@@ -126,8 +126,10 @@ impl std::error::Error for RenderError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(u64);
 
-/// The rendered width of a timestamp — `2026-08-23T09:14:22.031Z`.
-const TIMESTAMP_WIDTH: usize = 24;
+/// The rendered width of a timestamp — `2026-08-23T09:14:22.031Z`. Fixed, and
+/// the transreptor's window filter leans on it: a line's time can be compared
+/// as a string prefix without tokenizing the line.
+pub(crate) const TIMESTAMP_WIDTH: usize = 24;
 
 impl Timestamp {
     /// A timestamp from milliseconds since the Unix epoch (`ikigai_core::Time`'s

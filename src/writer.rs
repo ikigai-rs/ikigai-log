@@ -511,7 +511,7 @@ fn stamp(now: Timestamp) -> String {
 /// An instance name as a file-name component. Native only: nothing on wasm has
 /// a file to name.
 #[cfg(not(target_family = "wasm"))]
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' => c,
@@ -522,7 +522,7 @@ fn slug(name: &str) -> String {
 
 /// The directory segments land in: the configured one, else `{data home}/log`.
 #[cfg(not(target_family = "wasm"))]
-fn resolve_directory(config: &LogConfig) -> Option<PathBuf> {
+pub(crate) fn resolve_directory(config: &LogConfig) -> Option<PathBuf> {
     config
         .directory
         .clone()

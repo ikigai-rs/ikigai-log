@@ -53,6 +53,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(target_family = "wasm"))]
+use ikigai_core::UriTemplate;
 use ikigai_core::{
     ActionSpec, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
     ReprType, Representation, Result, Verb,
@@ -62,6 +64,9 @@ use crate::config::LogConfig;
 #[cfg(not(target_family = "wasm"))]
 use crate::config::{level_iri, Destination, Patch};
 use crate::line::{parse_fields, Entry, Timestamp};
+#[cfg(not(target_family = "wasm"))]
+use crate::segments::{SegmentEndpoint, SegmentsEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE};
+use crate::segments::{TransreptEndpoint, TRANSREPT_IRI};
 use crate::vocabulary::{Vocabulary, CAPABILITY_DENIED_CLASS, LOG_NS, MESSAGE_CLASS};
 #[cfg(not(target_family = "wasm"))]
 use crate::vocabulary::{CONFIG_CHANGE_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS};
@@ -741,19 +746,54 @@ pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
     )
 }
 
-/// The module's space: `urn:log:write` everywhere, plus `urn:log:config` on
-/// hosts that have a filesystem to layer within.
+/// The module's space, over the built-in vocabulary.
 ///
 /// **Binding starts nothing.** The handle decides whether this process logs,
 /// and it is closed until a host opens it.
-///
-/// On wasm the config endpoint is absent rather than present-and-failing: an
-/// action in the manifold that cannot succeed is worse than one that is not
-/// offered, because an agent will select it.
-#[allow(clippy::let_and_return)] // the config binding is cfg'd out on wasm
 pub fn space(handle: Arc<LogHandle>) -> EndpointSpace {
-    let space = EndpointSpace::new().bind(Exact::new(WRITE_IRI), write(handle.clone()));
+    space_with_vocabulary(handle, Vocabulary::shared_builtin())
+}
+
+/// The module's space, over a vocabulary the host assembled.
+///
+/// `vocabulary` is the transreptor's term table, and it is a parameter for the
+/// reason the table is data at all: a host that has loaded a module's own
+/// `rdfs:subClassOf` extension transrepts that module's entry classes correctly,
+/// and its graph did not come from an `include_str!`.
+///
+/// ## ★ The binding order is load-bearing
+///
+/// `urn:log:{segment}` is a TEMPLATE, and a template over `urn:log:` matches
+/// every IRI in this space — `urn:log:write` included. The first grammar that
+/// matches wins, so **every exact IRI is bound before it and the template is
+/// bound last**. A later milestone adding `urn:log:verify` must add it above the
+/// template; below it, the request resolves as a segment named `verify` and the
+/// failure is a "no segment" error rather than an unbound IRI.
+///
+/// On wasm the config, segment and listing endpoints are absent rather than
+/// present-and-failing: an action in the manifold that cannot succeed is worse
+/// than one that is not offered, because an agent will select it. The
+/// transreptor is pure and binds everywhere — a browser host that received a
+/// segment over the wire can still turn it into a graph.
+#[allow(clippy::let_and_return)] // three bindings are cfg'd out on wasm
+pub fn space_with_vocabulary(handle: Arc<LogHandle>, vocabulary: Arc<Vocabulary>) -> EndpointSpace {
+    let space = EndpointSpace::new()
+        .bind(Exact::new(WRITE_IRI), write(handle.clone()))
+        .bind(
+            Exact::new(TRANSREPT_IRI),
+            TransreptEndpoint::new(vocabulary.clone()),
+        );
     #[cfg(not(target_family = "wasm"))]
-    let space = space.bind(Exact::new(CONFIG_IRI), config(handle));
+    let space = space
+        .bind(Exact::new(CONFIG_IRI), config(handle.clone()))
+        .bind(
+            Exact::new(SEGMENTS_IRI),
+            SegmentsEndpoint::new(handle.clone()),
+        )
+        // LAST. See the note above: this template matches every IRI in the space.
+        .bind(
+            UriTemplate::parse(SEGMENT_TEMPLATE).expect("SEGMENT_TEMPLATE is a valid template"),
+            SegmentEndpoint::new(handle, vocabulary),
+        );
     space
 }

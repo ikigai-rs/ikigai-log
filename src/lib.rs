@@ -66,17 +66,30 @@
 //! ## What this crate is not, yet
 //!
 //! `@prev genesis`, always: the hash chain and the seals are one piece of work
-//! and a partial chain is worse than none, because it looks verifiable.
-//! Transreption to Turtle, the `ikigai_core::Tracer` implementation, SHACL on
-//! write, rotation and retention are all still ahead.
+//! and a partial chain is worse than none, because it looks verifiable. A
+//! `#seal` line transrepts — [`graph`] STATES what it says — but nothing here
+//! verifies one. The `ikigai_core::Tracer` implementation, SHACL on write,
+//! rotation and retention are all still ahead.
+//!
+//! ## Reading
+//!
+//! [`graph::to_turtle`] is the transreptor, `text/x-ikigai-log` → `text/turtle`,
+//! and it is the whole of the mapping. It is reached two ways: `urn:log:transrept`
+//! over piped bytes, and `urn:log:{segment}` over a segment on disk — whose
+//! DEFAULT face is Turtle, because that is what makes
+//! `urn:sparql:* graph=urn:log:{name}` load a segment as a named graph named by
+//! its own IRI. Cross-segment analysis is then two IRIs in a `graph=` list, and
+//! nothing in this crate implements it.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod endpoints;
+pub mod graph;
 mod line;
 #[cfg(not(target_family = "wasm"))]
 pub mod load;
+pub mod segments;
 mod vocabulary;
 mod writer;
 
@@ -88,10 +101,16 @@ pub use config::{
     DEFAULT_LEVEL, INSTANCE_NS, STEM,
 };
 pub use endpoints::{LogHandle, CAP_CONFIG, CAP_READ, CAP_WRITE, CONFIG_IRI, WRITE_IRI};
+pub use graph::{
+    to_triples, to_turtle, GraphError, Options, LOG_MEDIA_TYPE, SIG_NS, TURTLE_MEDIA_TYPE,
+};
 pub use line::{
     is_iri, parse_fields, Entry, Header, Line, ParseError, Prev, RenderError, Seal, Timestamp,
     FORMAT_VERSION,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use segments::{SegmentEndpoint, SegmentsEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE};
+pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
 pub use vocabulary::{
     ClassDef, KeyDef, VocabError, Vocabulary, CAPABILITY_DENIED_CLASS, CONFIG_CHANGE_CLASS,
     DEFAULT_MIN_LEVEL, ENTRY_CLASS, ERROR_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS,

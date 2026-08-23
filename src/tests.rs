@@ -1377,3 +1377,931 @@ fn a_level_the_config_write_cannot_parse_is_rejected_and_the_rejection_lands() {
         "and nothing was written"
     );
 }
+
+// =====================================================================================
+// The transreptor, and the named-graph story
+// =====================================================================================
+
+use oxrdf::{NamedNodeRef, NamedOrBlankNode, Term as OxTerm, Triple};
+use oxrdfio::{RdfFormat, RdfParser};
+
+use crate::graph::{to_triples, to_turtle, GraphError, Options, LOG_MEDIA_TYPE, SIG_NS};
+use crate::segments::{SegmentEndpoint, TransreptEndpoint, SEGMENTS_IRI, TRANSREPT_IRI};
+
+const PROV: &str = "http://www.w3.org/ns/prov#";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const TURTLE: &str = "text/turtle";
+
+/// Re-parse a serialization as RDF and hand back its triples.
+///
+/// Every assertion below goes through this: asserting on the Turtle TEXT would
+/// test the serializer's whitespace, not the mapping, and would pass on a graph
+/// that no parser accepts.
+fn reparse(turtle: &str) -> Vec<Triple> {
+    RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(turtle.as_bytes())
+        .map(|quad| quad.expect("the emitted Turtle re-parses").into())
+        .collect()
+}
+
+/// Whether `triples` states `subject predicate object`.
+fn states(triples: &[Triple], subject: &str, predicate: &str, object: OxTerm) -> bool {
+    let subject =
+        NamedOrBlankNode::NamedNode(NamedNodeRef::new(subject).expect("an IRI").into_owned());
+    let predicate = NamedNodeRef::new(predicate).expect("an IRI").into_owned();
+    triples
+        .iter()
+        .any(|t| t.subject == subject && t.predicate == predicate && t.object == object)
+}
+
+fn node(iri: &str) -> OxTerm {
+    OxTerm::NamedNode(NamedNodeRef::new(iri).expect("an IRI").into_owned())
+}
+
+fn string(value: &str) -> OxTerm {
+    OxTerm::Literal(oxrdf::Literal::new_simple_literal(value))
+}
+
+fn typed(value: &str, datatype: &str) -> OxTerm {
+    OxTerm::Literal(oxrdf::Literal::new_typed_literal(
+        value,
+        NamedNodeRef::new(datatype).expect("an IRI").into_owned(),
+    ))
+}
+
+fn objects<'a>(triples: &'a [Triple], subject: &str, predicate: &str) -> Vec<&'a OxTerm> {
+    let subject =
+        NamedOrBlankNode::NamedNode(NamedNodeRef::new(subject).expect("an IRI").into_owned());
+    let predicate = NamedNodeRef::new(predicate).expect("an IRI").into_owned();
+    triples
+        .iter()
+        .filter(|t| t.subject == subject && t.predicate == predicate)
+        .map(|t| &t.object)
+        .collect()
+}
+
+/// A segment written by the WRITER, not by hand — so the transreptor is tested
+/// against the bytes the rest of the crate actually produces.
+fn written_segment(level: &str, write: impl FnOnce(&mut Writer)) -> (String, String) {
+    let (mut writer, captured) = writer_at(level);
+    let name = writer.segment().to_string();
+    write(&mut writer);
+    (name, captured.text())
+}
+
+#[test]
+fn a_written_segment_becomes_a_graph_that_reparses_as_rdf() {
+    let (segment, text) = written_segment("debug", |writer| {
+        writer
+            .write(
+                Entry::new(
+                    at(1_700_000_001_000),
+                    log("Resolution"),
+                    "urn:calendar:today",
+                )
+                .with("span", "7")
+                .with("dur", "12")
+                .with("worker", "ikigai-sched-2")
+                .with("cap", "urn:cap:personal:calendar"),
+            )
+            .expect("a resolution at debug");
+    });
+
+    let turtle = to_turtle(&text, Vocabulary::builtin(), &Options::all()).expect("it transrepts");
+    let triples = reparse(&turtle);
+
+    // The header became a segment node.
+    assert!(states(&triples, &segment, RDF_TYPE, node(&log("Segment"))));
+    assert!(states(
+        &triples,
+        &segment,
+        &log("level"),
+        node(&log("debug"))
+    ));
+    assert!(states(
+        &triples,
+        &segment,
+        &format!("{PROV}startedAtTime"),
+        typed(
+            "2023-11-14T22:13:20.000Z",
+            "http://www.w3.org/2001/XMLSchema#dateTime"
+        )
+    ));
+    // `genesis` is STATED, not omitted: an absent @prev is unambiguously an
+    // error, and a graph that dropped the token would give that away.
+    assert!(states(
+        &triples,
+        &segment,
+        &log("prevSeal"),
+        string("genesis")
+    ));
+
+    let instance = "urn:ikigai:instance:bug:test";
+    assert!(states(&triples, instance, RDF_TYPE, node(&log("Instance"))));
+    assert!(
+        states(
+            &triples,
+            instance,
+            RDF_TYPE,
+            node(&format!("{PROV}SoftwareAgent"))
+        ),
+        "a consumer of this graph alone has no reasoner and no copy of the log \
+         vocabulary, so the PROV type is stated rather than inferred"
+    );
+
+    // seq=1 is log:ProcessStart, seq=2 the resolution.
+    let entry = format!("{segment}:2");
+    assert!(states(&triples, &entry, RDF_TYPE, node(&log("Resolution"))));
+    assert!(states(
+        &triples,
+        &entry,
+        &format!("{PROV}wasAssociatedWith"),
+        node(instance)
+    ));
+    assert!(
+        states(
+            &triples,
+            &entry,
+            &log("span"),
+            typed("7", "http://www.w3.org/2001/XMLSchema#integer")
+        ),
+        "an xsd:integer range makes a typed literal, so a threshold query can compare"
+    );
+    assert!(states(
+        &triples,
+        &entry,
+        &log("worker"),
+        string("ikigai-sched-2")
+    ));
+
+    // The subject column emits TWICE: log:subject always, plus the class's
+    // declared log:subjectPredicate. Two triples, both true, no reasoner.
+    assert!(states(
+        &triples,
+        &entry,
+        &log("subject"),
+        node("urn:calendar:today")
+    ));
+    assert!(
+        states(
+            &triples,
+            &entry,
+            &log("resolved"),
+            node("urn:calendar:today")
+        ),
+        "log:Resolution declares log:subjectPredicate log:resolved"
+    );
+}
+
+#[test]
+fn a_range_typed_key_lands_as_an_iri_and_not_as_a_string() {
+    let (segment, text) = written_segment("info", |writer| {
+        writer
+            .write(
+                Entry::new(at(1_700_000_001_000), log("Message"), "urn:agent:calendar")
+                    .with("cap", "urn:cap:personal:calendar")
+                    .with("cap", "urn:cap:fs:read")
+                    .with("msg", "sync started"),
+            )
+            .expect("a message at info");
+    });
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
+    let entry = format!("{segment}:2");
+
+    // `cap` is rdfs:range rdfs:Resource. As a string it would join to nothing,
+    // and the whole capability axis is a join.
+    let caps = objects(&triples, &entry, &log("capability"));
+    assert_eq!(caps.len(), 2, "a key may repeat: two scopes, two triples");
+    for cap in caps {
+        assert!(
+            matches!(cap, OxTerm::NamedNode(_)),
+            "an rdfs:Resource range makes an IRI: {cap:?}"
+        );
+    }
+
+    // `configured` is rdfs:range log:Instance — a CLASS, not an XSD datatype,
+    // and it must be an IRI for the same reason. The rule is one rule: XSD
+    // datatype ⇒ typed literal, anything else ⇒ IRI.
+    let (_, start_text) = written_segment("info", |_| {});
+    let started = reparse(&to_turtle(&start_text, Vocabulary::builtin(), &Options::all()).unwrap());
+    assert!(
+        started.iter().all(
+            |t| t.predicate.as_str() != format!("{LOG_NS}configuredInstance")
+                || matches!(t.object, OxTerm::NamedNode(_))
+        ),
+        "a class-ranged key is an IRI"
+    );
+
+    // And prose stays prose.
+    assert!(states(
+        &triples,
+        &entry,
+        &log("text"),
+        string("sync started")
+    ));
+}
+
+#[test]
+fn an_undeclared_key_lands_losslessly_and_flagged() {
+    let (segment, text) = written_segment("info", |writer| {
+        writer
+            .write(
+                Entry::new(at(1_700_000_001_000), log("Message"), "urn:agent:calendar")
+                    .with("nonesuch", "42")
+                    .with("nonesuch", "43"),
+            )
+            .expect("a message at info");
+    });
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
+    let entry = format!("{segment}:2");
+
+    // Lossless: both values, on log:{key}, as plain literals — never guessed
+    // into a range nobody declared.
+    let values = objects(&triples, &entry, &log("nonesuch"));
+    assert_eq!(values.len(), 2, "{values:?}");
+    assert!(values.contains(&&string("42")) && values.contains(&&string("43")));
+
+    // AND flagged, once — the hygiene signal the design counts, not a
+    // per-occurrence rash.
+    let flags = objects(&triples, &entry, &log("undeclaredKey"));
+    assert_eq!(flags, vec![&string("nonesuch")], "{flags:?}");
+}
+
+#[test]
+fn log_segment_is_on_every_entry_so_a_flattened_triple_keeps_its_attribution() {
+    let (segment, text) = written_segment("debug", |writer| {
+        for n in 0..3 {
+            writer
+                .write(Entry::new(
+                    at(1_700_000_001_000 + n),
+                    log("Message"),
+                    "urn:agent:calendar",
+                ))
+                .expect("a message at debug");
+        }
+    });
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
+
+    // urn:rdf:union is triple-only and loses graph names, so this is what keeps
+    // a triple self-identifying if it is ever flattened into one graph — and it
+    // lets a query written against a union keep working on a single segment.
+    for seq in 1..=4 {
+        assert!(
+            states(
+                &triples,
+                &format!("{segment}:{seq}"),
+                &log("segment"),
+                node(&segment)
+            ),
+            "entry {seq} names its segment"
+        );
+    }
+}
+
+#[test]
+fn nothing_transrepts_to_a_blank_node() {
+    let (_, text) = written_segment("debug", |writer| {
+        writer
+            .write(
+                Entry::new(
+                    at(1_700_000_001_000),
+                    log("Resolution"),
+                    "urn:calendar:today",
+                )
+                .with("span", "7")
+                .with("parent", "1")
+                .with("undeclared", "x"),
+            )
+            .expect("a resolution at debug");
+    });
+    let mut text = text;
+    text.push_str("#seal 1-2 sha256:4c1e sig:MEUCIQD\n");
+
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
+    assert!(!triples.is_empty());
+    for triple in &triples {
+        assert!(
+            matches!(triple.subject, NamedOrBlankNode::NamedNode(_)),
+            "a blank node in a log is a fact you cannot cite: {triple}"
+        );
+        assert!(
+            !matches!(triple.object, OxTerm::BlankNode(_)),
+            "a blank node in a log is a fact you cannot cite: {triple}"
+        );
+    }
+}
+
+#[test]
+fn a_graph_states_each_fact_once_and_two_runs_are_byte_identical() {
+    // log:ProcessStart declares `log:subjectPredicate prov:wasAssociatedWith`,
+    // which is also the per-entry attribution — so the naive emission writes
+    // that triple twice. A set has no duplicates and neither should the
+    // serialization: two runs over one segment agreeing as graphs but differing
+    // in bytes costs the artifact its diffability for nothing.
+    let (_, text) = written_segment("info", |writer| {
+        writer
+            .write(
+                Entry::new(at(1_700_000_001_000), log("Message"), "urn:agent:calendar")
+                    .with("cap", "urn:cap:fs:read")
+                    .with("cap", "urn:cap:fs:read"),
+            )
+            .unwrap();
+    });
+    let turtle = to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap();
+    let triples = reparse(&turtle);
+    let mut seen = std::collections::HashSet::new();
+    for triple in &triples {
+        assert!(seen.insert(triple.to_string()), "stated twice: {triple}");
+    }
+    assert_eq!(
+        turtle,
+        to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap(),
+        "the same segment serializes to the same bytes"
+    );
+}
+
+#[test]
+fn invoked_is_materialized_within_one_run_and_never_across_a_process_start() {
+    // Two runs in one segment — which is what a rotation-free restart looks
+    // like from the writer's side, and exactly where a naive span join breaks:
+    // the kernel's span counter restarts with the process, so span 7 in run two
+    // is a different activity from span 7 in run one.
+    let (segment, text) = written_segment("debug", |writer| {
+        let resolution = |ms: u64, span: &str| {
+            Entry::new(at(ms), log("Resolution"), "urn:calendar:today").with("span", span)
+        };
+        writer
+            .write(resolution(1_700_000_001_000, "9").with("parent", "7"))
+            .unwrap();
+        writer.write(resolution(1_700_000_002_000, "7")).unwrap();
+        // A second run. Its child claims parent 7 — which exists, but in the
+        // OTHER run.
+        writer
+            .write(Entry::new(
+                at(1_700_000_003_000),
+                log("ProcessStart"),
+                "urn:ikigai:instance:bug:test",
+            ))
+            .unwrap();
+        writer
+            .write(resolution(1_700_000_004_000, "11").with("parent", "7"))
+            .unwrap();
+    });
+
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
+    let invoked = objects(&triples, &format!("{segment}:3"), &log("invoked"));
+    assert_eq!(
+        invoked,
+        vec![&node(&format!("{segment}:2"))],
+        "parent → child, and the parent's line is written when it COMPLETES, so \
+         the child's line came first: {invoked:?}"
+    );
+
+    // The cross-run child got no edge — and kept its literal, so the fact is
+    // still recoverable by a union that can see both runs.
+    let across = triples
+        .iter()
+        .filter(|t| t.predicate.as_str() == format!("{LOG_NS}invoked"))
+        .count();
+    assert_eq!(across, 1, "no edge crosses a log:ProcessStart");
+    assert!(states(
+        &triples,
+        &format!("{segment}:5"),
+        &log("parentSpan"),
+        typed("7", "http://www.w3.org/2001/XMLSchema#integer")
+    ));
+}
+
+#[test]
+fn a_seal_transrepts_as_what_it_says_and_asserts_nothing_about_its_validity() {
+    let (segment, text) = written_segment("info", |_| {});
+    let mut text = text;
+    text.push_str("#seal 1-42 sha256:4c1e0d sig:MEUCIQD\n");
+    text.push_str("#seal 43-99 sha256:9ab7\n");
+
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
+    let seal = format!("{segment}:seal:1-42");
+    assert!(states(&triples, &seal, RDF_TYPE, node(&log("Seal"))));
+    assert!(states(&triples, &seal, &log("segment"), node(&segment)));
+    assert!(states(
+        &triples,
+        &seal,
+        &log("firstSequence"),
+        typed("1", "http://www.w3.org/2001/XMLSchema#integer")
+    ));
+    assert!(states(
+        &triples,
+        &seal,
+        &log("lastSequence"),
+        typed("42", "http://www.w3.org/2001/XMLSchema#integer")
+    ));
+    // The tokens EXACTLY as the line wrote them. T3 states; T4 verifies.
+    assert!(states(
+        &triples,
+        &seal,
+        &format!("{SIG_NS}contentHash"),
+        string("sha256:4c1e0d")
+    ));
+    assert!(states(
+        &triples,
+        &seal,
+        &format!("{SIG_NS}value"),
+        string("sig:MEUCIQD")
+    ));
+
+    // An unsigned seal still localizes tampering, so it is not an error and it
+    // carries no sig:value to imply otherwise.
+    let unsigned = format!("{segment}:seal:43-99");
+    assert!(states(
+        &triples,
+        &unsigned,
+        &format!("{SIG_NS}contentHash"),
+        string("sha256:9ab7")
+    ));
+    assert!(objects(&triples, &unsigned, &format!("{SIG_NS}value")).is_empty());
+
+    // Nothing anywhere claims a seal is valid, verified, or intact.
+    let turtle = to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap();
+    for word in ["verif", "valid", "intact"] {
+        assert!(
+            !turtle.contains(word),
+            "a transreptor that implied verification would be worse than one \
+             that ignored seals: {turtle}"
+        );
+    }
+}
+
+#[test]
+fn a_module_extends_the_mapping_without_touching_the_transreptor() {
+    // The same claim T1 tests for the writer, now for the reader: the table is
+    // data, so a module's own class and key transrept with no code change here.
+    let mut vocab = Vocabulary::builtin().clone();
+    vocab
+        .extend(
+            r#"
+            @prefix log:  <https://ikigai-rs.dev/ns/log#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+            <urn:demo:Fetch> a rdfs:Class ;
+                rdfs:subClassOf log:Entry ;
+                log:minLevel log:info ;
+                log:subjectPredicate <urn:demo:fetched> .
+            <urn:demo:status> a rdf:Property ;
+                log:keyName "status" ;
+                rdfs:range xsd:integer .
+            "#,
+        )
+        .expect("the extension parses");
+
+    let (mut writer, captured) = {
+        let captured = Captured::default();
+        let writer = Writer::open_with_sink(
+            &config_at("info"),
+            Arc::new(vocab.clone()),
+            at(1_700_000_000_000),
+            captured.sink(),
+        )
+        .expect("the segment opens");
+        (writer, captured)
+    };
+    let segment = writer.segment().to_string();
+    writer
+        .write(
+            Entry::new(at(1_700_000_001_000), "urn:demo:Fetch", "urn:page:home")
+                .with("status", "200"),
+        )
+        .expect("the extension's class emits at info");
+
+    let triples = reparse(&to_turtle(&captured.text(), &vocab, &Options::all()).unwrap());
+    let entry = format!("{segment}:2");
+    assert!(states(&triples, &entry, RDF_TYPE, node("urn:demo:Fetch")));
+    assert!(
+        states(&triples, &entry, "urn:demo:fetched", node("urn:page:home")),
+        "the extension's log:subjectPredicate refines the subject column"
+    );
+    assert!(
+        states(
+            &triples,
+            &entry,
+            "urn:demo:status",
+            typed("200", "http://www.w3.org/2001/XMLSchema#integer")
+        ),
+        "and its rdfs:range types the value"
+    );
+    assert!(
+        objects(&triples, &entry, &log("undeclaredKey")).is_empty(),
+        "a key the EXTENDED table claims is not undeclared"
+    );
+}
+
+#[test]
+fn the_window_narrows_the_entries_and_never_the_header() {
+    let (segment, text) = written_segment("info", |writer| {
+        for n in 1..=5 {
+            writer
+                .write(Entry::new(
+                    at(1_700_000_000_000 + n * 1000),
+                    log("Message"),
+                    "urn:agent:calendar",
+                ))
+                .unwrap();
+        }
+    });
+    let window = Options {
+        from_seq: Some(3),
+        to_seq: Some(4),
+        ..Options::default()
+    };
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &window).unwrap());
+
+    // O(segment) is the design's own first stated weakness, and the window is
+    // how a long segment stays affordable — so it must narrow before the graph
+    // is built, not after.
+    for seq in [3, 4] {
+        assert!(states(
+            &triples,
+            &format!("{segment}:{seq}"),
+            &log("segment"),
+            node(&segment)
+        ));
+    }
+    for seq in [1, 2, 5] {
+        assert!(
+            objects(&triples, &format!("{segment}:{seq}"), &log("segment")).is_empty(),
+            "entry {seq} is outside the window"
+        );
+    }
+    // The header always lands: a segment node with no level and no start time
+    // would be a graph that cannot say what it is a window into.
+    assert!(states(&triples, &segment, RDF_TYPE, node(&log("Segment"))));
+    assert!(states(
+        &triples,
+        &segment,
+        &log("level"),
+        node(&log("info"))
+    ));
+
+    let by_time = Options {
+        since: Some(at(1_700_000_004_000)),
+        ..Options::default()
+    };
+    let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &by_time).unwrap());
+    assert!(objects(&triples, &format!("{segment}:4"), &log("segment")).is_empty());
+    assert!(!objects(&triples, &format!("{segment}:5"), &log("segment")).is_empty());
+}
+
+#[test]
+fn a_corrupt_line_names_its_position_rather_than_saying_invalid() {
+    let (_, text) = written_segment("info", |_| {});
+    let mut text = text;
+    text.push_str("2026-13-45T99:99:99.999Z log:Message urn:agent:calendar\n");
+    match to_triples(&text, Vocabulary::builtin(), &Options::all()) {
+        // The corrupt line is the last one, and the error says so — "line N" is
+        // what an operator can act on; "invalid" is not.
+        Err(GraphError::Parse { line, .. }) => assert_eq!(line, text.lines().count(), "{text}"),
+        other => panic!("a corrupt line is located, not shrugged at: {other:?}"),
+    }
+}
+
+// =====================================================================================
+// The addressable space
+// =====================================================================================
+
+use ikigai_core::{Expiry, Fallback, Space};
+
+/// A handle writing real segment files into `dir`.
+fn file_handle(dir: &Path, level: &str) -> Arc<LogHandle> {
+    let config = LogConfig::default()
+        .with_instance("bug:seg")
+        .with_level(level)
+        .expect("a real level")
+        .with_destination(Destination::File)
+        .with_directory(dir);
+    let handle = Arc::new(LogHandle::new(Some(dir.to_path_buf()), None, config));
+    handle
+        .open(Vocabulary::shared_builtin(), at(1_700_000_000_000))
+        .expect("the segment opens");
+    handle
+}
+
+fn source_request(iri: &str, args: &[(&str, &str)]) -> Request {
+    let mut request = Request::new(Verb::Source, Iri::parse(iri).expect("a valid IRI"));
+    for (name, value) in args {
+        request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+    }
+    request
+}
+
+fn source(kernel: &Kernel, iri: &str, args: &[(&str, &str)]) -> Representation {
+    futures::executor::block_on(kernel.issue(source_request(iri, args), &Capability::root()))
+        .unwrap_or_else(|e| panic!("<{iri}> resolves: {e}"))
+}
+
+#[test]
+fn the_transreptor_declares_its_conversion_and_runs_over_piped_bytes() {
+    let (segment, text) = written_segment("info", |writer| {
+        writer
+            .write(Entry::new(
+                at(1_700_000_001_000),
+                log("Message"),
+                "urn:agent:calendar",
+            ))
+            .unwrap();
+    });
+
+    // Declared, so the shipped sniff-and-dispatch machinery can SELECT it —
+    // `Description::transreptor` is what puts it in the transreptor graph, and
+    // an undeclared converter is invisible to every caller that does not name
+    // it directly.
+    let described = TransreptEndpoint::new(Vocabulary::shared_builtin()).describe();
+    let conversion = described
+        .transreption()
+        .expect("it is a transreptor, not an endpoint that happens to convert");
+    assert_eq!(conversion.from, vec![LOG_MEDIA_TYPE.to_string()]);
+    assert_eq!(conversion.to, vec![TURTLE.to_string()]);
+
+    let home = Scratch::new("transrept");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        LogConfig::default(),
+    ));
+    let kernel = kernel(handle);
+    let repr = source(&kernel, TRANSREPT_IRI, &[("content", &text)]);
+    assert_eq!(repr.repr_type.media_type.as_str(), TURTLE);
+    assert!(states(
+        &reparse(&text_of(&repr)),
+        &format!("{segment}:2"),
+        RDF_TYPE,
+        node(&log("Message"))
+    ));
+}
+
+fn text_of(repr: &Representation) -> String {
+    String::from_utf8(repr.bytes.clone()).expect("utf-8")
+}
+
+#[test]
+fn a_segment_resolves_to_turtle_at_its_own_iri_and_the_file_face_is_opt_in() {
+    let dir = Scratch::new("segment-face");
+    let handle = file_handle(dir.path(), "info");
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    handle
+        .write(Entry::new(
+            at(1_700_000_001_000),
+            MESSAGE_CLASS,
+            "urn:agent:calendar",
+        ))
+        .expect("a message at info");
+    let kernel = kernel(handle);
+
+    // ★ Turtle is the DEFAULT, and that is not a preference. `urn:sparql:*`
+    // issues a bare Source with no `as=`, so a segment that answered it with log
+    // lines would not be a graph source and the whole named-graph story would
+    // need a second mechanism.
+    let repr = source(&kernel, &segment, &[]);
+    assert_eq!(repr.repr_type.media_type.as_str(), TURTLE);
+    let triples = reparse(&text_of(&repr));
+    assert!(states(&triples, &segment, RDF_TYPE, node(&log("Segment"))));
+    assert!(states(
+        &triples,
+        &format!("{segment}:2"),
+        &log("subject"),
+        node("urn:agent:calendar")
+    ));
+
+    // The file itself is still addressable — it is the thing you grep.
+    let raw = source(&kernel, &segment, &[("as", LOG_MEDIA_TYPE)]);
+    assert_eq!(raw.repr_type.media_type.as_str(), LOG_MEDIA_TYPE);
+    assert!(text_of(&raw).starts_with("# ikigai-log v1"));
+
+    // A window over the raw face would hand back something that is not a
+    // segment, so it is refused rather than silently truncated.
+    let error = futures::executor::block_on(kernel.issue(
+        source_request(&segment, &[("as", LOG_MEDIA_TYPE), ("from_seq", "2")]),
+        &Capability::root(),
+    ))
+    .expect_err("a windowed segment file is not a segment");
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error:?}");
+
+    // On the graph face it narrows.
+    let windowed = source(&kernel, &segment, &[("from_seq", "2")]);
+    let triples = reparse(&text_of(&windowed));
+    assert!(objects(&triples, &format!("{segment}:1"), &log("segment")).is_empty());
+    assert!(!objects(&triples, &format!("{segment}:2"), &log("segment")).is_empty());
+}
+
+#[test]
+fn the_segment_template_is_bound_last_so_the_exact_iris_still_win() {
+    // `urn:log:{segment}` matches EVERY IRI in this space. The exact bindings
+    // are registered first and the template last, and if that ever inverts,
+    // `urn:log:write` becomes a segment named "write" — which fails as "no
+    // segment" rather than as an unbound IRI, so nothing else would catch it.
+    let dir = Scratch::new("binding-order");
+    let handle = file_handle(dir.path(), "info");
+    let kernel = kernel(handle);
+
+    let written = futures::executor::block_on(kernel.issue(
+        sink_request(WRITE_IRI, &[("msg", "still the writer")]),
+        &Capability::root(),
+    ))
+    .expect("urn:log:write is not a segment named `write`");
+    assert!(
+        text(&written).starts_with("urn:log:bug:seg:"),
+        "{}",
+        text(&written)
+    );
+
+    assert!(text_of(&source(&kernel, CONFIG_IRI, &[])).contains("destination"));
+    assert!(!source(&kernel, SEGMENTS_IRI, &[]).bytes.is_empty());
+}
+
+#[test]
+fn a_finished_segment_caches_and_a_live_one_does_not() {
+    // ★ The trap in this task. Effective expiry PROPAGATES from dependencies, so
+    // a live source joined into a cached graph silently un-caches it and NO test
+    // fails. The rule is therefore asserted directly rather than trusted.
+    let dir = Scratch::new("cacheability");
+    let handle = file_handle(dir.path(), "info");
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    let kernel = kernel(handle.clone());
+
+    let live = source(&kernel, &segment, &[]);
+    assert_eq!(
+        live.expiry,
+        Expiry::Always,
+        "this process is appending to it right now; a cached tail would be a lie \
+         about the one fact a reader came for"
+    );
+    // And the thread is declared anyway — the read did not go through
+    // `urn:file:`, but what the kernel needs from it is the dependency.
+    assert!(
+        live.threads()
+            .iter()
+            .any(|t| t.as_str().starts_with("urn:file:")),
+        "{:?}",
+        live.threads()
+    );
+
+    // An orderly close writes log:ProcessStop, which is what makes the segment
+    // FINISHED — nothing will append to it again.
+    handle
+        .close(at(1_700_000_009_000))
+        .expect("an orderly close");
+    let finished = source(&kernel, &segment, &[]);
+    assert_eq!(
+        finished.expiry,
+        Expiry::Never,
+        "a rotated segment is immutable, and it is the common case for analysis"
+    );
+    assert!(finished
+        .threads()
+        .iter()
+        .any(|t| t.as_str().starts_with("urn:file:")));
+
+    // A segment that ends WITHOUT a stop marker ended because the process died,
+    // and a dead process's segment is indistinguishable from a running one's —
+    // so it stays live rather than being guessed finished.
+    let orphan = dir.path().join("bug-orphan-2023-11-14T22-13-20Z.log");
+    let mut truncated = std::fs::read_to_string(
+        std::fs::read_dir(dir.path())
+            .expect("the scratch dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "log"))
+            .expect("a segment file"),
+    )
+    .expect("readable");
+    truncated = truncated
+        .lines()
+        .filter(|l| !l.contains("ProcessStop"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("urn:log:bug:seg:", "urn:log:bug:orphan:")
+        .replace("instance:bug:seg", "instance:bug:orphan");
+    std::fs::write(&orphan, format!("{truncated}\n")).expect("writable");
+    let orphaned = source(&kernel, "urn:log:bug:orphan:2023-11-14T22-13-20Z", &[]);
+    assert_eq!(orphaned.expiry, Expiry::Always);
+}
+
+#[test]
+fn the_listing_reads_each_file_s_own_name_and_is_never_cached() {
+    let dir = Scratch::new("listing");
+    let handle = file_handle(dir.path(), "info");
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    let kernel = kernel(handle);
+
+    let listing = source(&kernel, SEGMENTS_IRI, &[]);
+    assert_eq!(text_of(&listing), format!("{segment}\n"));
+    assert_eq!(
+        listing.expiry,
+        Expiry::Always,
+        "the directory changes under rotation and nothing cuts a thread on a \
+         directory, so a cached listing would send a chain walk after a segment \
+         that is no longer there"
+    );
+
+    // The `@name` in the file is the authority; the filename is a convenience.
+    // A renamed file is still found, and still found by what it says it is.
+    let path = std::fs::read_dir(dir.path())
+        .expect("the scratch dir")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "log"))
+        .expect("a segment file");
+    std::fs::rename(&path, dir.path().join("renamed-by-an-operator.log")).expect("renamable");
+    assert_eq!(
+        text_of(&source(&kernel, SEGMENTS_IRI, &[])),
+        format!("{segment}\n")
+    );
+    assert!(text_of(&source(&kernel, &segment, &[])).contains("log:Segment"));
+}
+
+#[test]
+fn reading_a_segment_without_the_capability_is_refused() {
+    let dir = Scratch::new("segment-denied");
+    let handle = file_handle(dir.path(), "info");
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    let kernel = kernel(handle);
+
+    for iri in [segment.as_str(), SEGMENTS_IRI] {
+        let error = futures::executor::block_on(
+            kernel.issue(source_request(iri, &[]), &Capability::scoped([CAP_WRITE])),
+        )
+        .expect_err("segment content is at least as sensitive as the log's whereabouts");
+        assert!(matches!(error, Error::Denied(_)), "<{iri}>: {error:?}");
+    }
+
+    // Declared == enforced: the manifold says exactly what the body checks.
+    let described = SegmentEndpoint::new(
+        Arc::new(LogHandle::new(None, None, LogConfig::default())),
+        Vocabulary::shared_builtin(),
+    )
+    .describe();
+    let read = described
+        .action_specs()
+        .into_iter()
+        .find(|a| a.verb == Verb::Source)
+        .expect("a Source action");
+    assert_eq!(read.requires, vec![CAP_READ.to_string()]);
+}
+
+#[test]
+fn a_segment_is_a_named_graph_to_sparql_because_it_resolves_to_turtle() {
+    // ★ THE test. Everything else in this file asserts what this crate does;
+    // this asserts what it BUYS — that resolving to Turtle at your own IRI is
+    // the entire named-graph story, with no N-Quads, no TriG and no union
+    // machinery, because `urn:sparql:*` already loads each `graph=` source
+    // "through the kernel and loaded as a named graph (named by its URI)".
+    let dir = Scratch::new("named-graph");
+    let handle = file_handle(dir.path(), "info");
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    handle
+        .record_denial(at(1_700_000_002_000), "urn:cap:fs:write", "writing a file")
+        .expect("a refused authority lands at every level");
+
+    let space = Fallback::new(vec![
+        Arc::new(crate::endpoints::space(handle)) as Arc<dyn Space>,
+        Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
+    ]);
+    let kernel = Kernel::new(Arc::new(space)).with_clock(Arc::new(Fixed(1_700_000_000_000)));
+
+    let results = source(
+        &kernel,
+        "urn:sparql:select",
+        &[
+            (
+                "query",
+                "SELECT ?g ?e WHERE { GRAPH ?g { ?e a \
+                 <https://ikigai-rs.dev/ns/log#CapabilityDenied> } }",
+            ),
+            ("graph", &segment),
+        ],
+    );
+    let body = text_of(&results);
+    assert!(
+        body.contains(&segment),
+        "the graph is named by the IRI it was dereferenced at: {body}"
+    );
+    assert!(
+        body.contains(&format!("{segment}:2")),
+        "and the entry is in it: {body}"
+    );
+
+    // Golden threads reach through too, so an analysis result dies when a
+    // segment it read changes. Verified, not assumed — this is the "alerting =
+    // golden threads" line of the design working through shipped machinery.
+    assert!(
+        results
+            .threads()
+            .iter()
+            .any(|t| t.as_str().starts_with("urn:file:")),
+        "the segment's thread reached the query result: {:?}",
+        results.threads()
+    );
+    // The live segment un-caches the query over it. That is expiry PROPAGATING,
+    // and it is correct: a cached answer about a log that is still being written
+    // is a stale answer.
+    assert_eq!(results.expiry, Expiry::Always);
+}

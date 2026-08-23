@@ -25,6 +25,11 @@
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix prov: <http://www.w3.org/ns/prov#> .
 @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+# The signature terms a `#seal` line transrepts to are ikigai-sign's, not
+# ours: sig:contentHash / sig:value / sig:algorithm / sig:signer. Reusing them
+# rather than minting parallel terms is what makes ikigai-log the second
+# consumer that crate names as its own promotion trigger.
+@prefix sig:  <https://ikigai-rs.dev/ns/sign#> .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The spine
@@ -271,6 +276,18 @@ log:Seal a rdfs:Class ;
     log:minLevel log:always ;
     rdfs:label "Seal" ;
     rdfs:comment "A signed checkpoint over a run of entries, written as a `#seal` line so it reads as a comment and greps as ^#seal. Its hash and signature reuse sig:contentHash / sig:value / sig:algorithm / sig:signer from ikigai-sign rather than minting parallel terms — which makes ikigai-log the second consumer that crate names as its own promotion trigger." .
+
+log:firstSequence a rdf:Property ;
+    rdfs:domain log:Seal ;
+    rdfs:range xsd:integer ;
+    rdfs:label "firstSequence" ;
+    rdfs:comment "The first entry sequence a seal covers. A seal names a RANGE, and the range is the whole localization claim: tampering is narrowed to \"between seal K and seal K+1\", which is meaningless without both ends. No log:keyName — a seal is its own line shape, not a key=value column." .
+
+log:lastSequence a rdf:Property ;
+    rdfs:domain log:Seal ;
+    rdfs:range xsd:integer ;
+    rdfs:label "lastSequence" ;
+    rdfs:comment "The last entry sequence a seal covers, and the entry whose chain hash sig:contentHash carries." .
 
 log:ChainBroken a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
