@@ -10,7 +10,25 @@ homepage = "https://github.com/ikigai-rs/ikigai-log"
 keywords = ["ikigai", "roc", "logging", "provenance", "rdf"]
 categories = ["development-tools::debugging", "web-programming"]
 
+# `File::try_lock` (stable since 1.89) is how one instance name is held by one
+# process without a stale-lock story: the OS releases an advisory lock when the
+# process dies, so a crash cannot strand the name.
+rust-version = "1.89"
+
 [dependencies]
+# The published kernel, consumed from crates.io — the SAME version the hosts
+# use, so a host links exactly one `ikigai-core`. 0.1.56 is the true minimum:
+# `config::{config_home, layered_paths_in, data_home_in}` (the path algebra the
+# layered `log.toml` reads) arrived there and nowhere earlier; everything else
+# this crate touches (ActionSpec, ArgSpec `class`/`one_of`/`default_value`,
+# `Error::Denied`, `Invocation::now`) is older still.
+ikigai-core = "0.1.56"
+
+# The layered `log.toml`. `deny_unknown_fields` on every layer is what makes a
+# misspelled key loud; pure Rust, so the config half stays wasm-clean.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
 # The vocabulary is parsed, not hard-coded — a module's own `rdfs:subClassOf`
 # extension is loaded the same way at runtime, which is what makes the term
 # table data rather than a match arm. Oxigraph's pure-Rust oxrdf/oxrdfio are
@@ -26,3 +44,6 @@ oxrdfio = "0.2"
 # crates still carry). Unused at runtime: nothing here generates randomness.
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+futures = "0.3" # block_on, for the endpoint tests

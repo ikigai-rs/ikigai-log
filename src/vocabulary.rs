@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use oxrdf::Term;
 use oxrdfio::{RdfFormat, RdfParser};
@@ -45,8 +45,31 @@ const LOG_RANK: &str = "https://ikigai-rs.dev/ns/log#rank";
 const LOG_SUBJECT_PREDICATE: &str = "https://ikigai-rs.dev/ns/log#subjectPredicate";
 const LOG_LEVEL_CLASS: &str = "https://ikigai-rs.dev/ns/log#Level";
 
+/// The PROV-O namespace, bound in every segment header alongside `log:`.
+pub const PROV_NS: &str = "http://www.w3.org/ns/prov#";
+
 /// `log:Entry` — the root of the entry hierarchy.
 pub const ENTRY_CLASS: &str = "https://ikigai-rs.dev/ns/log#Entry";
+
+/// `log:Message` — the convenience write's class, and the root of the prose
+/// hierarchy whose SUBCLASSES carry severity.
+pub const MESSAGE_CLASS: &str = "https://ikigai-rs.dev/ns/log#Message";
+/// `log:Warning`.
+pub const WARNING_CLASS: &str = "https://ikigai-rs.dev/ns/log#Warning";
+/// `log:Error`.
+pub const ERROR_CLASS: &str = "https://ikigai-rs.dev/ns/log#Error";
+/// `log:ProcessStart` — always-land liveness, first entry of every segment.
+pub const PROCESS_START_CLASS: &str = "https://ikigai-rs.dev/ns/log#ProcessStart";
+/// `log:ProcessStop` — always-land, written only by an ORDERLY close.
+pub const PROCESS_STOP_CLASS: &str = "https://ikigai-rs.dev/ns/log#ProcessStop";
+/// `log:ConfigChange` — always-land.
+pub const CONFIG_CHANGE_CLASS: &str = "https://ikigai-rs.dev/ns/log#ConfigChange";
+/// `log:LevelChange` — always-land.
+pub const LEVEL_CHANGE_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChange";
+/// `log:LevelChangeRejected` — always-land.
+pub const LEVEL_CHANGE_REJECTED_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChangeRejected";
+/// `log:CapabilityDenied` — always-land.
+pub const CAPABILITY_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#CapabilityDenied";
 
 /// The level a class is written at when neither it nor any of its superclasses
 /// declares one: the day-to-day default, so an undeclared extension is visible
@@ -105,6 +128,20 @@ impl Vocabulary {
         BUILTIN.get_or_init(|| {
             Vocabulary::parse(VOCABULARY_TTL).expect("the embedded vocabulary parses")
         })
+    }
+
+    /// The built-in vocabulary as a shared handle — what a writer that has no
+    /// module extensions to load takes.
+    ///
+    /// A `Writer` holds an `Arc<Vocabulary>` rather than a `&'static` one
+    /// because the extension story is the point: a host that has loaded a
+    /// module's own `rdfs:subClassOf` declarations passes its extended graph,
+    /// and it did not come from an `include_str!`.
+    pub fn shared_builtin() -> Arc<Vocabulary> {
+        static SHARED: OnceLock<Arc<Vocabulary>> = OnceLock::new();
+        SHARED
+            .get_or_init(|| Arc::new(Vocabulary::builtin().clone()))
+            .clone()
     }
 
     /// Parse a vocabulary from Turtle.

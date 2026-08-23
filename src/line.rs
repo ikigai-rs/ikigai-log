@@ -471,23 +471,47 @@ impl Entry {
         if !is_iri(&subject) {
             return Err(ParseError::NotAnIri(subject));
         }
-        let mut fields = Vec::new();
-        for token in tokens {
-            let (key, value) = token
-                .split_once('=')
-                .ok_or_else(|| ParseError::Field(token.clone()))?;
-            if !is_key(key) {
-                return Err(ParseError::Field(token.clone()));
-            }
-            fields.push((key.to_string(), value.to_string()));
-        }
         Ok(Entry {
             time,
             class,
             subject,
-            fields,
+            fields: fields_from_tokens(tokens)?,
         })
     }
+}
+
+/// Parse a bare run of `key=value` columns — a line's TAIL, without the three
+/// fixed columns in front of it.
+///
+/// This is the same scanner [`Entry::parse`] uses, exposed so that a caller
+/// supplying fields by some other route (an endpoint argument, a config file, a
+/// test) writes them in the syntax the file already uses instead of a second,
+/// nearly-identical one. Quoting, escaping and repeated keys all behave exactly
+/// as they do in a segment, because it is not "exactly as" — it is the same code.
+///
+/// ```
+/// # use ikigai_log::parse_fields;
+/// let fields = parse_fields(r#"dur=12 cap=urn:cap:fs msg="two words""#).unwrap();
+/// assert_eq!(fields[2], ("msg".to_string(), "two words".to_string()));
+/// ```
+pub fn parse_fields(tail: &str) -> Result<Vec<(String, String)>, ParseError> {
+    fields_from_tokens(scan(tail)?.into_iter())
+}
+
+fn fields_from_tokens(
+    tokens: impl Iterator<Item = String>,
+) -> Result<Vec<(String, String)>, ParseError> {
+    let mut fields = Vec::new();
+    for token in tokens {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| ParseError::Field(token.clone()))?;
+        if !is_key(key) {
+            return Err(ParseError::Field(token.clone()));
+        }
+        fields.push((key.to_string(), value.to_string()));
+    }
+    Ok(fields)
 }
 
 // =====================================================================================
