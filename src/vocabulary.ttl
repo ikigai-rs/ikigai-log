@@ -1,0 +1,332 @@
+# The ikigai-log vocabulary — and, literally, the transreptor's term table.
+#
+# Two things are declared here that would otherwise be Rust:
+#
+#   * `log:keyName` binds a line's bare `key=` column to a property, and that
+#     property's `rdfs:range` decides whether the value becomes an IRI, an
+#     integer, a boolean or a plain literal. The mapping is DATA; the
+#     transreption code is mechanical.
+#   * `log:minLevel` declares, per class, the lowest level at which entries of
+#     that class are written, and `log:rank` orders the ladder. The operator
+#     sets one dial; this graph decides what it includes.
+#
+# So a module introduces new entry types with `rdfs:subClassOf` plus its own
+# `log:minLevel` and `log:keyName` bindings, and neither the writer nor the
+# transreptor changes. That is the whole extension story.
+#
+# Namespace note: self-contained under `https://ikigai-rs.dev/ns/log#`, the
+# `sig:` precedent from ikigai-sign. NOT part of the published ikigai-rs.dev/ns
+# vocabulary and needing no /ns deploy — a term is promoted into
+# `vocabulary.ttl` when it earns a second consumer, and log-specific classes
+# are expected to stay here.
+
+@prefix log:  <https://ikigai-rs.dev/ns/log#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The spine
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:Entry a rdfs:Class ;
+    rdfs:subClassOf prov:Activity ;
+    rdfs:label "Entry" ;
+    rdfs:comment "One log line. A prov:Activity because every entry records an occurrent — something a process DID, at a time, under an authority. Skolemized as urn:log:{segment}:{seq}; never a blank node." .
+
+log:Segment a rdfs:Class ;
+    rdfs:subClassOf prov:Bundle ;
+    rdfs:label "Segment" ;
+    rdfs:comment "One log file between rotations, and the named graph its entries land in. prov:Bundle is PROV's own term for a named set of provenance descriptions, so segment-as-named-graph needs no invention here." .
+
+log:Instance a rdfs:Class ;
+    rdfs:subClassOf prov:SoftwareAgent ;
+    rdfs:label "Instance" ;
+    rdfs:comment "One logging PROCESS — the attribution key, since the log is per-process rather than per-machine. Two `serve` processes on one host are two instances, and \"what happened on this machine\" is a union." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Structure — PROV where PROV says exactly what we mean
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Used directly, so not restated as ik:/log: terms:
+#
+#   prov:startedAtTime     the line's leading timestamp, on EVERY entry (an
+#                          instantaneous entry is an activity with no end).
+#                          NOT prov:atTime, whose domain is
+#                          prov:InstantaneousEvent — putting it on an Activity
+#                          infers a class nobody meant.
+#   prov:endedAtTime       only where an end is genuinely known.
+#   prov:wasAssociatedWith entry → log:Instance, materialized from the segment
+#                          header, so per-process attribution costs no bytes
+#                          per line.
+#   prov:wasDerivedFrom    an analysis finding → the entries it was CONSTRUCTed
+#                          from. The loop guard excludes on this, so a derived
+#                          event cannot re-trigger the rule that derived it.
+
+log:resolved a rdf:Property ;
+    rdfs:subPropertyOf prov:used ;
+    rdfs:domain log:Resolution ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "resolved" ;
+    rdfs:comment "The target IRI this resolution resolved. A sub-property of prov:used, which states the same fact to a reader that knows PROV and not this vocabulary; the specific property exists because a resolution also uses its arguments and only one of the things it used is the thing that was asked for." .
+
+log:invoked a rdf:Property ;
+    rdfs:subPropertyOf prov:wasInformedBy ;
+    rdfs:domain log:Resolution ;
+    rdfs:range log:Resolution ;
+    rdfs:label "invoked" ;
+    rdfs:comment "This resolution issued that sub-resolution and consumed its representation — the call-tree edge, parent to child. prov:wasInformedBy holds in exactly this direction: the parent used an entity the child generated. Materialized from log:parentSpan where both lines sit in one segment and one process run; across a rotation or a restart the literal spans survive and the edge is recovered by union." .
+
+log:subject a rdf:Property ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "subject" ;
+    rdfs:comment "What the entry is ABOUT, as an IRI — the third column of every line whatever its class. Emitted alongside the class-declared log:subjectPredicate refinement, so an ad-hoc query can ask one question of every entry without joining through this graph while a PROV reader still gets the precise reading. The redundancy is deliberate: two triples, both true, no reasoner required." .
+
+log:subjectPredicate a rdf:Property ;
+    rdfs:domain rdfs:Class ;
+    rdfs:range rdf:Property ;
+    rdfs:label "subjectPredicate" ;
+    rdfs:comment "Declared ON an entry class: the precise predicate its subject column means (log:resolved for a resolution, prov:wasAssociatedWith for a liveness event). Read from this graph, so a new class refines its subject reading without a code change." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The term table
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:keyName a rdf:Property ;
+    rdfs:domain rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "keyName" ;
+    rdfs:comment "The bare key as it appears in a line's key=value column. This binding plus the property's rdfs:range IS the term table. A key no property claims is still recorded losslessly — as log:{key} with a plain literal — and flagged log:undeclaredKey, so drift is measurable rather than silent: the same posture as log:Message, and for the same reason." .
+
+log:undeclaredKey a rdf:Property ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "undeclaredKey" ;
+    rdfs:comment "A key this entry carried that no property claims via log:keyName. Hygiene signal, counted by the same standing CONSTRUCT that counts log:Message." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Levels — the threshold is a vocabulary fact, and so is the comparison
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:Level a rdfs:Class ;
+    rdfs:label "Level" ;
+    rdfs:comment "A verbosity level. Levels are IRIs carrying a log:rank rather than bare strings, so the emit test is one comparison over this graph and a reader can ask what a level MEANS." .
+
+log:rank a rdf:Property ;
+    rdfs:domain log:Level ;
+    rdfs:range xsd:integer ;
+    rdfs:label "rank" ;
+    rdfs:comment "Ordering of the ladder: lower includes fewer classes. An entry class is written iff rank(its log:minLevel) <= rank(the segment's level). log:always ranks below every settable level, which is exactly why the always-land set needs no special case in code." .
+
+log:minLevel a rdf:Property ;
+    rdfs:domain rdfs:Class ;
+    rdfs:range log:Level ;
+    rdfs:label "minLevel" ;
+    rdfs:comment "Declared ON an entry class: the lowest level at which entries of that class are written. Inherited along rdfs:subClassOf when a class does not declare its own, so an extension gets a sane minimum for free and states one only where it differs." .
+
+log:always a log:Level ;
+    log:rank -1 ;
+    rdfs:label "always" ;
+    rdfs:comment "Below every settable level: these land whatever the dial says. A hash chain is tamper-evident, NOT omission-evident — it proves nothing was altered and cannot prove nothing was left out — so every legitimate source of absence must leave a marker in the chain: level and config changes, seals, chain breaks, rotations, retention tombstones, dropped entries, process start/stop, capability denials, key changes. The same argument rejects sampling as a volume strategy: sampling is holes everywhere with no brackets." .
+
+log:error a log:Level ; log:rank 0 ; rdfs:label "error" .
+log:warn  a log:Level ; log:rank 1 ; rdfs:label "warn" .
+log:info  a log:Level ; log:rank 2 ; rdfs:label "info" ;
+    rdfs:comment "The day-to-day default: notable events, no resolutions." .
+log:debug a log:Level ; log:rank 3 ; rdfs:label "debug" ;
+    rdfs:comment "Adds resolutions, without cache hits." .
+log:trace a log:Level ; log:rank 4 ; rdfs:label "trace" ;
+    rdfs:comment "Adds cache hits — the highest-volume, lowest-information events, so they sit at the top of the dial." .
+
+log:level a rdf:Property ;
+    rdfs:domain log:Segment ;
+    rdfs:range log:Level ;
+    rdfs:label "level" ;
+    rdfs:comment "The level a segment ran at, from its header. Exactly ONE per segment: a level change takes effect only at a segment boundary, so a verifier reasons per sealed segment — \"this ran at info, so absent resolutions are explained\" — instead of tracking transitions inside sealed content, and a level change can never open a gap inside it." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Kernel resolutions — the ikigai_core::Tracer mapping
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:Resolution a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:debug ;
+    log:subjectPredicate log:resolved ;
+    rdfs:label "Resolution" ;
+    rdfs:comment "One resolved invocation, as ikigai_core::Tracer reports it. The kernel writes these, which is what makes them trap-free: they are structured by construction rather than by discipline." .
+
+log:CacheHit a rdfs:Class ;
+    rdfs:subClassOf log:Resolution ;
+    log:minLevel log:trace ;
+    rdfs:label "CacheHit" ;
+    rdfs:comment "A resolution the representation cache served. Its own class rather than a boolean on log:Resolution, because a class is what the level dial can exclude — the threshold is per class." .
+
+log:span a rdf:Property ;
+    log:keyName "span" ;
+    rdfs:domain log:Resolution ;
+    rdfs:range xsd:integer ;
+    rdfs:label "span" ;
+    rdfs:comment "TraceEvent.span — unique within one process run of the kernel, which is why log:ProcessStart is what bounds a span join." .
+
+log:parentSpan a rdf:Property ;
+    log:keyName "parent" ;
+    rdfs:domain log:Resolution ;
+    rdfs:range xsd:integer ;
+    rdfs:label "parentSpan" ;
+    rdfs:comment "TraceEvent.parent, kept as the literal it was written as. log:invoked is materialized from it where it resolves; the literal remains, so the edge is still recoverable after a union across segments." .
+
+log:worker a rdf:Property ;
+    log:keyName "worker" ;
+    rdfs:domain log:Resolution ;
+    rdfs:range xsd:string ;
+    rdfs:label "worker" ;
+    rdfs:comment "The scheduler worker the invocation ran on (TraceEvent.thread). Named `worker`, NOT `thread`: in ikigai a thread is a GOLDEN thread, and a vocabulary that spent that word on an OS thread would mislead every query later written against it." .
+
+log:capability a rdf:Property ;
+    log:keyName "cap" ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "capability" ;
+    rdfs:comment "One capability IRI of the authority this entry ran under; repeated per scope, absent for full authority. PROV has no term for the authority an activity ran under — this is ikigai's own axis, and it is a large part of why the log is worth more than a trace." .
+
+log:durationMs a rdf:Property ;
+    log:keyName "dur" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:integer ;
+    rdfs:label "durationMs" ;
+    rdfs:comment "Elapsed milliseconds, from TraceEvent.started/ended. A duration rather than a second absolute timestamp because a threshold is what anyone greps or filters on; prov:endedAtTime is derivable from it and the start, and is materialized only where a consumer needs it." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The unstructured escape hatch — permitted, honest, and MEASURABLE
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:Message a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:info ;
+    rdfs:label "Message" ;
+    rdfs:comment "An informational write whose payload is prose. Deliberately allowed — banning it only drives prose into one field of a typed class, where it is invisible — but it is its OWN class, so the unstructured ratio per module is one standing CONSTRUCT away and 90% prose is a legible smell instead of a silent one. Severity is carried by SUBCLASS, never by a level= column, so the class alone decides emission and grep alone finds failures." .
+
+log:Warning a rdfs:Class ;
+    rdfs:subClassOf log:Message ;
+    log:minLevel log:warn ;
+    rdfs:label "Warning" .
+
+log:Error a rdfs:Class ;
+    rdfs:subClassOf log:Message ;
+    log:minLevel log:error ;
+    rdfs:label "Error" ;
+    rdfs:comment "Prose describing a failure. NOT where a typed error goes: wire v7 errors are already matchable nodes, and re-serializing one as prose is the printf trap wearing a class name." .
+
+log:text a rdf:Property ;
+    log:keyName "msg" ;
+    rdfs:domain log:Message ;
+    rdfs:range xsd:string ;
+    rdfs:label "text" ;
+    rdfs:comment "The prose. Quoted and escaped in the line format; a newline inside it is escaped rather than emitted, because one entry is one line is a load-bearing invariant — of the grammar, of grep, and of the hash chain." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The always-land set — every legitimate source of ABSENCE leaves a marker
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:ProcessStart a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    log:subjectPredicate prov:wasAssociatedWith ;
+    rdfs:label "ProcessStart" ;
+    rdfs:comment "Liveness, and the run boundary that makes span numbers unambiguous: the kernel's span counter restarts with the process, so a span join is scoped between these markers. The absence query needs a positive liveness entry to key off — an append-only log cannot state absence directly." .
+
+log:ProcessStop a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    log:subjectPredicate prov:wasAssociatedWith ;
+    rdfs:label "ProcessStop" .
+
+log:ConfigChange a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "ConfigChange" ;
+    rdfs:comment "Every urn:log:config write, not only the level: lowering the level makes a hole, but repointing the destination silences the log entirely, so the always-land rule is about config as a whole." .
+
+log:LevelChange a rdfs:Class ;
+    rdfs:subClassOf log:ConfigChange ;
+    log:minLevel log:always ;
+    rdfs:label "LevelChange" ;
+    rdfs:comment "Brackets the hole a level change creates, so a verifier can say \"between these seals the level was info, therefore absent resolutions are explained\". Without the bracket, an attacker who can lower the level creates a gap the chain then blesses as perfectly intact." .
+
+log:LevelChangeRejected a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "LevelChangeRejected" ;
+    rdfs:comment "A refused level set, landed immediately and at any level — under `locked` mode this is the evidence that an external modification did not take." .
+
+log:Rotation a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "Rotation" .
+
+log:Seal a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "Seal" ;
+    rdfs:comment "A signed checkpoint over a run of entries, written as a `#seal` line so it reads as a comment and greps as ^#seal. Its hash and signature reuse sig:contentHash / sig:value / sig:algorithm / sig:signer from ikigai-sign rather than minting parallel terms — which makes ikigai-log the second consumer that crate names as its own promotion trigger." .
+
+log:ChainBroken a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "ChainBroken" ;
+    rdfs:comment "A rotation that could not verify its predecessor. An entry, not an exception: the failure belongs in the record it is a failure of." .
+
+log:Tombstone a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "Tombstone" ;
+    rdfs:comment "A segment existed here, sealed thus, removed under this policy at this time. Retention and tamper-evidence otherwise conflict — a deleted segment and a tampered-away one are indistinguishable — and this is the resolution: the chain head outlives the payload, so an as-of query reaching into it gets \"redacted by retention\" rather than silence." .
+
+log:Dropped a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "Dropped" ;
+    rdfs:comment "N entries lost to back-pressure. Never drop silently." .
+
+log:CapabilityDenied a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "CapabilityDenied" ;
+    rdfs:comment "A refused authority is a security fact, so it lands at every level." .
+
+log:KeyChange a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:always ;
+    rdfs:label "KeyChange" ;
+    rdfs:comment "Signing-key rotation. Unrecorded, it is a window in which old signatures stop verifying — which is indistinguishable from tampering." .
+
+log:count a rdf:Property ;
+    log:keyName "count" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:integer ;
+    rdfs:label "count" .
+
+log:reason a rdf:Property ;
+    log:keyName "reason" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "reason" .
+
+log:sequence a rdf:Property ;
+    log:keyName "seq" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:integer ;
+    rdfs:label "sequence" .
+
+log:segment a rdf:Property ;
+    rdfs:domain log:Entry ;
+    rdfs:range log:Segment ;
+    rdfs:label "segment" .
+
+log:prevSeal a rdf:Property ;
+    rdfs:domain log:Segment ;
+    rdfs:range xsd:string ;
+    rdfs:label "prevSeal" ;
+    rdfs:comment "The prior segment's final seal, from the @prev header — or the token `genesis`, which is always written rather than left absent so that a missing @prev is unambiguously an error. The chain spans rotations; without it, rotation is the seam at which a whole file can be replaced and nothing detects it." .

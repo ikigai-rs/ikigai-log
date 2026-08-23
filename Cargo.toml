@@ -1,0 +1,28 @@
+[package]
+name = "ikigai-log"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+repository = "https://github.com/ikigai-rs/ikigai-log"
+homepage = "https://github.com/ikigai-rs/ikigai-log"
+keywords = ["ikigai", "roc", "logging", "provenance", "rdf"]
+categories = ["development-tools::debugging", "web-programming"]
+
+[dependencies]
+# The vocabulary is parsed, not hard-coded — a module's own `rdfs:subClassOf`
+# extension is loaded the same way at runtime, which is what makes the term
+# table data rather than a match arm. Oxigraph's pure-Rust oxrdf/oxrdfio are
+# wasm-clean (the same pair ikigai-sign parses signature-graphs with).
+oxrdf = "0.3"
+oxrdfio = "0.2"
+
+# oxrdf/oxrdfio pull getrandom 0.3, which refuses to compile for
+# wasm32-unknown-unknown until a backend is named — and the browser destination
+# writes these same lines through `console.log`, so the wasm build is real. The
+# feature alone suffices with getrandom 0.3.4 (older versions also wanted a
+# `getrandom_backend` rustflag, hence the `.cargo/config.toml` some sibling
+# crates still carry). Unused at runtime: nothing here generates randomness.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
