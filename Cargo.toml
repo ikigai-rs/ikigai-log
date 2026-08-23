@@ -24,6 +24,10 @@ rust-version = "1.89"
 # `Error::Denied`, `Invocation::now`) is older still.
 ikigai-core = "0.1.56"
 
+# The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
+# they carry a vocabulary and a handle — and `Endpoint::invoke` is `async_trait`.
+async-trait = "0.1"
+
 # The layered `log.toml`. `deny_unknown_fields` on every layer is what makes a
 # misspelled key loud; pure Rust, so the config half stays wasm-clean.
 serde = { version = "1", features = ["derive"] }
@@ -47,3 +51,12 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 futures = "0.3" # block_on, for the endpoint tests
+
+# The end-to-end test that the named-graph story is real rather than assumed: a
+# segment resolved through the kernel and handed to `urn:sparql:select` as
+# `graph=<segment IRI>`, answering a `GRAPH ?g { … }` query with the segment's
+# own IRI as ?g. Nothing in this crate implements that — it is what resolving to
+# Turtle at your own IRI BUYS — so asserting it needs the real consumer, and a
+# hand-rolled stand-in would prove nothing. Dev-only: a host mounts whichever
+# SPARQL space it wants, and this crate depends on none of them at runtime.
+ikigai-sparql = "0.1.6"
