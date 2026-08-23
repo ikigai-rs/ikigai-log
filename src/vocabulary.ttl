@@ -302,6 +302,103 @@ log:KeyChange a rdfs:Class ;
     rdfs:label "KeyChange" ;
     rdfs:comment "Signing-key rotation. Unrecorded, it is a window in which old signatures stop verifying — which is indistinguishable from tampering." .
 
+# ═══════════════════════════════════════════════════════════════════════════
+# The configuration — a resource, so it is describable like everything else
+# ═══════════════════════════════════════════════════════════════════════════
+
+log:Config a rdfs:Class ;
+    rdfs:label "Config" ;
+    rdfs:comment "The EFFECTIVE log configuration of one process: built-in defaults ⊕ log.toml ⊕ {app}.log.toml, merged key-wise. Never the contents of one file, which is why it carries log:configLayer rather than a path — the answer to \"why is the level debug?\" should not need a second lookup." .
+
+log:Destination a rdfs:Class ;
+    rdfs:label "Destination" ;
+    rdfs:comment "Where a segment's lines go. Individuals rather than strings, so a reader can ask what a destination MEANS and a query can join on it." .
+
+log:off a log:Destination ;
+    rdfs:label "off" ;
+    rdfs:comment "Nothing is written and no segment is opened — the DEFAULT. A one-shot `ikigai -c` that opened a segment would put a process that did nothing into the journal beside the servers, so a host that means to log says so." .
+
+log:console a log:Destination ;
+    rdfs:label "console" ;
+    rdfs:comment "The process's own diagnostic stream: stderr natively, console.log in a browser. NOT stdout — stdout is the pipeline's data channel, and a log line in it corrupts the composition." .
+
+log:file a log:Destination ;
+    rdfs:label "file" ;
+    rdfs:comment "A segment file under log:directory." .
+
+log:none a log:Segment ;
+    rdfs:label "none" ;
+    rdfs:comment "The stand-in for \"no segment is open\" in a log:currentSegment statement. Stated positively rather than by omitting the triple, because an absent statement is indistinguishable from a config face that forgot to emit one." .
+
+log:destination a rdf:Property ;
+    rdfs:domain log:Config ;
+    rdfs:range log:Destination ;
+    rdfs:label "destination" .
+
+log:directory a rdf:Property ;
+    rdfs:domain log:Config ;
+    rdfs:range xsd:string ;
+    rdfs:label "directory" ;
+    rdfs:comment "Where segment files land. Absent means the ikigai data home's `log` directory — resolved by the process that opens a segment, since only it knows its own HOME." .
+
+log:instance a rdf:Property ;
+    rdfs:domain log:Config ;
+    rdfs:range log:Instance ;
+    rdfs:label "instance" .
+
+log:configLayer a rdf:Property ;
+    log:keyName "file" ;
+    rdfs:domain log:Config ;
+    rdfs:range xsd:string ;
+    rdfs:label "configLayer" ;
+    rdfs:comment "One config file that contributed to the effective config, lowest precedence first. Provenance, not configuration — which is why the TOML face omits it and the graph face does not. Also bound as the line column `file=`, naming the layer a log:ConfigChange actually wrote." .
+
+log:currentSegment a rdf:Property ;
+    rdfs:domain log:Config ;
+    rdfs:range log:Segment ;
+    rdfs:label "currentSegment" ;
+    rdfs:comment "The segment this process is writing right now, or log:none. The config alone cannot answer it: `destination = file` in a process whose host never opened a writer means nothing is being logged." .
+
+log:configuredInstance a rdf:Property ;
+    log:keyName "configured" ;
+    rdfs:domain log:Instance ;
+    rdfs:range log:Instance ;
+    rdfs:label "configuredInstance" ;
+    rdfs:comment "The instance name that was ASKED for, when a live process already held it and this one took a disambiguated name instead. Two facts, both true — a silent disambiguation would make the header disagree with the config and nothing would say why. Also the line column `configured=` on log:ProcessStart." .
+
+log:processId a rdf:Property ;
+    log:keyName "pid" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:integer ;
+    rdfs:label "processId" ;
+    rdfs:comment "The OS process id, on log:ProcessStart. It is also what disambiguates a contended instance name: unique among LIVE processes, which is exactly the span a name arbitrates over, and unlike a random token it points at something an operator can go and look at." .
+
+log:changedKey a rdf:Property ;
+    log:keyName "key" ;
+    rdfs:domain log:ConfigChange ;
+    rdfs:range xsd:string ;
+    rdfs:label "changedKey" ;
+    rdfs:comment "Which config key a change touched. One entry per key that actually changed: a write that restates a value is not a change, and inventing an entry for it would dilute the ones that are." .
+
+log:fromValue a rdf:Property ;
+    log:keyName "from" ;
+    rdfs:domain log:ConfigChange ;
+    rdfs:range xsd:string ;
+    rdfs:label "fromValue" .
+
+log:toValue a rdf:Property ;
+    log:keyName "to" ;
+    rdfs:domain log:ConfigChange ;
+    rdfs:range xsd:string ;
+    rdfs:label "toValue" .
+
+log:effective a rdf:Property ;
+    log:keyName "effective" ;
+    rdfs:domain log:ConfigChange ;
+    rdfs:range xsd:string ;
+    rdfs:label "effective" ;
+    rdfs:comment "When the change takes hold — `next-segment`, always, because a segment has exactly one level for its whole life. Written on the entry rather than left implicit so that a reader of the line alone, grepped out of its file, still knows the change did not apply to the entries around it." .
+
 log:count a rdf:Property ;
     log:keyName "count" ;
     rdfs:domain log:Entry ;

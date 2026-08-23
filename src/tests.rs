@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::ConfigError;
 use crate::line::{Entry, Header, Line, ParseError, Prev, Seal, Timestamp};
 use crate::vocabulary::{Vocabulary, DEFAULT_MIN_LEVEL, ENTRY_CLASS, LOG_NS};
 
@@ -166,7 +167,13 @@ fn every_declared_key_types_its_range() {
 #[test]
 fn every_class_is_placeable_on_the_dial() {
     let vocab = Vocabulary::builtin();
-    let structural = [log("Segment"), log("Instance"), log("Level")];
+    let structural = [
+        log("Segment"),
+        log("Instance"),
+        log("Level"),
+        log("Config"),
+        log("Destination"),
+    ];
     for class in vocab.classes() {
         if structural.contains(&class.iri) {
             continue;
@@ -577,5 +584,796 @@ fn lines_are_classified_by_shape() {
             name: "name".to_string(),
             value: "urn:log:x".to_string()
         }
+    );
+}
+
+// =====================================================================================
+// The writer
+// =====================================================================================
+//
+// Hermetic by construction, not by redirection: every path below is either an
+// explicit scratch directory or a caller-supplied sink, and every config home
+// is passed in. Nothing here consults `$HOME`, so nothing can read or write the
+// real `~/.ikigai` — and no test has to fight the process-global environment to
+// stay honest about it.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use ikigai_core::{
+    ArgRef, Capability, Clock, Endpoint, Error, Iri, Kernel, Representation, Request, Time, Verb,
+};
+
+use crate::config::{Destination, LogConfig, Patch};
+use crate::endpoints::{LogHandle, CAP_CONFIG, CAP_READ, CAP_WRITE, CONFIG_IRI, WRITE_IRI};
+use crate::vocabulary::{
+    CONFIG_CHANGE_CLASS, LEVEL_CHANGE_CLASS, MESSAGE_CLASS, PROCESS_START_CLASS,
+};
+use crate::writer::{ClosureSink, WriteError, Writer};
+
+/// A scratch directory that removes itself. No dev-dependency for two
+/// directories, and no `$TMPDIR` collision between concurrent tests.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!(
+            "ikigai-log-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Scratch(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn write(&self, name: &str, contents: &str) {
+        std::fs::write(self.0.join(name), contents).expect("scratch write");
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.0.join(name)).expect("scratch read")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Lines captured from a writer, without a filesystem.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<String>>>);
+
+impl Captured {
+    fn sink(&self) -> Box<ClosureSink<impl FnMut(&str) + Send>> {
+        let lines = self.0.clone();
+        Box::new(ClosureSink(move |line: &str| {
+            lines.lock().expect("captured").push(line.to_string())
+        }))
+    }
+
+    fn text(&self) -> String {
+        let lines = self.0.lock().expect("captured");
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    }
+}
+
+fn at(millis: u64) -> Timestamp {
+    Timestamp::from_millis(millis)
+}
+
+fn config_at(level: &str) -> LogConfig {
+    LogConfig::default()
+        .with_instance("bug:test")
+        .with_level(level)
+        .expect("a level this vocabulary defines")
+}
+
+/// Open a writer onto a capture buffer at `level`, and hand back both.
+fn writer_at(level: &str) -> (Writer, Captured) {
+    let captured = Captured::default();
+    let writer = Writer::open_with_sink(
+        &config_at(level),
+        Vocabulary::shared_builtin(),
+        at(1_700_000_000_000),
+        captured.sink(),
+    )
+    .expect("the segment opens");
+    (writer, captured)
+}
+
+#[test]
+fn a_written_segment_reparses_and_yields_back_what_went_in() {
+    let (mut writer, captured) = writer_at("debug");
+    writer
+        .write(
+            Entry::new(
+                at(1_700_000_001_000),
+                log("Resolution"),
+                "urn:calendar:today",
+            )
+            .with("worker", "ikigai-sched-2")
+            .with("dur", "12"),
+        )
+        .expect("the entry writes")
+        .expect("and is not filtered");
+    writer
+        .write(
+            Entry::new(at(1_700_000_002_000), MESSAGE_CLASS, "urn:agent:calendar")
+                .with("msg", "sync started"),
+        )
+        .expect("the entry writes")
+        .expect("and is not filtered");
+
+    let text = captured.text();
+    let (header, offset) = Header::parse(&text).expect("the header this writer wrote parses");
+    assert_eq!(header.level, log("debug"));
+    assert_eq!(header.instance, "urn:ikigai:instance:bug:test");
+    assert_eq!(
+        header.prev,
+        Prev::Genesis,
+        "T4 owns the chain; T2 claims nothing"
+    );
+    assert_eq!(header.started, at(1_700_000_000_000));
+
+    let entries: Vec<Entry> = text[offset..]
+        .lines()
+        .map(|line| Line::parse(line, &header.prefixes).expect("every line parses"))
+        .filter_map(|line| match line {
+            Line::Entry(entry) => Some(entry),
+            _ => None,
+        })
+        .collect();
+
+    // The liveness marker the writer laid down first, then the two entries.
+    assert_eq!(entries.len(), 3, "{entries:#?}");
+    assert_eq!(entries[0].class, PROCESS_START_CLASS);
+    assert_eq!(entries[0].get("seq"), Some("1"));
+    assert_eq!(entries[1].class, log("Resolution"));
+    assert_eq!(entries[1].subject, "urn:calendar:today");
+    assert_eq!(
+        entries[1].get("seq"),
+        Some("2"),
+        "seq is written EXPLICITLY"
+    );
+    assert_eq!(entries[1].get("worker"), Some("ikigai-sched-2"));
+    assert_eq!(entries[1].get("dur"), Some("12"));
+    assert_eq!(entries[2].get("msg"), Some("sync started"));
+}
+
+#[test]
+fn the_level_dial_excludes_resolutions_at_info_and_never_the_always_land_set() {
+    let (mut info, captured) = writer_at("info");
+    assert!(!info.emits(&log("Resolution")), "no resolutions at info");
+    assert!(!info.emits(&log("CacheHit")), "and certainly no cache hits");
+    assert!(info.emits(MESSAGE_CLASS));
+    let filtered = info
+        .write(Entry::new(at(1), log("Resolution"), "urn:calendar:today"))
+        .expect("a filtered entry is not an error");
+    assert_eq!(filtered, None);
+    assert!(
+        !captured.text().contains("Resolution"),
+        "and nothing reached the file"
+    );
+
+    // At the bottom of the dial, every always-land class still lands: rank -1
+    // sorts below every settable level, so the set needs no list in code.
+    let (mut error, captured) = writer_at("error");
+    for class in [
+        "ProcessStart",
+        "ProcessStop",
+        "ConfigChange",
+        "LevelChange",
+        "LevelChangeRejected",
+        "Rotation",
+        "Seal",
+        "ChainBroken",
+        "Tombstone",
+        "Dropped",
+        "CapabilityDenied",
+        "KeyChange",
+    ] {
+        assert!(
+            error.emits(&log(class)),
+            "log:{class} lands at every level or the chain blesses a hole"
+        );
+        error
+            .write(Entry::new(at(2), log(class), "urn:log:test"))
+            .expect("it writes")
+            .unwrap_or_else(|| panic!("log:{class} must not be filtered"));
+    }
+    assert!(!error.emits(MESSAGE_CLASS), "but ordinary prose does not");
+    let text = captured.text();
+    for class in ["ProcessStart", "Dropped", "CapabilityDenied"] {
+        assert!(text.contains(&format!("log:{class}")), "{text}");
+    }
+}
+
+#[test]
+fn a_level_the_vocabulary_does_not_define_fails_at_open() {
+    let mut config = config_at("info");
+    // Shape-valid, so the config layer accepts it — and meaningless, so the
+    // writer must not.
+    config.level = log("verbose");
+    let opened = Writer::open_with_sink(
+        &config,
+        Vocabulary::shared_builtin(),
+        at(0),
+        Captured::default().sink(),
+    );
+    match opened
+        .err()
+        .expect("a level nothing can place on the dial is a hard stop")
+    {
+        WriteError::UnknownLevel { level, known } => {
+            assert_eq!(level, log("verbose"));
+            assert!(known.contains(&log("info")), "{known:?}");
+        }
+        other => panic!("expected UnknownLevel, got {other}"),
+    }
+}
+
+#[test]
+fn prose_with_a_newline_survives_escaped_on_one_line() {
+    let (mut writer, captured) = writer_at("info");
+    writer
+        .write(
+            Entry::new(at(3), MESSAGE_CLASS, "urn:agent:calendar")
+                .with("msg", "first\nsecond\ttabbed"),
+        )
+        .expect("it writes")
+        .expect("and is not filtered");
+    let text = captured.text();
+    assert!(text.contains(r#"msg="first\nsecond\ttabbed""#), "{text}");
+
+    let (header, offset) = Header::parse(&text).expect("header");
+    let entries: Vec<Entry> = text[offset..]
+        .lines()
+        .filter_map(|line| match Line::parse(line, &header.prefixes) {
+            Ok(Line::Entry(entry)) => Some(entry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entries.last().expect("the message").get("msg"),
+        Some("first\nsecond\ttabbed"),
+        "one entry is one line on the way out AND the way back"
+    );
+}
+
+#[test]
+fn the_file_destination_writes_a_segment_and_a_second_process_does_not_interleave() {
+    let scratch = Scratch::new("segments");
+    let config = LogConfig::default()
+        .with_destination(Destination::File)
+        .with_directory(scratch.path())
+        .with_instance("serve");
+
+    let first = Writer::open(&config, Vocabulary::shared_builtin(), at(1_700_000_000_000))
+        .expect("the first segment opens")
+        .expect("a file destination is a writer");
+    assert_eq!(first.instance(), "urn:ikigai:instance:serve");
+    assert!(
+        first.configured_instance().is_none(),
+        "no disambiguation yet"
+    );
+    assert_eq!(
+        first.segment(),
+        "urn:log:serve:2023-11-14T22-13-20Z",
+        "the segment IRI carries the instant, so two runs of one name stay apart"
+    );
+
+    // The same name, in the same process, while the first writer still holds
+    // the lock: this is what a second `ikigai serve` looks like from here. It
+    // does NOT refuse — a logging subsystem that takes out the second server on
+    // the box is backwards — it disambiguates, and it records that it did.
+    let second = Writer::open(&config, Vocabulary::shared_builtin(), at(1_700_000_060_000))
+        .expect("the second segment opens too")
+        .expect("a writer");
+    assert_ne!(second.instance(), first.instance());
+    assert!(
+        second
+            .instance()
+            .ends_with(&format!("-{}", std::process::id())),
+        "the pid is the token: unique among LIVE processes, and it points at one"
+    );
+    assert_eq!(
+        second.configured_instance(),
+        Some("urn:ikigai:instance:serve"),
+        "what was asked for is in the record, not lost"
+    );
+    assert_ne!(second.path(), first.path(), "two names, two files");
+
+    let text = std::fs::read_to_string(first.path().expect("a file")).expect("the segment");
+    let (header, offset) = Header::parse(&text).expect("the header parses");
+    assert_eq!(header.name, first.segment());
+    let start = text[offset..]
+        .lines()
+        .find_map(|line| match Line::parse(line, &header.prefixes) {
+            Ok(Line::Entry(entry)) if entry.class == PROCESS_START_CLASS => Some(entry),
+            _ => None,
+        })
+        .expect("every segment opens with liveness");
+    assert_eq!(
+        start.get("pid"),
+        Some(std::process::id().to_string()).as_deref()
+    );
+
+    let second_text =
+        std::fs::read_to_string(second.path().expect("a file")).expect("the second segment");
+    let (_, second_offset) = Header::parse(&second_text).expect("header");
+    assert!(
+        second_text[second_offset..].contains("configured=urn:ikigai:instance:serve"),
+        "{second_text}"
+    );
+}
+
+#[test]
+fn an_orderly_close_writes_a_stop_marker_and_a_drop_does_not() {
+    let (writer, captured) = writer_at("error");
+    writer.close(at(9)).expect("the close writes");
+    assert!(
+        captured.text().contains("log:ProcessStop"),
+        "{}",
+        captured.text()
+    );
+
+    let (writer, captured) = writer_at("error");
+    drop(writer);
+    assert!(
+        !captured.text().contains("log:ProcessStop"),
+        "a segment that ends without one ended because the process DIED — which \
+         is exactly what the absence query will want to see"
+    );
+}
+
+// =====================================================================================
+// The layered config
+// =====================================================================================
+
+#[test]
+fn no_files_at_all_is_the_host_defaults_not_an_error() {
+    let home = Scratch::new("empty-config");
+    let base = LogConfig::default().with_destination(Destination::Console);
+    let effective = crate::load::complete_in(home.path(), Some("serve"), base.clone())
+        .expect("an absent file is a layer that states nothing");
+    assert_eq!(effective.destination, Destination::Console);
+    assert_eq!(effective.level, log("info"));
+    assert!(effective.layers.is_empty());
+}
+
+#[test]
+fn the_app_layer_overrides_the_shared_one_key_wise() {
+    let home = Scratch::new("layered-config");
+    home.write("log.toml", "level = \"debug\"\ndestination = \"file\"\n");
+    home.write("serve.log.toml", "instance = \"bug:serve\"\n");
+
+    let effective = crate::load::complete_in(home.path(), Some("serve"), LogConfig::default())
+        .expect("both layers parse");
+    assert_eq!(effective.instance, "urn:ikigai:instance:bug:serve");
+    assert_eq!(effective.level, log("debug"), "the shared level SURVIVES");
+    assert_eq!(effective.destination, Destination::File);
+    assert_eq!(effective.layers.len(), 2);
+
+    // Another application sees the shared file only.
+    let other = crate::load::complete_in(home.path(), Some("web"), LogConfig::default())
+        .expect("the shared layer parses");
+    assert_eq!(other.instance, "urn:ikigai:instance:repl");
+    assert_eq!(other.level, log("debug"));
+    assert_eq!(other.layers.len(), 1);
+}
+
+#[test]
+fn a_present_but_wrong_key_fails_loudly_and_names_itself() {
+    let home = Scratch::new("bad-config");
+    home.write("log.toml", "destination = \"flie\"\n");
+    let error = crate::load::complete_in(home.path(), None, LogConfig::default())
+        .expect_err("a typo that silently does nothing is the defect this prevents");
+    assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
+
+    let home = Scratch::new("unknown-key");
+    home.write("log.toml", "levle = \"debug\"\n");
+    assert!(
+        crate::load::complete_in(home.path(), None, LogConfig::default()).is_err(),
+        "an unknown key is the same defect as a misspelled value"
+    );
+
+    let home = Scratch::new("bad-level");
+    home.write("log.toml", "level = \"not a level\"\n");
+    let error = crate::load::complete_in(home.path(), None, LogConfig::default())
+        .expect_err("a level that is not even IRI-shaped stops at the layer");
+    assert!(
+        matches!(error, ConfigError::BadValue { key: "level", .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn the_threads_name_every_candidate_including_the_ones_not_created_yet() {
+    let threads = crate::load::threads_in(Path::new("/cfg/ikigai"), Some("serve"));
+    assert_eq!(
+        threads,
+        vec![
+            "urn:file:/cfg/ikigai/log.toml".to_string(),
+            "urn:file:/cfg/ikigai/serve.log.toml".to_string(),
+        ],
+        "a config that named only the files it READ would never notice an \
+         override being created"
+    );
+}
+
+// =====================================================================================
+// The endpoints
+// =====================================================================================
+
+/// A clock that does not move — the only kind a test should reason against.
+struct Fixed(u64);
+
+impl Clock for Fixed {
+    fn now(&self) -> Time {
+        Time::from_millis(self.0)
+    }
+}
+
+/// A kernel over the log's own space, with a fixed clock. Entries are stamped
+/// from the KERNEL's clock and nowhere else — a caller-supplied timestamp would
+/// be a forgery surface on a record whose whole value is that it can be trusted.
+fn kernel(handle: Arc<LogHandle>) -> Kernel {
+    Kernel::new(Arc::new(crate::endpoints::space(handle)))
+        .with_clock(Arc::new(Fixed(1_700_000_000_000)))
+}
+
+fn sink_request(iri: &str, args: &[(&str, &str)]) -> Request {
+    let mut request = Request::new(Verb::Sink, Iri::parse(iri).expect("a valid IRI"));
+    for (name, value) in args {
+        request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+    }
+    request
+}
+
+fn text(repr: &Representation) -> String {
+    String::from_utf8(repr.bytes.to_vec()).expect("utf-8")
+}
+
+/// A handle with a segment open onto a capture buffer.
+fn open_handle(home: &Path, app: Option<&str>, level: &str) -> (Arc<LogHandle>, Captured) {
+    let config = crate::load::complete_in(
+        home,
+        app,
+        LogConfig::default()
+            .with_instance("bug:test")
+            .with_level(level)
+            .expect("a real level"),
+    )
+    .expect("the layers parse");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.to_path_buf()),
+        app.map(str::to_string),
+        config,
+    ));
+    let captured = Captured::default();
+    handle
+        .open_with_sink(
+            Vocabulary::shared_builtin(),
+            at(1_700_000_000_000),
+            captured.sink(),
+        )
+        .expect("the segment opens");
+    (handle, captured)
+}
+
+#[test]
+fn binding_the_endpoints_starts_nothing() {
+    let home = Scratch::new("closed");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        LogConfig::default(),
+    ));
+    let _space = crate::endpoints::space(handle.clone());
+    assert!(
+        !handle.is_open(),
+        "the module cannot judge what it is inside; the HOST decides who logs"
+    );
+
+    // And a write against a closed log says so rather than pretending.
+    let kernel = kernel(handle);
+    let repr = futures::executor::block_on(kernel.issue(
+        sink_request(WRITE_IRI, &[("msg", "nothing to see")]),
+        &Capability::root(),
+    ))
+    .expect("a closed log is not an error");
+    assert!(text(&repr).starts_with("closed:"), "{}", text(&repr));
+}
+
+#[test]
+fn the_convenience_write_normalizes_to_log_message() {
+    let home = Scratch::new("convenience");
+    let (handle, captured) = open_handle(home.path(), None, "info");
+    let kernel = kernel(handle);
+
+    // Piped content, no class, no subject — the whole convenience path.
+    let repr = futures::executor::block_on(kernel.issue(
+        sink_request(WRITE_IRI, &[("content", "sync started\nand continued")]),
+        &Capability::root(),
+    ))
+    .expect("the write lands");
+    assert!(
+        text(&repr).starts_with("urn:log:bug:test:"),
+        "the entry's IRI comes back, so it pipes: {}",
+        text(&repr)
+    );
+
+    let written = captured.text();
+    assert!(written.contains("log:Message"), "{written}");
+    assert!(
+        written.contains(r#"msg="sync started\nand continued""#),
+        "prose survives a newline ESCAPED, on one line: {written}"
+    );
+    assert!(
+        written.contains("urn:ikigai:instance:bug:test"),
+        "an entry with no stated subject is about the process that wrote it"
+    );
+    assert_eq!(
+        written
+            .lines()
+            .filter(|l| l.contains("log:Message"))
+            .count(),
+        1,
+        "one entry is one line"
+    );
+    assert!(
+        !written.contains("level="),
+        "severity is carried by SUBCLASS, never by a level= column"
+    );
+}
+
+#[test]
+fn the_typed_write_takes_its_fields_in_the_lines_own_tail_syntax() {
+    let home = Scratch::new("typed");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = kernel(handle);
+
+    futures::executor::block_on(kernel.issue(
+        sink_request(
+            WRITE_IRI,
+            &[
+                ("class", "log:Resolution"),
+                ("subject", "urn:calendar:today"),
+                (
+                    "fields",
+                    r#"span=7 dur=12 cap=urn:cap:fs cap=urn:cap:net msg="two words""#,
+                ),
+            ],
+        ),
+        &Capability::root(),
+    ))
+    .expect("the write lands");
+
+    let written = captured.text();
+    let (header, offset) = Header::parse(&written).expect("header");
+    let entry = written[offset..]
+        .lines()
+        .find_map(|line| match Line::parse(line, &header.prefixes) {
+            Ok(Line::Entry(entry)) if entry.class == log("Resolution") => Some(entry),
+            _ => None,
+        })
+        .expect("the resolution");
+    assert_eq!(entry.get("span"), Some("7"));
+    assert_eq!(entry.get("dur"), Some("12"));
+    assert_eq!(
+        entry.all("cap").collect::<Vec<_>>(),
+        vec!["urn:cap:fs", "urn:cap:net"],
+        "a repeated key is a list — one resolution under two capability scopes"
+    );
+    assert_eq!(
+        entry.get("msg"),
+        Some("two words"),
+        "the same scanner as the file, so quoting behaves identically"
+    );
+}
+
+#[test]
+fn a_write_without_the_capability_is_denied_before_the_endpoint_is_entered() {
+    let home = Scratch::new("denied");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle.clone());
+
+    let error = futures::executor::block_on(kernel.issue(
+        sink_request(WRITE_IRI, &[("msg", "forged")]),
+        &Capability::scoped(["urn:cap:something:else"]),
+    ))
+    .expect_err("a forged entry is the threat this gate exists for");
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert!(
+        !captured.text().contains("forged"),
+        "and the payload does not land"
+    );
+
+    // ★ The kernel refuses BEFORE dispatch (core 0.1.49 onward), so the entry
+    // that would record the refusal is written by the action that was refused —
+    // and never runs. `log:CapabilityDenied` is always-land and this is a real
+    // hole in T2: the fact can only be recorded by a HOST that catches the
+    // Denied, through `record_denial`. Closing it properly needs a kernel seam
+    // for pre-dispatch denials, which is core's decision and not this crate's.
+    assert!(
+        !captured.text().contains("log:CapabilityDenied"),
+        "if this ever starts passing, the kernel grew the seam and the module \
+         docs need rewriting: {}",
+        captured.text()
+    );
+
+    // The door that IS available to a host, at the bottom of the dial.
+    handle
+        .record_denial(at(1_700_000_000_500), CAP_WRITE, "appending a log entry")
+        .expect("a refused authority is a security fact, so it lands at EVERY level");
+    let written = captured.text();
+    assert!(written.contains("log:CapabilityDenied"), "{written}");
+    assert!(written.contains(&format!("cap={CAP_WRITE}")), "{written}");
+
+    // The declared requirement and the enforced one are the same string.
+    let described =
+        crate::endpoints::write(Arc::new(LogHandle::new(None, None, LogConfig::default())))
+            .describe();
+    let sink = described
+        .action_specs()
+        .into_iter()
+        .find(|a| a.verb == Verb::Sink)
+        .expect("a Sink action");
+    assert_eq!(sink.requires, vec![CAP_WRITE.to_string()]);
+}
+
+#[test]
+fn the_config_source_serves_the_effective_config_and_whether_a_segment_is_open() {
+    let home = Scratch::new("config-source");
+    home.write("log.toml", "level = \"debug\"\n");
+    let (handle, _captured) = open_handle(home.path(), None, "info");
+    let kernel = kernel(handle);
+
+    let plain = futures::executor::block_on(kernel.issue(
+        Request::new(Verb::Source, Iri::parse(CONFIG_IRI).expect("iri")),
+        &Capability::scoped([CAP_READ]),
+    ))
+    .expect("the read lands");
+    let body = text(&plain);
+    assert!(body.contains("level = \"debug\""), "{body}");
+    assert!(body.contains("# open = true"), "{body}");
+    assert!(body.contains("# segment = urn:log:bug:test:"), "{body}");
+    assert!(
+        Patch::parse(&body, None).is_ok(),
+        "the plain face round-trips as a config file — the live state is comments: {body}"
+    );
+
+    let turtle = futures::executor::block_on(
+        kernel.issue(
+            Request::new(Verb::Source, Iri::parse(CONFIG_IRI).expect("iri"))
+                .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec())),
+            &Capability::scoped([CAP_READ]),
+        ),
+    )
+    .expect("the graph face lands");
+    let graph = text(&turtle);
+    assert!(graph.contains("a log:Config"), "{graph}");
+    assert!(
+        graph.contains("log:currentSegment <urn:log:bug:test:"),
+        "{graph}"
+    );
+    assert!(!graph.contains("[]"), "skolemized; no blank nodes: {graph}");
+
+    // Reading where the log lives is itself gated.
+    let denied = futures::executor::block_on(kernel.issue(
+        Request::new(Verb::Source, Iri::parse(CONFIG_IRI).expect("iri")),
+        &Capability::scoped([CAP_WRITE]),
+    ))
+    .expect_err("a write grant is not a read grant");
+    assert!(matches!(denied, Error::Denied(_)), "{denied:?}");
+}
+
+#[test]
+fn a_config_write_lands_its_always_land_entry_at_every_level_and_persists() {
+    // `error` is the bottom of the dial: if the bracket lands here it lands
+    // everywhere, which is the whole point of log:always.
+    let home = Scratch::new("config-sink");
+    let (handle, captured) = open_handle(home.path(), Some("serve"), "error");
+    let kernel = kernel(handle.clone());
+
+    let repr = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("level", "debug"), ("destination", "file")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect("the change lands");
+    let body = text(&repr);
+    assert!(
+        body.contains("serve.log.toml"),
+        "the file it touched: {body}"
+    );
+    assert!(
+        body.contains("effective at next process start"),
+        "T2 has no rotation, and a segment's level is fixed for its life: {body}"
+    );
+
+    // Persisted to the HIGHEST-precedence layer, or the change could be
+    // silently overridden by a file the writer never mentioned.
+    let written = home.read("serve.log.toml");
+    assert!(written.contains("level = \"debug\""), "{written}");
+    assert!(written.contains("destination = \"file\""), "{written}");
+
+    // And in memory, for the next segment.
+    assert_eq!(handle.config().level, log("debug"));
+    assert_eq!(handle.config().destination, Destination::File);
+
+    let log_text = captured.text();
+    let (header, offset) = Header::parse(&log_text).expect("header");
+    assert_eq!(
+        header.level,
+        log("error"),
+        "the OPEN segment keeps its level"
+    );
+    let entries: Vec<Entry> = log_text[offset..]
+        .lines()
+        .filter_map(|line| match Line::parse(line, &header.prefixes) {
+            Ok(Line::Entry(entry)) => Some(entry),
+            _ => None,
+        })
+        .collect();
+    let level_change = entries
+        .iter()
+        .find(|e| e.class == LEVEL_CHANGE_CLASS)
+        .expect("a level change brackets the hole it creates");
+    assert_eq!(level_change.get("from"), Some(log("error")).as_deref());
+    assert_eq!(level_change.get("to"), Some(log("debug")).as_deref());
+    assert_eq!(level_change.get("effective"), Some("next-segment"));
+    let config_change = entries
+        .iter()
+        .find(|e| e.class == CONFIG_CHANGE_CLASS)
+        .expect("a destination change matters MORE than a level change");
+    assert_eq!(config_change.get("key"), Some("destination"));
+
+    // A change nobody is entitled to make does not touch the file.
+    let error = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("level", "trace")]),
+        &Capability::scoped([CAP_READ]),
+    ))
+    .expect_err("reading the config is not changing it");
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert!(
+        !home.read("serve.log.toml").contains("trace"),
+        "a denied change is not a change"
+    );
+}
+
+#[test]
+fn a_level_the_config_write_cannot_parse_is_rejected_and_the_rejection_lands() {
+    let home = Scratch::new("rejected");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle);
+
+    let error = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("level", "not a level")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect_err("a level that is not even IRI-shaped is refused");
+    assert!(
+        matches!(error, Error::InvalidArgument { ref name, .. } if name == "level"),
+        "{error:?}"
+    );
+    assert!(
+        captured.text().contains("log:LevelChangeRejected"),
+        "the evidence that the change did NOT take: {}",
+        captured.text()
+    );
+    assert!(
+        !home.path().join("log.toml").exists(),
+        "and nothing was written"
     );
 }
