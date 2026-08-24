@@ -123,8 +123,8 @@ mod writer;
 mod tests;
 
 pub use chain::{
-    head_of, verify_chain, verify_segment, ChainReport, Finding, RotationPolicy, SealPolicy,
-    SealSigner, SegmentReport, HASH_ALGORITHM,
+    head_of, split_signature, tagged, verify_chain, verify_segment, Chain, ChainReport, Finding,
+    RotationPolicy, SealPolicy, SealSigner, SegmentReport, HASH_ALGORITHM,
 };
 pub use config::{
     instance_iri, level_iri, ConfigError, Destination, LogConfig, Patch, DEFAULT_INSTANCE_NAME,
@@ -139,7 +139,9 @@ pub use line::{
     FORMAT_VERSION,
 };
 #[cfg(not(target_family = "wasm"))]
-pub use segments::{SegmentEndpoint, SegmentsEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE};
+pub use segments::{
+    SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
+};
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
 pub use vocabulary::{
     ClassDef, KeyDef, VocabError, Vocabulary, CAPABILITY_DENIED_CLASS, CHAIN_BROKEN_CLASS,
