@@ -269,13 +269,21 @@ log:LevelChangeRejected a rdfs:Class ;
 log:Rotation a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
     log:minLevel log:always ;
-    rdfs:label "Rotation" .
+    rdfs:label "Rotation" ;
+    rdfs:comment "The last entry of a segment that was rolled over rather than stopped. Rotation is VERIFY + SEAL + VALIDATE as one operation: the successor's @prev names the seal this entry precedes, so the marker and the link are written together or not at all. It also ENDS a segment as finally as log:ProcessStop does — a rotated segment is immutable, which is what makes it cacheable, and a reader that knew only about ProcessStop would treat every rotated segment as a live tail forever." .
+
+log:successor a rdf:Property ;
+    log:keyName "next" ;
+    rdfs:domain log:Rotation ;
+    rdfs:range log:Segment ;
+    rdfs:label "successor" ;
+    rdfs:comment "The segment this rotation opened — the only FORWARD link in the chain, and it is not merely navigation. @prev catches a segment removed from the MIDDLE, because the one after it still names what should have been there; nothing points forward at the LAST segment, so truncating a chain at its head would be free, and the head is the recent past — the part worth erasing. This is what notices. Written because the successor's IRI is derivable at the moment of rotation: it is the instance and the instant, so the file is reserved before the predecessor is sealed and the marker names what actually exists." .
 
 log:Seal a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
     log:minLevel log:always ;
     rdfs:label "Seal" ;
-    rdfs:comment "A signed checkpoint over a run of entries, written as a `#seal` line so it reads as a comment and greps as ^#seal. Its hash and signature reuse sig:contentHash / sig:value / sig:algorithm / sig:signer from ikigai-sign rather than minting parallel terms — which makes ikigai-log the second consumer that crate names as its own promotion trigger." .
+    rdfs:comment "A signed checkpoint over a run of entries, written as a `#seal first-last <hash> [<alg>:<base64>]` line so it reads as a comment and greps as ^#seal. Its hash and signature reuse sig:contentHash / sig:value / sig:algorithm from ikigai-sign rather than minting parallel terms — which makes ikigai-log the second consumer that crate names as its own promotion trigger, and which is why the digest is TAGGED (sha256:<hex>) at both ends: sharing a predicate while writing two lexical forms of one value means the two never join in a query. The signature is over the ASCII bytes of that tagged hash, so checking it is `urn:sign:verify in={the hash} sig={the graph} key={the public key}` and this crate holds no key. An UNSIGNED seal still localizes tampering, which is why a segment written without a key seals anyway." .
 
 log:firstSequence a rdf:Property ;
     rdfs:domain log:Seal ;
@@ -293,7 +301,28 @@ log:ChainBroken a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
     log:minLevel log:always ;
     rdfs:label "ChainBroken" ;
-    rdfs:comment "A rotation that could not verify its predecessor. An entry, not an exception: the failure belongs in the record it is a failure of." .
+    rdfs:comment "A rotation that could not verify its predecessor. An entry, not an exception: the failure belongs in the record it is a failure of — an exception would be caught by whatever was rotating and the fact would leave no trace. Its subject column is the PREDECESSOR that failed to verify; it is written into the segment the rotation opened, because the one it is about has already been sealed." .
+
+log:expectedSeal a rdf:Property ;
+    log:keyName "expected" ;
+    rdfs:domain log:ChainBroken ;
+    rdfs:range xsd:string ;
+    rdfs:label "expectedSeal" ;
+    rdfs:comment "The chain head the predecessor actually ends at, tagged (sha256:…). Written beside log:statedSeal so the break is legible from the grepped line alone." .
+
+log:statedSeal a rdf:Property ;
+    log:keyName "stated" ;
+    rdfs:domain log:ChainBroken ;
+    rdfs:range xsd:string ;
+    rdfs:label "statedSeal" ;
+    rdfs:comment "What the broken segment's @prev claimed. Together with log:expectedSeal this is the whole of the rotation-seam failure: a forged replacement segment differs here and nowhere else that a hash-only check would look." .
+
+log:finding a rdf:Property ;
+    log:keyName "finding" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "finding" ;
+    rdfs:comment "One verification finding, in the same words `urn:log:verify` prints. Repeated per finding — a key may repeat in a line, and a chain break usually has more than one thing to say." .
 
 log:Tombstone a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
@@ -443,4 +472,4 @@ log:prevSeal a rdf:Property ;
     rdfs:domain log:Segment ;
     rdfs:range xsd:string ;
     rdfs:label "prevSeal" ;
-    rdfs:comment "The prior segment's final seal, from the @prev header — or the token `genesis`, which is always written rather than left absent so that a missing @prev is unambiguously an error. The chain spans rotations; without it, rotation is the seam at which a whole file can be replaced and nothing detects it." .
+    rdfs:comment "The prior segment's final seal, from the @prev header — or the token `genesis`, which is always written rather than left absent so that a missing @prev is unambiguously an error. Precisely: the hash on the predecessor's LAST #seal line, or its header hash h0 when it never sealed (a crashed process must not leave its successor unchainable, or a crash and an erasure would look alike). The chain spans rotations; without it, rotation is the seam at which a whole file can be replaced and nothing detects it, and every other test still passes." .

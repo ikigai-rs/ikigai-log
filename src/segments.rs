@@ -7,8 +7,10 @@
 //! [`UriTemplate`] rather than an [`Exact`]. A template matches **everything**
 //! under `urn:log:`, `urn:log:write` included — so the exact bindings must be
 //! registered FIRST and the template LAST. [`crate::endpoints::space`] does
-//! that, and a later milestone adding a `urn:log:verify` must add it above the
-//! template or it will silently resolve as a segment named `verify`.
+//! that. `urn:log:verify` is the case that proves it: bound below the template
+//! it resolves as a segment named `verify`, and the failure is `no segment
+//! <urn:log:verify>` rather than an unbound IRI — so nothing about the error
+//! says the binding order is what went wrong.
 //!
 //! ## The named-graph story is one sentence long
 //!
@@ -27,9 +29,13 @@
 //! elsewhere in this system, with every test still passing. There is no test
 //! signal for it, so the rule is stated rather than discovered:
 //!
-//! * a segment whose last entry is `log:ProcessStop` is **finished** — nothing
-//!   will ever append to it — so it is `.cacheable()`, under a golden thread on
-//!   its file;
+//! * a segment whose last entry is `log:ProcessStop` **or `log:Rotation`** is
+//!   **finished** — nothing will ever append to it — so it is `.cacheable()`,
+//!   under a golden thread on its file. ★ Both markers, and the second one is
+//!   the one that pays: a daemon writes one stop marker in its life and a
+//!   rotation every day, so a verifier that knew only about `ProcessStop` would
+//!   treat every rotated segment — the common case for analysis — as a live tail
+//!   forever, at the full 4,900× below, and no test would fail;
 //! * anything else is **live** and uncacheable. That includes this process's own
 //!   open segment (which we know directly) and a segment whose process died
 //!   without an orderly stop (which we cannot distinguish from one still
@@ -79,7 +85,7 @@ use crate::graph::{to_turtle, Options, LOG_MEDIA_TYPE, TURTLE_MEDIA_TYPE};
 use crate::line::{Header, Line, Timestamp};
 use crate::vocabulary::Vocabulary;
 #[cfg(not(target_family = "wasm"))]
-use crate::vocabulary::PROCESS_STOP_CLASS;
+use crate::vocabulary::{PROCESS_STOP_CLASS, ROTATION_CLASS};
 
 /// The transreptor: `text/x-ikigai-log` → `text/turtle`.
 pub const TRANSREPT_IRI: &str = "urn:log:transrept";
@@ -87,6 +93,12 @@ pub const TRANSREPT_IRI: &str = "urn:log:transrept";
 #[cfg(not(target_family = "wasm"))]
 /// The segments this process can see.
 pub const SEGMENTS_IRI: &str = "urn:log:segments";
+
+#[cfg(not(target_family = "wasm"))]
+/// The chain walk. **Bound ABOVE [`SEGMENT_TEMPLATE`]** — below it this resolves
+/// as a segment named `verify` and the failure is `no segment <urn:log:verify>`,
+/// which says nothing about binding order.
+pub const VERIFY_IRI: &str = "urn:log:verify";
 
 #[cfg(not(target_family = "wasm"))]
 /// The segment space. **Must be bound after every exact `urn:log:*` IRI** — see
@@ -108,6 +120,8 @@ const SEGMENT_EXTENSION: &str = "log";
 const HEADER_PROBE_BYTES: usize = 8 * 1024;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+#[cfg(not(target_family = "wasm"))]
+const RDFS_RESOURCE: &str = "http://www.w3.org/2000/01/rdf-schema#Resource";
 #[cfg(not(target_family = "wasm"))]
 const XSD_DATE_TIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 #[cfg(not(target_family = "wasm"))]
@@ -247,9 +261,12 @@ impl SegmentEndpoint {
 #[async_trait]
 impl Endpoint for SegmentEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb == Verb::Exists {
+            return self.exists(inv);
+        }
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
-                "a segment is a Source; it does not answer {:?}",
+                "a segment is a Source or an Exists; it does not answer {:?}",
                 inv.request.verb
             )));
         }
@@ -340,13 +357,22 @@ impl Endpoint for SegmentEndpoint {
                  graph named by that IRI — which is the whole of the named-graph story, and \
                  makes cross-segment analysis a matter of listing two graphs. as=\
                  text/x-ikigai-log serves the segment file itself. A FINISHED segment (its \
-                 last entry is log:ProcessStop) is cacheable under a golden thread on its \
-                 file; a live one is not, and no watcher pretends otherwise. Transreption is \
+                 last entry is log:ProcessStop or log:Rotation — a rotated segment is as \
+                 immutable as a stopped one, and it is the common case) is cacheable under a \
+                 golden thread on its file; a live one is not, and no watcher pretends \
+                 otherwise. Transreption is \
                  O(segment) — narrow it with since/until/from_seq/to_seq rather than \
                  filtering a year of entries in SPARQL.",
             )
             .verb(Verb::Source)
+            .verb(Verb::Exists)
             .verb(Verb::Meta)
+            .action(
+                ActionSpec::new(Verb::Exists)
+                    .summary("whether a segment with this IRI is here")
+                    .requires(CAP_READ)
+                    .output(TEXT_PLAIN),
+            )
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("the segment, as a graph or as itself")
@@ -393,6 +419,35 @@ impl Endpoint for SegmentEndpoint {
 
 #[cfg(not(target_family = "wasm"))]
 impl SegmentEndpoint {
+    /// `Exists`: is there a segment here, without paying to read one?
+    ///
+    /// Answering a chain walk's actual question. `@prev` and `next=` name
+    /// segments, and following either wants "is it still here" — which under
+    /// retention is a different answer from "does it verify", and O(header)
+    /// rather than O(segment).
+    fn exists(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_READ) {
+            return Err(Error::Denied(format!(
+                "asking after a log segment requires `{CAP_READ}`"
+            )));
+        }
+        let iri = inv.request.target.as_str().to_string();
+        let Some(tail) = inv.bindings.get(SEGMENT_BINDING) else {
+            return Err(Error::Endpoint("no segment named".to_string()));
+        };
+        let directory = self.directory()?;
+        let found = locate(&directory, tail, &iri);
+        // Uncacheable for the reason the listing is: the directory changes under
+        // rotation and retention, and nothing cuts a thread on a directory — but
+        // a found segment still declares its file's thread, so a reader that
+        // caches downstream of this is not caching a stale "yes".
+        let repr = plain(if found.is_some() { "true" } else { "false" });
+        Ok(match found {
+            Some(path) => repr.depends_on(format!("urn:file:{}", path.display())),
+            None => repr,
+        })
+    }
+
     fn directory(&self) -> Result<PathBuf> {
         crate::writer::resolve_directory(&self.handle.config())
             .ok_or_else(|| Error::Endpoint(crate::writer::WriteError::NoDirectory.to_string()))
@@ -402,10 +457,20 @@ impl SegmentEndpoint {
     ///
     /// Two questions, and the cheap definitive one first: this process's own
     /// open segment is live by construction, whatever its bytes currently say.
-    /// Otherwise the segment's own always-land stop marker decides — a segment
+    /// Otherwise the segment's own always-land END marker decides — a segment
     /// that ends without one ended because the process died, and a dead
     /// process's segment is indistinguishable from a running one's, so it stays
     /// live and uncached rather than being guessed finished.
+    ///
+    /// ★ **There are TWO end markers, and forgetting the second one is the
+    /// expensive mistake.** `log:ProcessStop` ends a segment because the process
+    /// stopped; `log:Rotation` ends it because the segment rolled over — and the
+    /// rotated segment is the COMMON case for analysis, since a long-running
+    /// daemon writes one stop marker in its life and a rotation every day. Keying
+    /// this on the stop marker alone leaves every rotated segment permanently
+    /// uncacheable, at **196 ms live versus 40 µs cached — ~4,900× — on every
+    /// read**, with no test failing either way, because expiry is not a property
+    /// any assertion about the graph can see.
     fn is_finished(&self, iri: &str, text: &str) -> bool {
         if self
             .handle
@@ -414,7 +479,7 @@ impl SegmentEndpoint {
         {
             return false;
         }
-        ends_with_stop(text, &self.vocabulary)
+        ends_finally(text, &self.vocabulary)
     }
 }
 
@@ -453,12 +518,18 @@ fn window(inv: &Invocation<'_>) -> Result<Options> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Whether the last entry in `text` is a `log:ProcessStop`.
+/// Whether the last entry in `text` ends the segment for good — a
+/// `log:ProcessStop` or a `log:Rotation`.
 ///
-/// Reads the classes, not the bytes: a module's own stop subclass counts,
-/// because `log:ProcessStop`'s meaning is "this process ended in an orderly
-/// way" and a subclass means the same thing more precisely.
-fn ends_with_stop(text: &str, vocabulary: &Vocabulary) -> bool {
+/// Reads the classes, not the bytes: a module's own stop or rotation subclass
+/// counts, because `log:ProcessStop` means "this process ended in an orderly
+/// way" and `log:Rotation` means "this segment rolled over", and a subclass of
+/// either means the same thing more precisely.
+///
+/// The LAST entry, not "contains one": a rotation marker is followed by a
+/// `#seal` line and nothing else, and a stop marker likewise, so a segment whose
+/// last entry is anything else still has a live tail.
+fn ends_finally(text: &str, vocabulary: &Vocabulary) -> bool {
     let Ok((header, offset)) = Header::parse(text) else {
         return false;
     };
@@ -468,7 +539,9 @@ fn ends_with_stop(text: &str, vocabulary: &Vocabulary) -> bool {
             last = Some(entry.class);
         }
     }
-    last.is_some_and(|class| vocabulary.is_a(&class, PROCESS_STOP_CLASS))
+    last.is_some_and(|class| {
+        vocabulary.is_a(&class, PROCESS_STOP_CLASS) || vocabulary.is_a(&class, ROTATION_CLASS)
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -513,8 +586,60 @@ fn segment_files(directory: &Path) -> Vec<(String, PathBuf)> {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// The newest segment file written by `instance` in `directory`, if any.
+///
+/// "Newest" is the largest `@name` — the segment IRI ends in a fixed-width UTC
+/// stamp, so IRI order IS chronological order within an instance. Read from each
+/// file's own header rather than from its name, so a renamed file is still found
+/// by what it says it is.
+pub(crate) fn newest_for_instance(directory: &Path, instance: &str) -> Option<PathBuf> {
+    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == SEGMENT_EXTENSION))
+        .filter_map(|path| header_of(&path).map(|header| (header, path)))
+        .filter(|(header, _)| header.instance == instance)
+        .map(|(header, path)| (header.name, path))
+        .collect();
+    found.sort();
+    found.pop().map(|(_, path)| path)
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// The segment this instance wrote immediately BEFORE `segment` — the largest
+/// `@name` strictly less than it.
+///
+/// What a rotation checks its newly sealed segment against. The link only means
+/// something against the segment it actually claims to follow, and the newest
+/// file is the one just sealed.
+pub(crate) fn predecessor_of(
+    directory: &Path,
+    instance: &str,
+    segment: &str,
+) -> Option<(String, PathBuf)> {
+    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == SEGMENT_EXTENSION))
+        .filter_map(|path| header_of(&path).map(|header| (header, path)))
+        .filter(|(header, _)| header.instance == instance && header.name.as_str() < segment)
+        .map(|(header, path)| (header.name, path))
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+#[cfg(not(target_family = "wasm"))]
 /// A segment's `@name`, read from the head of the file.
 fn header_name(path: &Path) -> Option<String> {
+    header_of(path).map(|header| header.name)
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// A segment's header, read from the head of the file.
+fn header_of(path: &Path) -> Option<Header> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut buffer = vec![0u8; HEADER_PROBE_BYTES];
     let read = file.read(&mut buffer).ok()?;
@@ -526,7 +651,209 @@ fn header_name(path: &Path) -> Option<String> {
     // on, so give the parser one rather than reporting a missing directive.
     let mut owned = text.into_owned();
     owned.push_str("\n\n");
-    Header::parse(&owned).ok().map(|(header, _)| header.name)
+    Header::parse(&owned).ok().map(|(header, _)| header)
+}
+
+// =====================================================================================
+// urn:log:verify — the chain, walked
+// =====================================================================================
+
+#[cfg(not(target_family = "wasm"))]
+/// The verifier: walk the chain and say what it found.
+pub struct VerifyEndpoint {
+    handle: Arc<LogHandle>,
+    vocabulary: Arc<Vocabulary>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl VerifyEndpoint {
+    /// A verifier over `handle`'s configured directory.
+    pub fn new(handle: Arc<LogHandle>, vocabulary: Arc<Vocabulary>) -> VerifyEndpoint {
+        VerifyEndpoint { handle, vocabulary }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[async_trait]
+impl Endpoint for VerifyEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "{VERIFY_IRI} is a Source; it does not answer {:?}",
+                inv.request.verb
+            )));
+        }
+        if !inv.capability.allows(CAP_READ) {
+            return Err(Error::Denied(format!(
+                "verifying the log requires `{CAP_READ}`"
+            )));
+        }
+
+        // A piped segment is verified in ISOLATION: everything except the
+        // rotation link, because a blob arriving over a wire has no predecessor
+        // to be checked against. Reported by the absence of a PrevMismatch
+        // rather than by asserting a link that was never examined.
+        if let Ok(bytes) = inv.inline_arg("content") {
+            let text = std::str::from_utf8(bytes).map_err(|e| Error::InvalidArgument {
+                name: "content".to_string(),
+                detail: format!("a segment is UTF-8 text: {e}"),
+            })?;
+            let report = crate::chain::verify_segment(text, &self.vocabulary, None);
+            return Ok(plain(
+                crate::chain::ChainReport {
+                    segments: vec![report],
+                }
+                .render(),
+            ));
+        }
+
+        let directory = crate::writer::resolve_directory(&self.handle.config())
+            .ok_or_else(|| Error::Endpoint(crate::writer::WriteError::NoDirectory.to_string()))?;
+        let wanted_segment = match inv.inline_str("segment").map(str::trim) {
+            Err(_) | Ok("") => None,
+            Ok(iri) => Some(iri.to_string()),
+        };
+        let wanted_instance = match inv.inline_str("instance").map(str::trim) {
+            Err(_) | Ok("") => None,
+            Ok(iri) => Some(iri.to_string()),
+        };
+
+        let mut body = String::new();
+        let mut chains = 0usize;
+        for (instance, chain) in chains_in(&directory) {
+            if wanted_instance
+                .as_ref()
+                .is_some_and(|want| want != &instance)
+            {
+                continue;
+            }
+            if wanted_segment
+                .as_ref()
+                .is_some_and(|want| !chain.iter().any(|(name, _)| name == want))
+            {
+                continue;
+            }
+            chains += 1;
+            body.push_str(&crate::chain::verify_chain(&chain, &self.vocabulary).render());
+        }
+        if chains == 0 {
+            // Named rather than answered with an empty report: "nothing to
+            // verify" and "verified nothing, all fine" are opposite facts and a
+            // blank body would read as the second.
+            return Err(Error::NotFound(format!(
+                "no segments to verify in {}",
+                directory.display()
+            )));
+        }
+        // NOT cacheable, for the reason the listing is not: the directory changes
+        // under rotation, the open segment changes under every write, and nothing
+        // cuts a thread on either. A cached verdict is the one kind of stale
+        // answer this endpoint must never give.
+        Ok(plain(body))
+    }
+
+    fn name(&self) -> &str {
+        "logVerify"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("logVerify")
+            .title("Verify the log")
+            .summary(
+                "Walk the hash chain and report what it finds, one `segment <iri> OK|BROKEN` \
+                 line per segment with its findings indented beneath — greppable like \
+                 everything else here. Checks FOUR things, not one: that each entry hashes \
+                 into the seal that covers it (so tampering localizes to `between seal K and \
+                 K+1`); that each segment's @prev names its predecessor's final seal, WHICH \
+                 IS WHAT MAKES ROTATION SOMETHING OTHER THAN A SEAM — a forged replacement \
+                 segment fails exactly here and nowhere else; that seal coverage and entry \
+                 sequences are contiguous, since emission advances the counter only for \
+                 entries actually written, so a jump means lines were REMOVED and not \
+                 filtered; and that every gap is BRACKETED — two adjacent segments at \
+                 different levels need a log:LevelChange, because a chain is tamper-evident \
+                 and NOT omission-evident, and a lowered level is sanctioned omission the \
+                 chain would otherwise bless as intact. What it does NOT establish: seal \
+                 SIGNATURES are stated, not checked (that is `urn:sign:verify` with the \
+                 public key — this crate resolves no key), and the level is checked as \
+                 RECORDED, not as authentic (a level MAC needs a key the application cannot \
+                 hold). An unmarked end or an unsealed tail is reported as `noted`, not \
+                 `BROKEN`: a crashed process is not a tamperer, and a verifier that cried \
+                 wolf on every daemon restart would be a verifier nobody read. Uncacheable.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("verify the chain")
+                    .requires(CAP_READ)
+                    .input(
+                        ArgSpec::new("segment")
+                            .summary(
+                                "verify the chain this segment belongs to; omit for every chain \
+                                 in the directory",
+                            )
+                            .class(RDFS_RESOURCE)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("instance")
+                            .summary("verify this instance's chain — one chain per instance")
+                            .class(RDFS_RESOURCE)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("content")
+                            .summary(
+                                "a segment's bytes, verified in ISOLATION: everything except \
+                                 the @prev link, which needs a predecessor this has none of",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .output(TEXT_PLAIN),
+            )
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Every chain in `directory`, as `(instance IRI, [(segment IRI, bytes)])`,
+/// each chain oldest-first.
+///
+/// **One chain per INSTANCE**, because the instance is the attribution key: a
+/// machine's log directory holds as many chains as it has instances, and a
+/// disambiguated name is a chain of its own — which is right, since it is a
+/// different process that never claimed to continue anyone.
+fn chains_in(directory: &Path) -> Vec<(String, Vec<(String, String)>)> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut by_instance: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == SEGMENT_EXTENSION))
+        .collect();
+    found.sort();
+    for path in found {
+        let Some(header) = header_of(&path) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        by_instance
+            .entry(header.instance)
+            .or_default()
+            .push((header.name, text));
+    }
+    for chain in by_instance.values_mut() {
+        // The segment IRI ends in a fixed-width UTC stamp, so IRI order IS
+        // chronological order within an instance — the same property that makes
+        // `grep '^2026-08-23T09:'` a query.
+        chain.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+    by_instance.into_iter().collect()
 }
 
 // =====================================================================================

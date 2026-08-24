@@ -722,7 +722,9 @@ fn a_written_segment_reparses_and_yields_back_what_went_in() {
     assert_eq!(
         header.prev,
         Prev::Genesis,
-        "T4 owns the chain; T2 claims nothing"
+        "the header carries the chain link explicitly — genesis is WRITTEN, so a \
+         missing @prev is unambiguously an error rather than an ambiguous \
+         \"maybe first\""
     );
     assert_eq!(header.started, at(1_700_000_000_000));
 
@@ -1776,7 +1778,7 @@ fn invoked_is_materialized_within_one_run_and_never_across_a_process_start() {
 fn a_seal_transrepts_as_what_it_says_and_asserts_nothing_about_its_validity() {
     let (segment, text) = written_segment("info", |_| {});
     let mut text = text;
-    text.push_str("#seal 1-42 sha256:4c1e0d sig:MEUCIQD\n");
+    text.push_str("#seal 1-42 sha256:4c1e0d Ed25519:MEUCIQD\n");
     text.push_str("#seal 43-99 sha256:9ab7\n");
 
     let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
@@ -1795,18 +1797,29 @@ fn a_seal_transrepts_as_what_it_says_and_asserts_nothing_about_its_validity() {
         &log("lastSequence"),
         typed("42", "http://www.w3.org/2001/XMLSchema#integer")
     ));
-    // The tokens EXACTLY as the line wrote them. T3 states; T4 verifies.
+    // The digest EXACTLY as the line wrote it — tagged, which is the same
+    // lexical form ikigai-sign writes on the same predicate, so the two producers
+    // join instead of silently never matching.
     assert!(states(
         &triples,
         &seal,
         &format!("{SIG_NS}contentHash"),
         string("sha256:4c1e0d")
     ));
+    // The signature column is SPLIT: a line has columns and a graph does not, and
+    // a graph that kept the packing would make sig:value mean something different
+    // here than in a signature-graph — which is exactly the join being bought.
+    assert!(states(
+        &triples,
+        &seal,
+        &format!("{SIG_NS}algorithm"),
+        string("Ed25519")
+    ));
     assert!(states(
         &triples,
         &seal,
         &format!("{SIG_NS}value"),
-        string("sig:MEUCIQD")
+        string("MEUCIQD")
     ));
 
     // An unsigned seal still localizes tampering, so it is not an error and it
@@ -2304,4 +2317,1029 @@ fn a_segment_is_a_named_graph_to_sparql_because_it_resolves_to_turtle() {
     // and it is correct: a cached answer about a log that is still being written
     // is a stale answer.
     assert_eq!(results.expiry, Expiry::Always);
+}
+
+// =====================================================================================
+// The chain, the seal, the rotation, and verify
+//
+// Four layers, tested as one piece — because a partial chain is worse than none:
+// it looks verifiable. Each test below names which layer it is defending, and the
+// forged-segment test is the one a naive implementation passes silently.
+// =====================================================================================
+
+use crate::chain::{
+    head_of, split_signature, verify_chain, verify_segment, Chain, Finding, RotationPolicy,
+    SealPolicy, SealSigner,
+};
+use crate::endpoints::CONFIG_IRI as CONFIG;
+use crate::segments::VERIFY_IRI;
+use crate::vocabulary::{CHAIN_BROKEN_CLASS, ROTATION_CLASS};
+
+/// A signer that is not cryptography — it is the SEAM. What is asserted is that
+/// the seam is reached with the tagged chain hash and that its answer round-trips
+/// through the line and into the graph; whether Ed25519 works is `ikigai-sign`'s
+/// test, and duplicating it here would test that crate from this one.
+struct TestSigner;
+
+impl SealSigner for TestSigner {
+    fn algorithm(&self) -> &str {
+        "Ed25519"
+    }
+
+    fn sign(&self, tagged_hash: &str) -> Option<String> {
+        // Deterministic and dependent on the input, so a seal signed over the
+        // wrong hash would show up as the wrong token rather than as no token.
+        Some(format!("SIG{}", &tagged_hash[tagged_hash.len() - 8..]))
+    }
+}
+
+/// A file-destination handle over `dir`, at `level`, under `instance`.
+fn chained_handle(dir: &Path, instance: &str, level: &str, now: u64) -> Arc<LogHandle> {
+    let config = LogConfig::default()
+        .with_instance(instance)
+        .with_level(level)
+        .expect("a real level")
+        .with_destination(Destination::File)
+        .with_directory(dir);
+    let handle = Arc::new(LogHandle::new(Some(dir.to_path_buf()), None, config));
+    handle
+        .open(Vocabulary::shared_builtin(), at(now))
+        .expect("the segment opens");
+    handle
+}
+
+fn message(now: u64, text: &str) -> Entry {
+    Entry::new(at(now), MESSAGE_CLASS, "urn:agent:test").with("msg", text)
+}
+
+/// Every segment file in `dir`, as `(IRI, bytes)`, oldest first.
+fn segments_on_disk(dir: &Path) -> Vec<(String, String)> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("the scratch dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    paths.sort();
+    let mut found: Vec<(String, String)> = paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).expect("readable");
+            let (header, _) = Header::parse(&text).expect("a segment");
+            (header.name, text)
+        })
+        .collect();
+    found.sort_by(|(a, _), (b, _)| a.cmp(b));
+    found
+}
+
+fn path_of(dir: &Path, segment: &str) -> PathBuf {
+    std::fs::read_dir(dir)
+        .expect("the scratch dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .find(|p| {
+            let text = std::fs::read_to_string(p).unwrap_or_default();
+            Header::parse(&text).is_ok_and(|(h, _)| h.name == segment)
+        })
+        .unwrap_or_else(|| panic!("a file for <{segment}>"))
+}
+
+#[test]
+fn a_segment_chains_and_seals_and_the_seal_is_the_chain_head() {
+    // Layers 1 and 2. The seal is not decoration over the entries: it states the
+    // running hash, which is what makes "between seal K and K+1" a range that
+    // means something.
+    let (mut writer, captured) = writer_at("info");
+    writer.write(message(1, "one")).expect("writes");
+    writer.write(message(2, "two")).expect("writes");
+    let seal = writer
+        .seal(at(3))
+        .expect("the seal lands")
+        .expect("there was something to seal");
+    assert_eq!((seal.first, seal.last), (1, 3), "ProcessStart is seq 1");
+
+    let text = captured.text();
+    let (header, offset) = Header::parse(&text).expect("a segment");
+    let mut recomputed = Chain::open(&header);
+    for raw in text[offset..].lines() {
+        if let Ok(Line::Entry(_)) = Line::parse(raw, &header.prefixes) {
+            recomputed.advance(raw);
+        }
+    }
+    assert_eq!(
+        seal.hash,
+        recomputed.head(),
+        "a reader recomputes exactly what the writer committed — the same two \
+         functions, not two implementations of one rule"
+    );
+    assert!(
+        seal.hash.starts_with("sha256:"),
+        "tagged at the boundary: {}",
+        seal.hash
+    );
+    assert_eq!(
+        seal.signature, None,
+        "no signer was installed, and that is a supported posture — an unsigned \
+         seal still localizes tampering"
+    );
+    assert!(
+        !text
+            .lines()
+            .filter(|l| !l.starts_with("#seal"))
+            .any(|l| l.contains("sha256:")),
+        "NOT a hash per line: that column is exactly the noise that would wreck \
+         grep, which is a first-order requirement of this format\n{text}"
+    );
+}
+
+#[test]
+fn the_seal_cadence_fires_on_entries_and_on_time_and_both_are_needed() {
+    // The time bound is not optional. N alone leaves a quiet log unsealed for
+    // days, and the unsealed tail is precisely what an attacker rewrites for free.
+    let captured = Captured::default();
+    let mut writer = Writer::open_with_sink_and(
+        &config_at("info"),
+        Vocabulary::shared_builtin(),
+        at(0),
+        captured.sink(),
+        crate::writer::WriterOptions {
+            seals: SealPolicy {
+                every_entries: 3,
+                every_millis: 10_000,
+            },
+            rotation: RotationPolicy::manual(),
+            prev: None,
+            signer: None,
+        },
+    )
+    .expect("the segment opens");
+
+    // Three entries including the ProcessStart: the count bound fires.
+    writer.write(message(1, "a")).expect("writes");
+    writer.write(message(2, "b")).expect("writes");
+    let seals: Vec<Seal> = captured
+        .text()
+        .lines()
+        .filter_map(|l| Seal::parse(l).ok())
+        .collect();
+    assert_eq!(seals.len(), 1, "3 entries reached the count bound");
+    assert_eq!((seals[0].first, seals[0].last), (1, 3));
+
+    // One more entry, far too few for the count bound — but past the time bound.
+    writer.write(message(20_000, "c")).expect("writes");
+    let seals: Vec<Seal> = captured
+        .text()
+        .lines()
+        .filter_map(|l| Seal::parse(l).ok())
+        .collect();
+    assert_eq!(
+        seals.len(),
+        2,
+        "the TIME bound sealed a tail the count bound would have left open for \
+         as long as the log stayed quiet"
+    );
+    assert_eq!((seals[1].first, seals[1].last), (4, 4));
+}
+
+#[test]
+fn a_signer_signs_the_tagged_hash_and_the_token_splits_into_the_graph() {
+    let captured = Captured::default();
+    let mut writer = Writer::open_with_sink_and(
+        &config_at("info"),
+        Vocabulary::shared_builtin(),
+        at(0),
+        captured.sink(),
+        crate::writer::WriterOptions {
+            seals: SealPolicy::manual(),
+            rotation: RotationPolicy::manual(),
+            prev: None,
+            signer: Some(Box::new(TestSigner)),
+        },
+    )
+    .expect("the segment opens");
+    writer.write(message(1, "signed")).expect("writes");
+    let seal = writer
+        .seal(at(2))
+        .expect("seals")
+        .expect("something to seal");
+
+    let token = seal.signature.clone().expect("the signer was reached");
+    let (algorithm, value) = split_signature(&token).expect("the token is tagged");
+    assert_eq!(algorithm, "Ed25519");
+    assert_eq!(
+        value,
+        format!("SIG{}", &seal.hash[seal.hash.len() - 8..]),
+        "what was signed is the TAGGED CHAIN HASH — which is what a verifier \
+         reconstructs, and what `urn:sign:verify in=<that>` would be handed"
+    );
+
+    // And the graph splits it, so a seal's signature joins with a signature-graph
+    // written by ikigai-sign rather than meaning something different here.
+    let triples = reparse(
+        &crate::graph::to_turtle(
+            &captured.text(),
+            Vocabulary::builtin(),
+            &crate::graph::Options::all(),
+        )
+        .expect("the segment transrepts"),
+    );
+    let (segment, _) = Header::parse(&captured.text())
+        .map(|(h, _)| (h.name, ()))
+        .expect("a segment");
+    let node = format!("{segment}:seal:1-2");
+    assert!(
+        states(
+            &triples,
+            &node,
+            "https://ikigai-rs.dev/ns/sign#algorithm",
+            string("Ed25519")
+        ),
+        "sig:algorithm, split out of the line's packed column"
+    );
+    assert!(
+        states(
+            &triples,
+            &node,
+            "https://ikigai-rs.dev/ns/sign#value",
+            string(value)
+        ),
+        "sig:value is the signature ALONE, as it is in a signature-graph"
+    );
+    assert!(
+        states(
+            &triples,
+            &node,
+            "https://ikigai-rs.dev/ns/sign#contentHash",
+            string(&seal.hash)
+        ),
+        "sig:contentHash is tagged at both ends, so the two producers join"
+    );
+}
+
+#[test]
+fn a_tampered_entry_inside_a_sealed_range_fails_and_the_failure_names_the_range() {
+    // ★ The localization claim, which IS the product. "This segment is broken" is
+    // not an answer; "between sequence 1 and 5 of this segment" is.
+    let dir = Scratch::new("tamper");
+    let handle = chained_handle(dir.path(), "bug:tamper", "info", 1_700_000_000_000);
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    handle.write(message(1_700_000_001_000, "before")).ok();
+    handle.write(message(1_700_000_002_000, "middle")).ok();
+    handle.write(message(1_700_000_003_000, "after")).ok();
+    handle
+        .close(at(1_700_000_004_000))
+        .expect("an orderly close");
+
+    let path = path_of(dir.path(), &segment);
+    let honest = std::fs::read_to_string(&path).expect("readable");
+    assert!(
+        verify_segment(&honest, Vocabulary::builtin(), None).ok(),
+        "the untampered segment verifies"
+    );
+
+    // The attacker rewrites one message and leaves everything else alone — the
+    // subtlest edit there is, and the one a log's own reader would never notice.
+    let tampered = honest.replace(r#"msg=middle"#, r#"msg=innocent"#);
+    assert_ne!(tampered, honest, "the tamper actually applied");
+    std::fs::write(&path, &tampered).expect("writable");
+
+    let report = verify_segment(&tampered, Vocabulary::builtin(), None);
+    assert!(!report.ok(), "a tampered entry does not verify");
+    let named = report
+        .findings
+        .iter()
+        .find_map(|f| match f {
+            Finding::SealMismatch { first, last, .. } => Some((*first, *last)),
+            _ => None,
+        })
+        .expect("the failure is a seal mismatch");
+    assert_eq!(
+        named,
+        (1, 5),
+        "and it NAMES the range: ProcessStart, three messages, ProcessStop"
+    );
+    assert!(
+        report
+            .render_findings()
+            .contains("between sequence 1 and 5"),
+        "the range is in the words, not only in the struct: {}",
+        report.render_findings()
+    );
+}
+
+#[test]
+fn a_forged_replacement_segment_fails_because_at_prev_does_not_match() {
+    // ★★ LAYER 3, and the test a naive implementation passes silently. Every
+    // other check here is satisfied by the forgery — its chain recomputes, its
+    // seals agree, its sequences are dense, it ends on a rotation marker. A
+    // per-file chain would call it perfect. What it cannot forge is the
+    // SUCCESSOR's @prev, which was written before the forgery existed.
+    let dir = Scratch::new("forge");
+    let handle = chained_handle(dir.path(), "bug:forge", "info", 1_700_000_000_000);
+    let (first, _) = handle.open_segment().expect("a segment is open");
+    handle.write(message(1_700_000_001_000, "damning")).ok();
+    handle.write(message(1_700_000_002_000, "ordinary")).ok();
+    handle
+        .rotate(at(1_700_000_060_000))
+        .expect("the rotation completes")
+        .expect("a file destination rotates");
+    handle.write(message(1_700_000_061_000, "later")).ok();
+    handle
+        .close(at(1_700_000_062_000))
+        .expect("an orderly close");
+
+    let on_disk = segments_on_disk(dir.path());
+    assert_eq!(on_disk.len(), 2, "one rotation makes two segments");
+    assert!(
+        verify_chain(&on_disk, Vocabulary::builtin()).ok(),
+        "the honest chain verifies:\n{}",
+        verify_chain(&on_disk, Vocabulary::builtin()).render()
+    );
+
+    // The forgery: the damning entry is gone, and everything a per-file check
+    // could look at has been made consistent again.
+    let path = path_of(dir.path(), &first);
+    let honest = std::fs::read_to_string(&path).expect("readable");
+    let forged = forge_without(&honest, "damning");
+    std::fs::write(&path, &forged).expect("writable");
+
+    assert!(
+        verify_segment(&forged, Vocabulary::builtin(), None).ok(),
+        "the forgery is INTERNALLY perfect — this is the point of the test:\n{}",
+        verify_segment(&forged, Vocabulary::builtin(), None).render_findings()
+    );
+    assert!(
+        !forged.contains("damning"),
+        "and the entry is genuinely gone"
+    );
+
+    let report = verify_chain(&segments_on_disk(dir.path()), Vocabulary::builtin());
+    assert!(
+        !report.ok(),
+        "★ the chain spans the rotation, so the forgery is caught:\n{}",
+        report.render()
+    );
+    let successor = report
+        .segments
+        .iter()
+        .find(|s| s.name != first)
+        .expect("the successor is in the report");
+    assert!(
+        successor
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::PrevMismatch { .. })),
+        "and it is caught at the SEAM — @prev, and nowhere a per-file chain \
+         would look: {:?}",
+        successor.findings
+    );
+}
+
+/// Rebuild a segment without the entries matching `drop`, as a competent forger
+/// would: sequences renumbered densely, every seal recomputed over the surviving
+/// chain, header untouched.
+///
+/// In the tests rather than in the crate, obviously — but written from the crate's
+/// OWN primitives, because a forgery built by a weaker method would prove nothing
+/// about what the verifier catches.
+fn forge_without(text: &str, drop: &str) -> String {
+    let (header, offset) = Header::parse(text).expect("a segment");
+    let mut out = header.render().expect("the header renders");
+    let mut chain = Chain::open(&header);
+    let mut seq = 0u64;
+    let mut sealed = 0u64;
+    for raw in text[offset..].lines() {
+        match Line::parse(raw, &header.prefixes) {
+            Ok(Line::Entry(entry)) => {
+                if raw.contains(drop) {
+                    continue;
+                }
+                seq += 1;
+                let mut fields = vec![("seq".to_string(), seq.to_string())];
+                fields.extend(
+                    entry
+                        .fields
+                        .iter()
+                        .filter(|(k, _)| k != "seq")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
+                let line = Entry {
+                    time: entry.time,
+                    class: entry.class,
+                    subject: entry.subject,
+                    fields,
+                }
+                .render(&header.prefixes)
+                .expect("renders");
+                chain.advance(&line);
+                out.push_str(&line);
+                out.push('\n');
+            }
+            Ok(Line::Seal(_)) if seq > sealed => {
+                out.push_str(
+                    &Seal {
+                        first: sealed + 1,
+                        last: seq,
+                        hash: chain.head().to_string(),
+                        signature: None,
+                    }
+                    .render(),
+                );
+                out.push('\n');
+                sealed = seq;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn a_rotation_that_cannot_verify_its_predecessor_lands_chain_broken_and_does_not_panic() {
+    // Layer 4. The failure belongs in the record it is a failure of — an entry,
+    // not an exception, because an exception would be caught by whatever was
+    // rotating and the fact would leave no trace at all.
+    let dir = Scratch::new("broken");
+    let handle = chained_handle(dir.path(), "bug:broken", "info", 1_700_000_000_000);
+    let (first, _) = handle.open_segment().expect("a segment is open");
+    handle.write(message(1_700_000_001_000, "one")).ok();
+    handle
+        .rotate(at(1_700_000_060_000))
+        .expect("the first rotation completes")
+        .expect("a file destination rotates");
+
+    // Tamper the now-sealed first segment while the process runs on. This is the
+    // realistic attack: nobody edits a file the writer holds open.
+    let path = path_of(dir.path(), &first);
+    let text = std::fs::read_to_string(&path).expect("readable");
+    std::fs::write(&path, text.replace("msg=one", "msg=two")).expect("writable");
+
+    handle.write(message(1_700_000_061_000, "second")).ok();
+    let third = handle
+        .rotate(at(1_700_000_120_000))
+        .expect("the rotation completes rather than throwing")
+        .expect("a file destination rotates");
+
+    let opened = std::fs::read_to_string(path_of(dir.path(), &third)).expect("readable");
+    assert!(
+        opened.contains("log:ChainBroken"),
+        "the rotation recorded what it found, in the log:\n{opened}"
+    );
+    assert!(
+        opened.contains(&first),
+        "and it names the segment that failed, not merely that something did"
+    );
+    assert!(
+        opened.contains("finding="),
+        "with what was wrong, in the words verify uses:\n{opened}"
+    );
+
+    // Not fatal, and that is deliberate: a rotation that refused to complete
+    // because a predecessor was tampered with would stop the log, which is
+    // exactly what a tamperer wants.
+    assert!(handle.is_open(), "the log kept logging");
+    handle.close(at(1_700_000_121_000)).expect("closes");
+}
+
+#[test]
+fn the_chain_survives_a_restart_and_a_different_instance_starts_its_own() {
+    // The chain spans process RESTARTS as well as rotations: a writer opening on
+    // a file destination reads the newest segment of its own instance and chains
+    // from its head. Per INSTANCE, because the instance is the attribution key.
+    let dir = Scratch::new("restart");
+    let first = chained_handle(dir.path(), "bug:restart", "info", 1_700_000_000_000);
+    let (first_segment, _) = first.open_segment().expect("open");
+    first.write(message(1_700_000_001_000, "run one")).ok();
+    first.close(at(1_700_000_002_000)).expect("closes");
+    let head = head_of(&std::fs::read_to_string(path_of(dir.path(), &first_segment)).unwrap())
+        .expect("a chain head");
+
+    let second = chained_handle(dir.path(), "bug:restart", "info", 1_700_000_060_000);
+    let (second_segment, _) = second.open_segment().expect("open");
+    second.close(at(1_700_000_061_000)).expect("closes");
+    let (header, _) = Header::parse(
+        &std::fs::read_to_string(path_of(dir.path(), &second_segment)).expect("readable"),
+    )
+    .expect("a segment");
+    assert_eq!(
+        header.prev,
+        Prev::Seal(head),
+        "a new PROCESS continues the chain — @prev names the predecessor's final \
+         seal, so a segment cannot be dropped between two runs either"
+    );
+
+    // A different instance is a different chain, and starts at genesis. That is
+    // the right reading rather than a limitation: it is a different process, and
+    // it never claimed to continue anyone.
+    let other = chained_handle(dir.path(), "bug:other", "info", 1_700_000_120_000);
+    let (other_segment, _) = other.open_segment().expect("open");
+    other.close(at(1_700_000_121_000)).expect("closes");
+    let (header, _) = Header::parse(
+        &std::fs::read_to_string(path_of(dir.path(), &other_segment)).expect("readable"),
+    )
+    .expect("a segment");
+    assert_eq!(header.prev, Prev::Genesis);
+}
+
+#[test]
+fn a_bracketed_gap_verifies_and_an_unexplained_one_does_not() {
+    // ★ THE omission check, and the reason verify is not just a hash walk. A hash
+    // chain is tamper-evident and NOT omission-evident: it proves nothing was
+    // ALTERED and cannot prove nothing was LEFT OUT. Lowering the level is
+    // sanctioned omission, and the chain would bless the hole as perfectly intact.
+    for bracketed in [true, false] {
+        let dir = Scratch::new(if bracketed {
+            "bracketed"
+        } else {
+            "unexplained"
+        });
+        let handle = chained_handle(dir.path(), "bug:level", "debug", 1_700_000_000_000);
+        handle.write(message(1_700_000_001_000, "at debug")).ok();
+        if bracketed {
+            // What a `urn:log:config` write lands: always-land, in the segment
+            // that was open when the change was made, effective at the next one.
+            handle
+                .write(
+                    Entry::new(at(1_700_000_002_000), LEVEL_CHANGE_CLASS, CONFIG)
+                        .with("key", "level")
+                        .with("from", "https://ikigai-rs.dev/ns/log#debug")
+                        .with("to", "https://ikigai-rs.dev/ns/log#info")
+                        .with("effective", "next-segment"),
+                )
+                .expect("an always-land entry lands at every level");
+        }
+        handle.set_config(
+            handle
+                .config()
+                .with_level("info")
+                .expect("a level the vocabulary defines"),
+        );
+        handle
+            .rotate(at(1_700_000_060_000))
+            .expect("rotates")
+            .expect("a file destination rotates");
+        handle.close(at(1_700_000_061_000)).expect("closes");
+
+        let report = verify_chain(&segments_on_disk(dir.path()), Vocabulary::builtin());
+        let unbracketed = report.segments.iter().any(|s| {
+            s.findings
+                .iter()
+                .any(|f| matches!(f, Finding::UnbracketedLevelChange { .. }))
+        });
+        if bracketed {
+            assert!(
+                report.ok() && !unbracketed,
+                "a level change that left a marker is EXPLAINED absence:\n{}",
+                report.render()
+            );
+        } else {
+            assert!(
+                unbracketed && !report.ok(),
+                "★ the level dropped from debug to info and nothing recorded it — \
+                 the hashes all agree, and that is exactly the point:\n{}",
+                report.render()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_removed_entry_is_caught_by_the_sequence_even_where_a_level_would_not_explain_it() {
+    // Emission advances the counter only for entries actually WRITTEN, so a
+    // level-filtered entry consumes no sequence number. That is what makes a jump
+    // mean "removed" rather than "filtered", and it is why the check is worth
+    // making at all.
+    let (mut writer, captured) = writer_at("info");
+    writer.write(message(1, "kept")).expect("writes");
+    writer
+        .write(Entry::new(at(2), log("Resolution"), "urn:x"))
+        .expect("filtered at info");
+    writer.write(message(3, "also kept")).expect("writes");
+    let text = captured.text();
+    assert!(
+        text.contains("seq=2") && text.contains("seq=3") && !text.contains("Resolution"),
+        "the filtered entry consumed no sequence number:\n{text}"
+    );
+
+    let gutted = text
+        .lines()
+        .filter(|l| !l.contains("msg=kept"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = verify_segment(&format!("{gutted}\n"), Vocabulary::builtin(), None);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::SequenceGap { after: 1, next: 3 })),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn a_crashed_tail_is_noted_and_not_called_broken() {
+    // The split that decides whether anyone reads this verifier. A daemon that
+    // was killed leaves an unmarked end on every restart, and a tool that called
+    // that BROKEN would train its operator to disregard the word.
+    let (mut writer, captured) = writer_at("info");
+    writer
+        .write(message(1, "and then nothing"))
+        .expect("writes");
+    let report = verify_segment(&captured.text(), Vocabulary::builtin(), None);
+    assert!(
+        report.ok(),
+        "a crash is not tampering:\n{}",
+        report.render_findings()
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::UnmarkedEnd { .. })),
+        "but it is REPORTED — silence about it would be the other failure: {:?}",
+        report.findings
+    );
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::UnsealedTail { from: 1, to: 2 })));
+}
+
+#[test]
+fn a_rotated_segment_is_finished_and_therefore_cacheable() {
+    // ★★ THE cacheability trap, and the single highest-value line in this
+    // milestone. `is_finished` keyed on log:ProcessStop ALONE leaves every
+    // ROTATED segment — the common case for analysis, since a daemon writes one
+    // stop marker in its life and a rotation every day — permanently uncacheable,
+    // at 196 ms live versus 40 µs cached, ~4,900×, with NO test failing either
+    // way, because expiry is not something an assertion about the graph can see.
+    let dir = Scratch::new("rotated-cacheable");
+    let handle = chained_handle(dir.path(), "bug:rot", "info", 1_700_000_000_000);
+    let (first, _) = handle.open_segment().expect("a segment is open");
+    handle.write(message(1_700_000_001_000, "before")).ok();
+    let second = handle
+        .rotate(at(1_700_000_060_000))
+        .expect("rotates")
+        .expect("a file destination rotates");
+    assert_ne!(first, second, "a rotation opens a new segment");
+
+    let kernel = kernel(handle.clone());
+    let rotated = source(&kernel, &first, &[]);
+    assert_eq!(
+        rotated.expiry,
+        Expiry::Never,
+        "a ROTATED segment is as immutable as a stopped one, and nothing will \
+         ever append to it again"
+    );
+    assert!(rotated
+        .threads()
+        .iter()
+        .any(|t| t.as_str().starts_with("urn:file:")));
+
+    // The successor is live, and stays uncached — this process is appending to it.
+    assert_eq!(source(&kernel, &second, &[]).expiry, Expiry::Always);
+
+    // And the rotation marker is the LAST entry, which is what `is_finished`
+    // reads: a rotation is followed by its final seal and nothing else.
+    let text = std::fs::read_to_string(path_of(dir.path(), &first)).expect("readable");
+    let last_entry = text
+        .lines()
+        .rfind(|l| Line::parse(l, &prefixes()).is_ok_and(|l| matches!(l, Line::Entry(_))))
+        .expect("entries");
+    assert!(last_entry.contains("log:Rotation"), "{text}");
+    assert!(
+        text.lines().last().is_some_and(|l| l.starts_with("#seal")),
+        "and the seal covers it — a rotation marker outside every checkpoint \
+         would be the one entry removable for free:\n{text}"
+    );
+    handle.close(at(1_700_000_120_000)).expect("closes");
+}
+
+#[test]
+fn the_rotation_marker_names_its_successor() {
+    let dir = Scratch::new("successor");
+    let handle = chained_handle(dir.path(), "bug:next", "info", 1_700_000_000_000);
+    let (first, _) = handle.open_segment().expect("open");
+    let second = handle
+        .rotate(at(1_700_000_060_000))
+        .expect("rotates")
+        .expect("rotates");
+    let text = std::fs::read_to_string(path_of(dir.path(), &first)).expect("readable");
+    assert!(
+        text.contains(&format!("next={second}")),
+        "the successor's IRI is derivable at the moment of rotation, which is the \
+         only reason it can be named before the segment exists:\n{text}"
+    );
+    handle.close(at(1_700_000_061_000)).expect("closes");
+
+    // And it transrepts as an edge, not as a string — log:successor's range is
+    // log:Segment, so the forward link joins.
+    let triples = reparse(
+        &crate::graph::to_turtle(&text, Vocabulary::builtin(), &crate::graph::Options::all())
+            .expect("transrepts"),
+    );
+    assert!(
+        objects(
+            &triples,
+            &format!("{first}:2"),
+            "https://ikigai-rs.dev/ns/log#successor"
+        )
+        .contains(&&node(&second)),
+        "log:successor is an IRI"
+    );
+}
+
+#[test]
+fn a_rotation_policy_rolls_the_segment_over_without_being_asked() {
+    let dir = Scratch::new("auto-rotate");
+    let config = LogConfig::default()
+        .with_instance("bug:auto")
+        .with_level("info")
+        .expect("a real level")
+        .with_destination(Destination::File)
+        .with_directory(dir.path());
+    let handle = Arc::new(LogHandle::new(Some(dir.path().to_path_buf()), None, config));
+    handle.set_policies(
+        SealPolicy::default(),
+        RotationPolicy {
+            max_entries: Some(3),
+            max_age_millis: None,
+        },
+    );
+    handle
+        .open(Vocabulary::shared_builtin(), at(1_700_000_000_000))
+        .expect("opens");
+
+    // ProcessStart is seq 1; two more reaches the bound and rolls over.
+    handle
+        .write(message(1_700_000_001_000, "a"))
+        .expect("writes");
+    handle
+        .write(message(1_700_000_002_000, "b"))
+        .expect("writes");
+    assert_eq!(
+        segments_on_disk(dir.path()).len(),
+        2,
+        "the segment rolled over on its own — a log has no tick of its own, so \
+         the write is the only moment there is to judge the policy at"
+    );
+    handle.close(at(1_700_000_003_000)).expect("closes");
+    let report = verify_chain(&segments_on_disk(dir.path()), Vocabulary::builtin());
+    assert!(
+        report.ok(),
+        "and the chain is intact across it:\n{}",
+        report.render()
+    );
+}
+
+#[test]
+fn verify_binds_above_the_template_and_reports_through_the_kernel() {
+    // ★ `urn:log:{segment}` is a template that matches EVERY urn:log: IRI. Bound
+    // below it, `urn:log:verify` resolves as a segment named `verify` and the
+    // failure is "no segment <urn:log:verify>" — an error that says nothing about
+    // what actually went wrong, so nothing but this test would catch it.
+    let dir = Scratch::new("verify-endpoint");
+    let handle = chained_handle(dir.path(), "bug:vrfy", "info", 1_700_000_000_000);
+    let (segment, _) = handle.open_segment().expect("open");
+    handle.write(message(1_700_000_001_000, "one")).ok();
+    handle.close(at(1_700_000_002_000)).expect("closes");
+
+    let kernel = kernel(handle);
+    let body = text_of(&source(&kernel, VERIFY_IRI, &[]));
+    assert!(
+        !body.contains("no segment"),
+        "resolved as the verifier, not as a segment named `verify`: {body}"
+    );
+    assert!(
+        body.contains(&format!("segment {segment} OK")),
+        "one greppable line per segment: {body}"
+    );
+    assert!(body.contains("verified 1 segment(s), 0 broken"), "{body}");
+
+    // The piped face verifies a blob in isolation — everything except the link,
+    // because a segment arriving over a wire has no predecessor to check against.
+    let honest = std::fs::read_to_string(path_of(dir.path(), &segment)).expect("readable");
+    let piped = text_of(&source(&kernel, VERIFY_IRI, &[("content", &honest)]));
+    assert!(piped.contains("OK"), "{piped}");
+    let tampered = honest.replace("msg=one", "msg=two");
+    let piped = text_of(&source(&kernel, VERIFY_IRI, &[("content", &tampered)]));
+    assert!(piped.contains("BROKEN"), "{piped}");
+}
+
+#[test]
+fn verifying_without_the_capability_is_refused() {
+    let dir = Scratch::new("verify-cap");
+    let handle = chained_handle(dir.path(), "bug:cap", "info", 1_700_000_000_000);
+    let described =
+        crate::segments::VerifyEndpoint::new(handle, Vocabulary::shared_builtin()).describe();
+    let read = described
+        .action_specs()
+        .into_iter()
+        .find(|a| a.verb == Verb::Source)
+        .expect("a Source action");
+    assert_eq!(
+        read.requires,
+        vec![CAP_READ.to_string()],
+        "declared = enforced: a verdict about the log is at least as sensitive as \
+         the log"
+    );
+}
+
+#[test]
+fn the_always_land_classes_the_chain_depends_on_are_all_declared() {
+    // Every legitimate source of absence must leave a marker, and rotation and
+    // chain breaks are two of them. Asserted because the emission rule is
+    // arithmetic over the vocabulary — a class that lost its log:always would go
+    // quiet at `error` and nothing else would say so.
+    let vocab = Vocabulary::builtin();
+    for class in [ROTATION_CLASS, CHAIN_BROKEN_CLASS] {
+        assert!(
+            vocab.emits(class, rank(vocab, "error")),
+            "{class} lands whatever the dial says"
+        );
+    }
+    assert_eq!(
+        vocab.key("next").map(|k| k.property.as_str()),
+        Some("https://ikigai-rs.dev/ns/log#successor")
+    );
+    assert_eq!(
+        vocab.key("next").and_then(|k| k.range.clone()),
+        Some("https://ikigai-rs.dev/ns/log#Segment".to_string()),
+        "the forward link is an EDGE, so it joins"
+    );
+}
+
+/// The measurement behind [`a_rotated_segment_is_finished_and_therefore_cacheable`]
+/// and behind the ★ note in [`crate::segments`], kept so the number can be
+/// re-derived rather than believed.
+///
+/// `#[ignore]`d because it is a measurement and not an assertion: a timing
+/// threshold in CI is a flake generator, and the thing worth asserting — that a
+/// rotated segment is `Expiry::Never` — is asserted in the test above, where it
+/// cannot be flaky. Run it with
+/// `cargo test measure_rotated -- --ignored --nocapture`.
+///
+/// Debug build, so read the RATIO and not the absolute numbers. Measured
+/// 2026-08-23 over a 585 KB / 5,002-entry rotated segment: **133 ms** to
+/// transrept, which is what an uncached read pays EVERY time, against **29 µs**
+/// served from cache — ~4,600×, matching T3's ~4,900× on a comparable segment.
+#[test]
+#[ignore = "measurement, not an assertion — see the doc comment"]
+fn measure_rotated_segment_read_either_side_of_the_is_finished_fix() {
+    let dir = Scratch::new("measure");
+    let handle = chained_handle(dir.path(), "bug:measure", "info", 1_700_000_000_000);
+    let (first, _) = handle.open_segment().expect("open");
+    for i in 0..5_000u64 {
+        handle
+            .write(message(
+                1_700_000_000_000 + i,
+                "a representative line of prose about a resolution",
+            ))
+            .expect("writes");
+    }
+    let second = handle
+        .rotate(at(1_700_001_000_000))
+        .expect("rotates")
+        .expect("rotates");
+    let path = path_of(dir.path(), &first);
+    let bytes = std::fs::metadata(&path).unwrap().len();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let entries = text.lines().filter(|l| l.starts_with("20")).count();
+    println!("segment: {bytes} bytes, {entries} entries, successor {second}");
+
+    let kernel = kernel(handle.clone());
+
+    // BEFORE the fix: `is_finished` keyed on log:ProcessStop alone, so a ROTATED
+    // segment read as live and EVERY read re-transrepted it. That per-read cost
+    // is exactly `to_turtle` over the whole segment — the same work the cold
+    // read below does once and then never again.
+    let start = std::time::Instant::now();
+    let turtle =
+        crate::graph::to_turtle(&text, Vocabulary::builtin(), &crate::graph::Options::all())
+            .expect("transrepts");
+    let live = start.elapsed();
+    println!(
+        "BEFORE (uncached, every read): {live:?} -> {} bytes",
+        turtle.len()
+    );
+
+    // AFTER: the rotation marker ends the segment, so it is cacheable.
+    let first_read = std::time::Instant::now();
+    let cold = source(&kernel, &first, &[]);
+    let cold_time = first_read.elapsed();
+    // Best of ten: the first cached read pays allocation the later ones do not,
+    // and what is being measured is the steady state a query hits.
+    let mut warm_time = std::time::Duration::MAX;
+    let mut warm = cold.clone();
+    for _ in 0..10 {
+        let read = std::time::Instant::now();
+        warm = source(&kernel, &first, &[]);
+        warm_time = warm_time.min(read.elapsed());
+    }
+    println!("AFTER  (cold): {cold_time:?}  expiry={:?}", cold.expiry);
+    println!("AFTER  (cached): {warm_time:?}  expiry={:?}", warm.expiry);
+    println!(
+        "ratio: {:.0}x",
+        live.as_secs_f64() / warm_time.as_secs_f64()
+    );
+    handle.close(at(1_700_002_000_000)).expect("closes");
+}
+
+#[test]
+fn exists_answers_a_chain_walk_without_reading_a_segment() {
+    let dir = Scratch::new("exists");
+    let handle = chained_handle(dir.path(), "bug:exists", "info", 1_700_000_000_000);
+    let (segment, _) = handle.open_segment().expect("open");
+    let kernel = kernel(handle.clone());
+
+    let found = futures::executor::block_on(kernel.issue(
+        Request::new(Verb::Exists, Iri::parse(&segment).expect("a valid IRI")),
+        &Capability::root(),
+    ))
+    .expect("Exists resolves");
+    assert_eq!(text_of(&found), "true");
+    assert!(
+        found
+            .threads()
+            .iter()
+            .any(|t| t.as_str().starts_with("urn:file:")),
+        "a found segment declares its file's thread, so a caller caching \
+         downstream of this is not caching a stale yes"
+    );
+
+    let absent = futures::executor::block_on(kernel.issue(
+        Request::new(
+            Verb::Exists,
+            Iri::parse("urn:log:bug:exists:1999-01-01T00-00-00Z").expect("a valid IRI"),
+        ),
+        &Capability::root(),
+    ))
+    .expect("Exists resolves for an absent segment too");
+    assert_eq!(
+        text_of(&absent),
+        "false",
+        "an absent segment is an ANSWER, not an error: following a @prev into a \
+         segment retention removed should say so"
+    );
+    handle.close(at(1_700_000_001_000)).expect("closes");
+}
+
+#[test]
+fn deleting_the_newest_segment_is_caught_by_the_rotation_marker() {
+    // The hole @prev cannot close. @prev catches a segment removed from the
+    // MIDDLE — the one after it still points at what should have been there. But
+    // nothing points forward at the LAST segment, so truncating the chain at its
+    // head would be free, and the head is the recent past: the part worth
+    // erasing. The rotation marker's `next=` is the forward link that notices.
+    let dir = Scratch::new("truncate");
+    let handle = chained_handle(dir.path(), "bug:trunc", "info", 1_700_000_000_000);
+    let (first, _) = handle.open_segment().expect("open");
+    let second = handle
+        .rotate(at(1_700_000_060_000))
+        .expect("rotates")
+        .expect("rotates");
+    handle.write(message(1_700_000_061_000, "recent")).ok();
+    handle.close(at(1_700_000_062_000)).expect("closes");
+    assert!(
+        verify_chain(&segments_on_disk(dir.path()), Vocabulary::builtin()).ok(),
+        "the intact chain verifies"
+    );
+
+    std::fs::remove_file(path_of(dir.path(), &second)).expect("the attacker deletes it");
+    let report = verify_chain(&segments_on_disk(dir.path()), Vocabulary::builtin());
+    assert!(!report.ok(), "{}", report.render());
+    assert!(
+        report.segments.iter().any(|s| s.findings.iter().any(|f| {
+            matches!(f, Finding::MissingSuccessor { after, successor }
+                if after == &first && successor == &second)
+        })),
+        "and it names both ends of the cut:\n{}",
+        report.render()
+    );
+}
+
+#[test]
+fn a_writer_with_no_file_does_not_rotate_and_is_not_lost() {
+    // Rotation is judged on the WRITER, not on the config: a console segment has
+    // no successor to open, and rotating it would mean discarding the chain
+    // rather than continuing it. The writer must come back either way — a
+    // rotation that could not proceed must leave the log logging.
+    let home = Scratch::new("no-rotate");
+    let (handle, captured) = open_handle(home.path(), None, "info");
+    assert!(
+        handle
+            .rotate(at(1_700_000_001_000))
+            .expect("asking is not an error")
+            .is_none(),
+        "there is no file to roll"
+    );
+    assert!(handle.is_open(), "and the writer came back");
+    handle
+        .write(message(1_700_000_002_000, "still logging"))
+        .expect("writes");
+    assert!(captured.text().contains("still logging"));
 }

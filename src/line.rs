@@ -11,7 +11,7 @@
 //! @prev     genesis
 //!
 //! 2026-08-23T09:14:22.031Z log:Message urn:agent:calendar msg="sync started"
-//! #seal 1-42 sha256:4c1e… sig:MEUCIQD…
+//! #seal 1-42 sha256:4c1e… Ed25519:MEUCIQD…
 //! ```
 //!
 //! Every column is chosen so that `grep` is a first-class query surface: the
@@ -527,8 +527,19 @@ fn fields_from_tokens(
 /// periodic, so tampering localizes to "between seal K and seal K+1", and
 /// written as a `#` line so an unaware reader sees a comment.
 ///
-/// The hash and signature are opaque here. What goes in them, and the walk that
-/// verifies a segment against its predecessor, belong to rotation.
+/// The hash and signature are opaque to this module — the grammar's job is that
+/// the line round-trips. What goes IN them is [`crate::chain`]: the hash is the
+/// tagged chain head at `last`, and the signature is `{algorithm}:{base64}` over
+/// that hash's ASCII bytes.
+///
+/// ```
+/// # use ikigai_log::Seal;
+/// let seal = Seal::parse("#seal 1-42 sha256:4c1e Ed25519:MEUCIQD").unwrap();
+/// assert_eq!((seal.first, seal.last), (1, 42));
+/// assert_eq!(seal.hash, "sha256:4c1e");
+/// assert_eq!(seal.signature.as_deref(), Some("Ed25519:MEUCIQD"));
+/// assert_eq!(seal.render(), "#seal 1-42 sha256:4c1e Ed25519:MEUCIQD");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seal {
     /// First entry sequence covered.

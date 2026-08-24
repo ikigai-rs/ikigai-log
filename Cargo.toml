@@ -40,6 +40,24 @@ toml = "0.8"
 oxrdf = "0.3"
 oxrdfio = "0.2"
 
+# The digest tag, taken and not copied. `ikigai-log`'s `#seal` lines carry
+# `sig:contentHash` — the SAME predicate `ikigai-sign` writes — so writing two
+# lexical forms of one value would mean the two never join in a query: a silent
+# failure, not a loud one. 0.2.0 is the true minimum: `HASH_ALG_SHA256` was
+# exported there, for this consumer, in the same release that started tagging.
+#
+# ⚠ The cost is real and worth stating: this pulls ed25519-dalek, p256, base64
+# and their transitive stack in for one `&str` — into the WASM build too, where
+# nothing here signs anything. It compiles clean on wasm32 and needs no
+# `.cargo/config.toml` (checked), but a `sig:`-tag crate, or features on
+# ikigai-sign, would be the honest shape of this dependency.
+ikigai-sign = "0.2"
+
+# SHA-256 for the hash chain (RustCrypto, pure Rust, wasm-clean) — the same
+# implementation ikigai-sign digests with, which is not a coincidence worth
+# leaving to chance: the two must agree on what `sha256:` means.
+sha2 = "0.10"
+
 # oxrdf/oxrdfio pull getrandom 0.3, which refuses to compile for
 # wasm32-unknown-unknown until a backend is named — and the browser destination
 # writes these same lines through `console.log`, so the wasm build is real. The
