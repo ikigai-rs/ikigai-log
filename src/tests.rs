@@ -3321,3 +3321,25 @@ fn deleting_the_newest_segment_is_caught_by_the_rotation_marker() {
         report.render()
     );
 }
+
+#[test]
+fn a_writer_with_no_file_does_not_rotate_and_is_not_lost() {
+    // Rotation is judged on the WRITER, not on the config: a console segment has
+    // no successor to open, and rotating it would mean discarding the chain
+    // rather than continuing it. The writer must come back either way — a
+    // rotation that could not proceed must leave the log logging.
+    let home = Scratch::new("no-rotate");
+    let (handle, captured) = open_handle(home.path(), None, "info");
+    assert!(
+        handle
+            .rotate(at(1_700_000_001_000))
+            .expect("asking is not an error")
+            .is_none(),
+        "there is no file to roll"
+    );
+    assert!(handle.is_open(), "and the writer came back");
+    handle
+        .write(message(1_700_000_002_000, "still logging"))
+        .expect("writes");
+    assert!(captured.text().contains("still logging"));
+}

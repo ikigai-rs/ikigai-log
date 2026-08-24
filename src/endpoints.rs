@@ -308,12 +308,18 @@ impl LogHandle {
     #[cfg(not(target_family = "wasm"))]
     pub fn rotate(&self, now: Timestamp) -> std::result::Result<Option<String>, WriteError> {
         let mut state = self.state.lock().expect("log state");
-        if state.config.destination != Destination::File {
-            return Ok(None);
-        }
         let Some(writer) = state.writer.take() else {
             return Ok(None);
         };
+        // Judged on the WRITER, not on the config: the config can have been
+        // repointed since the segment opened, and what decides whether there is
+        // something to roll is whether this writer has a file — a console
+        // segment has no successor to open, and rotating it would mean
+        // discarding the chain rather than continuing it.
+        if writer.path().is_none() {
+            state.writer = Some(writer);
+            return Ok(None);
+        }
         let vocabulary = writer.vocabulary().clone();
         let name = crate::writer::instance_name_of(writer.instance()).to_string();
         // Everything that can fail while the predecessor is still WRITABLE runs
