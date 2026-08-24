@@ -70,6 +70,16 @@ pub const LEVEL_CHANGE_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChange";
 pub const LEVEL_CHANGE_REJECTED_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChangeRejected";
 /// `log:CapabilityDenied` — always-land.
 pub const CAPABILITY_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#CapabilityDenied";
+/// `log:Rotation` — always-land, and the OTHER way a segment ends finally.
+///
+/// A rotated segment is as immutable as a stopped one, so this class is half of
+/// what `is_finished` asks: keying that question on `log:ProcessStop` alone
+/// leaves every rotated segment uncacheable forever.
+pub const ROTATION_CLASS: &str = "https://ikigai-rs.dev/ns/log#Rotation";
+/// `log:ChainBroken` — always-land. A rotation that could not verify its
+/// predecessor lands one of these: an entry, not an exception, because the
+/// failure belongs in the record it is a failure of.
+pub const CHAIN_BROKEN_CLASS: &str = "https://ikigai-rs.dev/ns/log#ChainBroken";
 
 /// The level a class is written at when neither it nor any of its superclasses
 /// declares one: the day-to-day default, so an undeclared extension is visible

@@ -53,8 +53,12 @@
 //! ## What this does NOT do
 //!
 //! **It states what a `#seal` line says; it verifies nothing.** No hash is
-//! recomputed and no signature is checked — that is T4, and a transreptor that
-//! silently implied verification would be worse than one that ignored seals.
+//! recomputed and no signature is checked here — a transreptor that silently
+//! implied verification would be worse than one that ignored seals, and reading
+//! must not depend on trusting. Verification is [`crate::chain`] and
+//! `urn:log:verify`, which recompute the chain and walk it across rotations; the
+//! two are deliberately separate acts, so a graph of a tampered segment is still
+//! a faithful graph OF a tampered segment.
 //!
 //! ## Cost, measured
 //!
@@ -130,6 +134,7 @@ const LOG_LAST_SEQUENCE: &str = "https://ikigai-rs.dev/ns/log#lastSequence";
 
 const SIG_CONTENT_HASH: &str = "https://ikigai-rs.dev/ns/sign#contentHash";
 const SIG_VALUE: &str = "https://ikigai-rs.dev/ns/sign#value";
+const SIG_ALGORITHM: &str = "https://ikigai-rs.dev/ns/sign#algorithm";
 
 /// The `key=` columns whose values are joined into `log:invoked`. Read from the
 /// vocabulary by property IRI rather than hard-coded by column name, so a
@@ -426,24 +431,45 @@ pub fn to_triples(
                 integer()?,
             )),
         ));
-        // The tokens exactly as the line wrote them — tagged (`sha256:…`),
-        // which is this system's boundary convention for a digest. NOTE for
-        // whoever owns the chain: ikigai-sign writes `sig:contentHash` as
-        // UNTAGGED hex, so the two producers share a predicate and not a lexical
-        // form. Reconciling them is a decision about the seal, and the seal is
-        // T4's; restating it differently here would be an interpretation, and
-        // T3 states what the line says.
+        // The digest exactly as the line wrote it — tagged (`sha256:…`), which
+        // is this system's boundary convention and the SAME lexical form
+        // `ikigai-sign` writes on `sig:contentHash` since 0.2.0. Sharing a
+        // predicate while writing two spellings of one value would mean the two
+        // producers never join in a query, which is a silent failure and not a
+        // loud one; that is why the tag exists at both ends.
         out.push(triple(
             &node,
             SIG_CONTENT_HASH,
             Term::Literal(Literal::new_simple_literal(&seal.hash)),
         ));
-        if let Some(signature) = &seal.signature {
-            out.push(triple(
-                &node,
-                SIG_VALUE,
-                Term::Literal(Literal::new_simple_literal(signature)),
-            ));
+        if let Some(token) = &seal.signature {
+            // SPLIT, not restated whole: the `#seal` line packs
+            // `{algorithm}:{base64}` into one column because a line has columns
+            // and a graph does not, and a graph that kept the packing would make
+            // `sig:value` mean something different here than in a signature-graph
+            // — which is exactly the join this vocabulary reuse exists to buy.
+            match crate::chain::split_signature(token) {
+                Some((algorithm, value)) => {
+                    out.push(triple(
+                        &node,
+                        SIG_ALGORITHM,
+                        Term::Literal(Literal::new_simple_literal(algorithm)),
+                    ));
+                    out.push(triple(
+                        &node,
+                        SIG_VALUE,
+                        Term::Literal(Literal::new_simple_literal(value)),
+                    ));
+                }
+                // An untagged token names no algorithm, and inventing one would
+                // make the tag decorative. Stated as written, losslessly, which
+                // is the same posture an undeclared key gets.
+                None => out.push(triple(
+                    &node,
+                    SIG_VALUE,
+                    Term::Literal(Literal::new_simple_literal(token)),
+                )),
+            }
         }
     }
 

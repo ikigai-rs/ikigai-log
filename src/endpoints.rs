@@ -60,17 +60,22 @@ use ikigai_core::{
     ReprType, Representation, Result, Verb,
 };
 
+use crate::chain::{RotationPolicy, SealPolicy, SealSigner};
 use crate::config::LogConfig;
 #[cfg(not(target_family = "wasm"))]
 use crate::config::{level_iri, Destination, Patch};
 use crate::line::{parse_fields, Entry, Timestamp};
 #[cfg(not(target_family = "wasm"))]
-use crate::segments::{SegmentEndpoint, SegmentsEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE};
+use crate::segments::{
+    SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
+};
 use crate::segments::{TransreptEndpoint, TRANSREPT_IRI};
+#[cfg(not(target_family = "wasm"))]
+use crate::vocabulary::CHAIN_BROKEN_CLASS;
 use crate::vocabulary::{Vocabulary, CAPABILITY_DENIED_CLASS, LOG_NS, MESSAGE_CLASS};
 #[cfg(not(target_family = "wasm"))]
 use crate::vocabulary::{CONFIG_CHANGE_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS};
-use crate::writer::{LineSink, WriteError, Writer};
+use crate::writer::{LineSink, WriteError, Writer, WriterOptions};
 
 /// Appending an entry.
 pub const CAP_WRITE: &str = "urn:cap:log:write";
@@ -113,6 +118,16 @@ pub struct LogHandle {
 struct State {
     config: LogConfig,
     writer: Option<Writer>,
+    /// The vocabulary the open segment was opened with, kept so a rotation can
+    /// open the successor without the caller handing it over again — rotation is
+    /// triggered from inside a write, where no caller is present to.
+    vocabulary: Option<Arc<Vocabulary>>,
+    seals: SealPolicy,
+    rotation: RotationPolicy,
+    /// The signer, parked here between segments. It moves INTO the writer at
+    /// open and back out at close or rotation, so one key seam serves a whole
+    /// chain rather than one segment.
+    signer: Option<Box<dyn SealSigner>>,
 }
 
 impl LogHandle {
@@ -130,6 +145,10 @@ impl LogHandle {
             state: Mutex::new(State {
                 config,
                 writer: None,
+                vocabulary: None,
+                seals: SealPolicy::default(),
+                rotation: RotationPolicy::default(),
+                signer: None,
             }),
         }
     }
@@ -173,8 +192,48 @@ impl LogHandle {
         if state.writer.is_some() {
             return Ok(true);
         }
-        state.writer = Writer::open(&state.config, vocabulary, now)?;
+        let options = WriterOptions {
+            seals: state.seals,
+            rotation: state.rotation,
+            // Discovered, not stated: the writer reads the newest segment of this
+            // same instance and chains from its head, so the chain spans process
+            // restarts and not merely rotations.
+            prev: None,
+            signer: state.signer.take(),
+        };
+        state.writer = Writer::open_with(&state.config, vocabulary.clone(), now, options)?;
+        state.vocabulary = Some(vocabulary);
         Ok(state.writer.is_some())
+    }
+
+    /// Install what signs this log's seals, before a segment is opened.
+    ///
+    /// A trait object rather than a key, because **keys resolve as resources**: a
+    /// host wires this to `urn:sign:sign` over `key=urn:file:…` today and
+    /// `key=urn:secret:…` or an Enclave slot tomorrow, and nothing here changes.
+    /// Installed on the HANDLE rather than on a writer so it survives rotation —
+    /// a chain signed by two different arrangements would be two chains.
+    ///
+    /// **Not installing one is a supported posture**, not a degraded mode: an
+    /// unsigned seal still localizes tampering to a range, which is most of what
+    /// a seal is for.
+    pub fn set_signer(&self, signer: Option<Box<dyn SealSigner>>) {
+        self.state.lock().expect("log state").signer = signer;
+    }
+
+    /// Set when checkpoints land and when segments roll over. Takes effect at the
+    /// next segment; the open one keeps what it was opened with, for the same
+    /// reason its level is fixed for its life.
+    pub fn set_policies(&self, seals: SealPolicy, rotation: RotationPolicy) {
+        let mut state = self.state.lock().expect("log state");
+        state.seals = seals;
+        state.rotation = rotation;
+    }
+
+    /// The policies in force for the next segment.
+    pub fn policies(&self) -> (SealPolicy, RotationPolicy) {
+        let state = self.state.lock().expect("log state");
+        (state.seals, state.rotation)
     }
 
     /// Open this process's segment onto a sink the caller supplies — the
@@ -187,12 +246,20 @@ impl LogHandle {
     ) -> std::result::Result<(), WriteError> {
         let mut state = self.state.lock().expect("log state");
         if state.writer.is_none() {
-            state.writer = Some(Writer::open_with_sink(
+            let options = WriterOptions {
+                seals: state.seals,
+                rotation: state.rotation,
+                prev: None,
+                signer: state.signer.take(),
+            };
+            state.writer = Some(Writer::open_with_sink_and(
                 &state.config,
-                vocabulary,
+                vocabulary.clone(),
                 now,
                 sink,
+                options,
             )?);
+            state.vocabulary = Some(vocabulary);
         }
         Ok(())
     }
@@ -201,10 +268,157 @@ impl LogHandle {
     /// open.
     pub fn close(&self, now: Timestamp) -> std::result::Result<(), WriteError> {
         let writer = self.state.lock().expect("log state").writer.take();
-        match writer {
-            Some(writer) => writer.close(now),
-            None => Ok(()),
+        let Some(writer) = writer else { return Ok(()) };
+        let closed = writer.close(now)?;
+        // The signer goes back on the handle rather than dropping with the
+        // writer: a host that closes and reopens is continuing one chain, and
+        // the key seam it wired should not have to be wired twice.
+        self.state.lock().expect("log state").signer = closed.signer;
+        Ok(())
+    }
+
+    /// ★ **Rotate: verify, seal, validate — one operation.**
+    ///
+    /// Three things happen together because doing any of them without the others
+    /// is worse than doing none:
+    ///
+    /// 1. **Seal.** The open segment gets a `log:Rotation` entry naming its
+    ///    successor and a final `#seal` over whatever tail was uncommitted, so
+    ///    nothing in it sits outside a checkpoint and its chain head is settled.
+    /// 2. **Open the successor**, chained: its `@prev` names that head. This is
+    ///    the layer that makes rotation something other than a seam — without it,
+    ///    a whole segment can be deleted and replaced and every other check still
+    ///    passes.
+    /// 3. **Verify the predecessor**, and where it does not verify, land a
+    ///    `log:ChainBroken` entry in the SUCCESSOR — an entry, not an exception.
+    ///    The failure belongs in the record it is a failure of, and by the time
+    ///    it is known the segment it is about has already been sealed, so the
+    ///    successor is where it can still be written. An exception would be
+    ///    caught by whatever was rotating and leave no trace at all.
+    ///
+    /// "Validate" is the structural validation the walk already performs — the
+    /// header is complete, every line parses, sequence numbers are dense, seal
+    /// coverage is contiguous. **SHACL shapes are not run**: they are T7 and this
+    /// crate mounts no validator. Said here rather than implied, because
+    /// "rotation validates" would otherwise read as more than it is.
+    ///
+    /// `Ok(None)` when nothing is open, or when the destination has no files to
+    /// roll — a console segment has no successor to open and rotating it would
+    /// mean discarding the chain rather than continuing it.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn rotate(&self, now: Timestamp) -> std::result::Result<Option<String>, WriteError> {
+        let mut state = self.state.lock().expect("log state");
+        if state.config.destination != Destination::File {
+            return Ok(None);
         }
+        let Some(writer) = state.writer.take() else {
+            return Ok(None);
+        };
+        let vocabulary = writer.vocabulary().clone();
+        let name = crate::writer::instance_name_of(writer.instance()).to_string();
+        // Everything that can fail while the predecessor is still WRITABLE runs
+        // first, and puts it back: a rotation that could not reserve a file must
+        // leave the log logging, not closed.
+        let directory = match crate::writer::resolve_directory(&state.config) {
+            Some(directory) => directory,
+            None => {
+                state.writer = Some(writer);
+                return Err(WriteError::NoDirectory);
+            }
+        };
+        let reserved = match crate::writer::reserve_segment(&directory, &name, now) {
+            Ok(reserved) => reserved,
+            Err(e) => {
+                state.writer = Some(writer);
+                return Err(e);
+            }
+        };
+        // The successor's FILE is created before the predecessor is sealed,
+        // because the rotation marker names the successor and only the file can
+        // settle its identity: two rotations inside one second disambiguate the
+        // stamp, and a marker naming the undisambiguated IRI would point at a
+        // segment that does not exist.
+        let successor = reserved.iri.clone();
+        let closed = writer.rotate_out(now, Some(&successor))?;
+
+        // VERIFY, between sealing and opening: the segment just sealed is final
+        // now and nothing has been written to the successor yet, so this is the
+        // one moment at which the verdict can still be written down.
+        //
+        // TWO segments, not one. Verifying only what this process just wrote
+        // would be verifying our own arithmetic — it cannot fail. What can fail
+        // is the segment BEFORE it, edited on disk while this process ran, and
+        // the LINK between the two. `verify_chain` over the pair checks both
+        // chains, the `@prev` link, and the level bracket, in one call.
+        //
+        // Bounded at two on purpose: walking all of history on every rotation
+        // would make rotation cost grow with the log. The full walk is
+        // `urn:log:verify`.
+        let sealed = closed
+            .path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let verdict = sealed.map(|sealed| {
+            let mut walk = Vec::new();
+            if let Some((name, path)) =
+                crate::segments::predecessor_of(&directory, &closed.instance, &closed.segment)
+            {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    walk.push((name, text));
+                }
+            }
+            walk.push((closed.segment.clone(), sealed));
+            crate::chain::verify_chain(&walk, &vocabulary)
+        });
+
+        let options = WriterOptions {
+            seals: state.seals,
+            rotation: state.rotation,
+            prev: Some(crate::line::Prev::Seal(closed.head.clone())),
+            signer: closed.signer,
+        };
+        let lock = closed.lock.ok_or_else(|| WriteError::InstanceInUse {
+            name: name.clone(),
+            tried: name.clone(),
+        })?;
+        let mut writer = Writer::open_file_on(
+            &state.config,
+            vocabulary,
+            now,
+            options,
+            name,
+            lock,
+            reserved,
+        )?;
+
+        if let Some(report) = verdict {
+            // ONE ENTRY PER BROKEN SEGMENT, subject = the segment that failed.
+            // An entry, not an exception: an exception would be caught by
+            // whatever was rotating and the fact would leave no trace, and the
+            // failure belongs in the record it is a failure of.
+            for broken in report.segments.iter().filter(|s| !s.ok()) {
+                let mut entry = Entry::new(now, CHAIN_BROKEN_CLASS, broken.name.clone())
+                    .with("expected", broken.head.clone())
+                    .with(
+                        "stated",
+                        match &broken.prev {
+                            crate::line::Prev::Genesis => "genesis".to_string(),
+                            crate::line::Prev::Seal(hash) => hash.clone(),
+                        },
+                    );
+                for finding in broken.findings.iter().filter(|f| f.is_breaking()) {
+                    entry = entry.with("finding", finding.to_string());
+                }
+                // Best-effort, and deliberately not fatal: a rotation that
+                // refused to complete because a predecessor was tampered with
+                // would stop the log — which is exactly what a tamperer wants.
+                let _ = writer.write(entry);
+            }
+        }
+
+        let opened = writer.segment().to_string();
+        state.writer = Some(writer);
+        Ok(Some(opened))
     }
 
     /// Whether a segment is being written right now.
@@ -214,12 +428,40 @@ impl LogHandle {
 
     /// Append one entry. `Ok(None)` when nothing is open or the level dial
     /// excluded the class — the two are distinguished by [`is_open`](Self::is_open).
+    ///
+    /// **This is also where rotation is triggered**, after the entry has landed
+    /// and been flushed: [`RotationPolicy`] is judged against the open segment,
+    /// and a segment that has met either bound rolls over here. Nowhere else is
+    /// there a moment to judge it — a log has no tick of its own, and a timer
+    /// that rotated a segment nothing was writing to would replace a quiet file
+    /// with a quieter one.
+    ///
+    /// If the rotation itself fails, the **entry is already durable** and this
+    /// returns the rotation's error anyway. Loud on purpose: a failed rotation
+    /// usually means the log has stopped being written at all, and swallowing it
+    /// would make the one subsystem whose job is to notice things fail silently.
     pub fn write(&self, entry: Entry) -> std::result::Result<Option<u64>, WriteError> {
-        let mut state = self.state.lock().expect("log state");
-        match &mut state.writer {
-            Some(writer) => writer.write(entry),
-            None => Ok(None),
+        let now = entry.time;
+        // Underscored because on wasm there is nothing to rotate INTO — a browser
+        // has no segment files — so the whole trigger is `cfg`'d out there and
+        // the answer goes unread rather than being computed differently.
+        let (seq, _rotation_due) = {
+            let mut state = self.state.lock().expect("log state");
+            match &mut state.writer {
+                Some(writer) => {
+                    let seq = writer.write(entry)?;
+                    (seq, writer.rotation_due(now))
+                }
+                None => (None, false),
+            }
+        };
+        // The lock is released before rotating: `rotate` takes it itself, and a
+        // rotation under an already-held lock would deadlock the log.
+        #[cfg(not(target_family = "wasm"))]
+        if _rotation_due {
+            self.rotate(now)?;
         }
+        Ok(seq)
     }
 
     /// The effective configuration.
@@ -766,9 +1008,10 @@ pub fn space(handle: Arc<LogHandle>) -> EndpointSpace {
 /// `urn:log:{segment}` is a TEMPLATE, and a template over `urn:log:` matches
 /// every IRI in this space — `urn:log:write` included. The first grammar that
 /// matches wins, so **every exact IRI is bound before it and the template is
-/// bound last**. A later milestone adding `urn:log:verify` must add it above the
-/// template; below it, the request resolves as a segment named `verify` and the
-/// failure is a "no segment" error rather than an unbound IRI.
+/// bound last**. `urn:log:verify` is the case that proved it: below the template
+/// the request resolves as a segment named `verify` and the failure is `no
+/// segment <urn:log:verify>` rather than an unbound IRI — an error that says
+/// nothing about what actually went wrong, which is why there is a test.
 ///
 /// On wasm the config, segment and listing endpoints are absent rather than
 /// present-and-failing: an action in the manifold that cannot succeed is worse
@@ -789,6 +1032,11 @@ pub fn space_with_vocabulary(handle: Arc<LogHandle>, vocabulary: Arc<Vocabulary>
         .bind(
             Exact::new(SEGMENTS_IRI),
             SegmentsEndpoint::new(handle.clone()),
+        )
+        // ABOVE the template. Below it this is a segment named `verify`.
+        .bind(
+            Exact::new(VERIFY_IRI),
+            VerifyEndpoint::new(handle.clone(), vocabulary.clone()),
         )
         // LAST. See the note above: this template matches every IRI in the space.
         .bind(

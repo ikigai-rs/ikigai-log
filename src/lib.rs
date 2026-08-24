@@ -63,13 +63,38 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! ## Tamper-evidence: four layers, or none
+//!
+//! [`chain`] holds all of it, and it is one piece of work on purpose — a partial
+//! chain is worse than none, because it *looks* verifiable.
+//!
+//! 1. **A per-entry hash chain**, in memory: h₀ over the canonical header, then
+//!    hᵢ = sha256(hᵢ₋₁ ‖ "\n" ‖ the line). Nothing per line lands on disk — a
+//!    hash column on every entry is exactly the noise that would wreck `grep`.
+//! 2. **Signed checkpoints** every N entries **or** T milliseconds
+//!    ([`SealPolicy`]), written as `#seal` lines that read as comments to
+//!    anything else and grep as `^#seal`. Tampering then localizes to "between
+//!    seal K and seal K+1". Signing is a seam ([`SealSigner`]) rather than a key,
+//!    because keys resolve as resources; **an unsigned seal still localizes**.
+//! 3. **★ The chain spans rotations.** `@prev` carries the predecessor's final
+//!    seal. Without it, rotation is a seam at which a whole segment can be
+//!    deleted and forged and every other check still passes.
+//! 4. **Rotation is verify + seal + validate, one operation**
+//!    ([`LogHandle::rotate`]). A rotation that cannot verify its predecessor
+//!    lands a `log:ChainBroken` **entry, not an exception** — the failure belongs
+//!    in the record it is a failure of.
+//!
+//! `urn:log:verify` walks it, and it checks more than hashes: a chain is
+//! tamper-evident and **not omission-evident**, so every gap must be bracketed by
+//! an always-land marker. What it does not establish is stated in [`chain`] and
+//! not implied: seal signatures are checked by `urn:sign:verify` with a key this
+//! crate never holds, and the level is verified as RECORDED rather than as
+//! AUTHENTIC — a level MAC needs a key the application itself cannot hold.
+//!
 //! ## What this crate is not, yet
 //!
-//! `@prev genesis`, always: the hash chain and the seals are one piece of work
-//! and a partial chain is worse than none, because it looks verifiable. A
-//! `#seal` line transrepts — [`graph`] STATES what it says — but nothing here
-//! verifies one. The `ikigai_core::Tracer` implementation, SHACL on write,
-//! rotation and retention are all still ahead.
+//! The `ikigai_core::Tracer` implementation, SHACL on write, and retention with
+//! `log:Tombstone` are all still ahead.
 //!
 //! ## Reading
 //!
@@ -83,6 +108,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chain;
 pub mod config;
 pub mod endpoints;
 pub mod graph;
@@ -96,6 +122,10 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use chain::{
+    head_of, verify_chain, verify_segment, ChainReport, Finding, RotationPolicy, SealPolicy,
+    SealSigner, SegmentReport, HASH_ALGORITHM,
+};
 pub use config::{
     instance_iri, level_iri, ConfigError, Destination, LogConfig, Patch, DEFAULT_INSTANCE_NAME,
     DEFAULT_LEVEL, INSTANCE_NS, STEM,
@@ -112,11 +142,11 @@ pub use line::{
 pub use segments::{SegmentEndpoint, SegmentsEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE};
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
 pub use vocabulary::{
-    ClassDef, KeyDef, VocabError, Vocabulary, CAPABILITY_DENIED_CLASS, CONFIG_CHANGE_CLASS,
-    DEFAULT_MIN_LEVEL, ENTRY_CLASS, ERROR_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS,
-    LOG_NS, MESSAGE_CLASS, PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS, VOCABULARY_TTL,
-    WARNING_CLASS,
+    ClassDef, KeyDef, VocabError, Vocabulary, CAPABILITY_DENIED_CLASS, CHAIN_BROKEN_CLASS,
+    CONFIG_CHANGE_CLASS, DEFAULT_MIN_LEVEL, ENTRY_CLASS, ERROR_CLASS, LEVEL_CHANGE_CLASS,
+    LEVEL_CHANGE_REJECTED_CLASS, LOG_NS, MESSAGE_CLASS, PROCESS_START_CLASS, PROCESS_STOP_CLASS,
+    PROV_NS, ROTATION_CLASS, VOCABULARY_TTL, WARNING_CLASS,
 };
-pub use writer::{ClosureSink, LineSink, WriteError, Writer};
+pub use writer::{Closed, ClosureSink, LineSink, WriteError, Writer, WriterOptions};
 #[cfg(not(target_family = "wasm"))]
 pub use writer::{FileSink, StderrSink};
