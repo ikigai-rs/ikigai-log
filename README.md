@@ -325,6 +325,54 @@ and the disambiguation is recorded (`configured=` on `log:ProcessStart`), becaus
 a header that quietly disagrees with the config is a question nobody can answer
 later.
 
+## The kernel writes it
+
+`LogTracer` is an `ikigai_core::Tracer`. A host installs one with
+`Kernel::set_tracer` and every resolution the kernel performs lands as an entry —
+**trap-free by construction, because nobody is composing prose**:
+
+```
+2026-08-31T09:14:22.031Z log:Resolution urn:calendar:today seq=41 worker=ikigai-sched-2 span=7 parent=3 dur=12 cap=urn:cap:fs:read
+2026-08-31T09:14:22.104Z log:CapabilityDenied urn:secret:api-key seq=42 denied=urn:cap:secret:read cap=urn:cap:fs:read
+```
+
+The mapping is nearly one-to-one, and two pieces of it are load-bearing:
+
+* **A cache hit is a CLASS, not a column.** `log:CacheHit` is
+  `rdfs:subClassOf log:Resolution` at `log:minLevel log:trace`, because a class is
+  what the dial can exclude and a boolean could not be.
+* **A refusal is a fact the kernel is the only place to see.** The capability
+  floor is enforced *before dispatch*, so the endpoint that would record a denial
+  is the one being denied. Core 0.1.62 reports the refusal to the tracer instead
+  (`DENIED_NOTE`), and `log:CapabilityDenied` is always-land. `denied=` is the
+  scope the caller **lacked**; `cap=` is the authority it **held** — two facts,
+  two columns.
+
+Two costs, stated rather than left to be discovered:
+
+**Installing a tracer means a `TraceEvent` is BUILT for every resolution.** The
+kernel gates only on `set_tracer` — there is no per-class filter upstream — so the
+level dial filters what is *written*, not what is *built*. Measured over 50,000
+computed resolutions (release, min of three):
+
+| | ns/resolution |
+|---|---|
+| no tracer installed | 566 |
+| a tracer that discards every event | 628 (+11%) |
+| `LogTracer` at `error`, writing nothing | 692 (+22%) |
+| `LogTracer` at `debug`, one flushed line | 2,177 (+285%) |
+
+Half of the `error` cost is the kernel's, not this crate's. "The log is
+effectively off, so it is free" is wrong; the honest lever is not installing a
+tracer.
+
+**`Tracer::record` returns `()`**, so a write failure is invisible upward by
+design. Nothing propagates, nothing panics, and everything lost is counted and
+lands as an always-land `log:Dropped count=N reason=…` — a drop that leaves no
+marker is the one thing the design forbids outright, since a chain is
+tamper-evident and not omission-evident. **There is no sampling**, for the same
+reason: sampling is holes everywhere with no brackets.
+
 ## One dial, and a floor it cannot reach
 
 The verbosity level is a **vocabulary fact**: `log:rank` orders the ladder,
@@ -361,6 +409,36 @@ segment has exactly one level for its whole life, which is what lets a verifier
 reason per sealed segment — "this ran at `info`, so absent resolutions are
 explained" — instead of tracking transitions inside sealed content.
 
+The seal and rotation cadences are operator dials on the same terms:
+
+```toml
+[seal]                     # when a #seal line is written
+every_entries = 1000
+every_millis  = 60000
+
+[rotation]                 # when a segment rolls over
+max_entries    = 100000
+max_age_millis = "never"   # roll over on age alone
+```
+
+They nest because `every_entries` names nothing on its own — it is a bound *of a
+cadence* — while the four scalars above them (`level`, `destination`,
+`directory`, `instance`) have no such pair to belong to. A bound is a positive
+integer or the word `"never"`: zero is a bound met before anything happened, so
+it is refused rather than read as "off". And a cadence change, like a level
+change, takes effect at the **next** segment — a cadence that shifted inside
+sealed content would make "was this segment sealed on schedule?" unanswerable.
+
+**A number worth knowing before you leave the defaults alone.** A segment of
+exactly the default `max_entries` (100,000) is 13.1 MB at ~138 B per resolution
+entry, and transrepts to 49.3 MB of Turtle in ~600 ms. Since 100,000 / 24 h =
+**1.16**, any process sustaining more than about **one resolution per second**
+rotates on the entry bound rather than the day bound — which inverts what the day
+bound is for ("yesterday's log should be one IRI"). The defaults are still the
+right *shape*: the day bound is the read-side unit and the entry bound is the
+guard against a burst producing a file nothing wants to transrept. But a host that
+installs a tracer should expect to set them, and now it can.
+
 ## Two invariants worth knowing before you extend it
 
 **One entry is one line.** It carries `grep`, the hash chain (which folds in each
@@ -384,8 +462,10 @@ capabilities declared and enforced, **the transreptor** — `urn:log:transrept`
 over piped bytes, `urn:log:{segment}` over a segment on disk (Turtle by default,
 the file itself on request, windowed by `since` / `until` / `from_seq` /
 `to_seq`, and answering `Exists` in O(header) so a chain walk can follow a
-`@prev` without reading what it points at), and `urn:log:segments` to list what
-there is to query — and **all four tamper-evidence layers**: the in-memory hash chain, seals on a count-or-time
+`@prev` without reading what it points at), `urn:log:segments` to list what
+there is to query, **`LogTracer` — the kernel writing its own resolutions,
+cache hits and capability denials** — the operator-settable seal and rotation
+cadences, and **all four tamper-evidence layers**: the in-memory hash chain, seals on a count-or-time
 cadence with a signer seam, `@prev` carrying the chain across rotations and
 restarts, and rotation as verify + seal + validate with `log:ChainBroken` as an
 entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
@@ -400,19 +480,13 @@ entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
 * **A segment is only greppable at the granularity it is queryable.**
   Transreption is O(segment); there is no index, and `urn:log:segments` is a
   directory listing rather than a catalog.
-* **Seal and rotation cadence are not operator-settable yet.** They are Rust
-  defaults a host can override (`LogHandle::set_policies`) and deliberately not
-  `log.toml` keys: adding operator dials is a schema decision that deserves to be
-  made on its own merits rather than as a side effect of building the chain.
-* No `ikigai_core::Tracer` implementation, so the kernel is not yet writing its
-  own resolutions here.
 * No retention and no `log:Tombstone`, no central collection, no SHACL on write —
   "validate" in a rotation is the structural walk, not shapes, and this README
   will not let that word carry more than it does.
-* A **known hole**: the kernel refuses a capability-gated action *before* the
-  endpoint runs, so `urn:log:write` cannot record its own `log:CapabilityDenied`.
-  A host that catches the refusal can, through `LogHandle::record_denial`;
-  closing it properly needs a seam in the kernel.
+* **The tracer is per-process and single-tenant.** It rides the kernel's global
+  tracer slot, which is the right shape for a daemon logging its own work and the
+  wrong one for a wire server tracing one tenant's connection — that wants
+  `Kernel::issue_traced`, and nothing here projects onto it yet.
 
 **Logging is off until a host opens a writer**, and binding the endpoints does
 not open one. The module cannot tell whether it is inside a daemon or a one-shot

@@ -334,13 +334,27 @@ log:Dropped a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
     log:minLevel log:always ;
     rdfs:label "Dropped" ;
-    rdfs:comment "N entries lost to back-pressure. Never drop silently." .
+    rdfs:comment "N entries lost to back-pressure. Never drop silently. log:count carries N and log:reason carries WHY, from a fixed set of tokens rather than composed prose — an observer that cannot fail upward (ikigai_core::Tracer::record returns unit) can only report what it lost by leaving one of these in the chain, and a chain is tamper-evident, not omission-evident." .
 
 log:CapabilityDenied a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
     log:minLevel log:always ;
+    log:subjectPredicate log:refused ;
     rdfs:label "CapabilityDenied" ;
-    rdfs:comment "A refused authority is a security fact, so it lands at every level." .
+    rdfs:comment "A refused authority is a security fact, so it lands at every level. The kernel reports one per pre-dispatch refusal (ikigai_core::DENIED_NOTE); log:deniedScope names the scope the caller LACKED and log:capability the authority it actually held — two different facts that must never share a column." .
+
+log:refused a rdf:Property ;
+    rdfs:domain log:CapabilityDenied ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "refused" ;
+    rdfs:comment "The resource the caller was refused: the subject column of a log:CapabilityDenied. NOT a sub-property of prov:used — nothing was used, which is the whole point. PROV describes what happened and has no term for what was prevented, so this is ikigai's own, and it is the join key that connects a refusal to the resolutions of the same target that did succeed." .
+
+log:deniedScope a rdf:Property ;
+    log:keyName "denied" ;
+    rdfs:domain log:CapabilityDenied ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "deniedScope" ;
+    rdfs:comment "The capability scope the caller did not hold. The column is spelled `denied` because that is exactly ikigai_core::DENIED_NOTE's key: the kernel's note key and the log's column are one string, so the mapping is identity and neither side can drift into a second spelling of the same fact." .
 
 log:KeyChange a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
@@ -398,6 +412,40 @@ log:configLayer a rdf:Property ;
     rdfs:range xsd:string ;
     rdfs:label "configLayer" ;
     rdfs:comment "One config file that contributed to the effective config, lowest precedence first. Provenance, not configuration — which is why the TOML face omits it and the graph face does not. Also bound as the line column `file=`, naming the layer a log:ConfigChange actually wrote." .
+
+log:Cadence a rdfs:Class ;
+    rdfs:label "Cadence" ;
+    rdfs:comment "A pair of bounds at which the writer acts on its own: whichever is met first fires. Its own node rather than four properties on log:Config, because `every_entries` means nothing without knowing WHICH cadence it belongs to, and a node keeps the seal pair and the rotation pair from ever being read as one." .
+
+log:sealCadence a rdf:Property ;
+    rdfs:domain log:Config ;
+    rdfs:range log:Cadence ;
+    rdfs:label "sealCadence" ;
+    rdfs:comment "When a #seal line is written. It sets the width of the localization claim: tampering is narrowed to \"between seal K and seal K+1\", so a wider cadence is a weaker claim, and a segment's whole unsealed tail is what a crash leaves uncommitted." .
+
+log:rotationCadence a rdf:Property ;
+    rdfs:domain log:Config ;
+    rdfs:range log:Cadence ;
+    rdfs:label "rotationCadence" ;
+    rdfs:comment "When a segment rolls over. It sets the unit a query names and the unit that caches, so it is a READ-side dial as much as a write-side one: a segment too large to transrept is a segment nothing reads." .
+
+log:everyEntries a rdf:Property ;
+    rdfs:domain log:Cadence ;
+    rdfs:range xsd:integer ;
+    rdfs:label "everyEntries" ;
+    rdfs:comment "The count bound. Always positive: zero would mean a bound met before anything happened, so it is refused rather than read as \"disabled\" — see log:unbounded." .
+
+log:everyMillis a rdf:Property ;
+    rdfs:domain log:Cadence ;
+    rdfs:range xsd:integer ;
+    rdfs:label "everyMillis" ;
+    rdfs:comment "The elapsed-time bound, in milliseconds, judged when an entry is written — a process writing nothing has nothing new to commit and nothing new to roll over. Always positive, for the same reason as log:everyEntries." .
+
+log:unbounded a rdf:Property ;
+    rdfs:domain log:Cadence ;
+    rdfs:range rdf:Property ;
+    rdfs:label "unbounded" ;
+    rdfs:comment "This cadence's named trigger is off — the operator wrote `never`. Stated as a triple naming the DISABLED property rather than by omitting that property, because \"no value\" and \"explicitly never\" are different facts and a reader that cannot tell them apart reads a half-emitted config as a disabled one." .
 
 log:currentSegment a rdf:Property ;
     rdfs:domain log:Config ;

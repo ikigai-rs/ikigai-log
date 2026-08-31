@@ -70,6 +70,19 @@ pub const LEVEL_CHANGE_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChange";
 pub const LEVEL_CHANGE_REJECTED_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChangeRejected";
 /// `log:CapabilityDenied` — always-land.
 pub const CAPABILITY_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#CapabilityDenied";
+/// `log:Resolution` — one resolved invocation, as `ikigai_core::Tracer` reports
+/// it. Written at `debug` and above.
+pub const RESOLUTION_CLASS: &str = "https://ikigai-rs.dev/ns/log#Resolution";
+/// `log:CacheHit` — a resolution the representation cache served.
+///
+/// A **subclass** of [`RESOLUTION_CLASS`] rather than a boolean column on it,
+/// because a class is what the level dial can exclude: cache hits are the
+/// highest-volume, lowest-information events, so they sit at `trace`, one notch
+/// above the resolutions they are otherwise identical to.
+pub const CACHE_HIT_CLASS: &str = "https://ikigai-rs.dev/ns/log#CacheHit";
+/// `log:Dropped` — always-land. What an observer that cannot fail upward leaves
+/// behind when it loses something.
+pub const DROPPED_CLASS: &str = "https://ikigai-rs.dev/ns/log#Dropped";
 /// `log:Rotation` — always-land, and the OTHER way a segment ends finally.
 ///
 /// A rotated segment is as immutable as a stopped one, so this class is half of

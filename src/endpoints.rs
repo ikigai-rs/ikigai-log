@@ -30,20 +30,26 @@
 //! it earns its keep on the paths where no kernel gate ran — a detached
 //! invocation, a module shim — and it costs one string comparison.
 //!
-//! ## ★ A denied action cannot log its own denial
+//! ## ★ A denied action cannot log its own denial — so the KERNEL reports it
 //!
 //! `log:CapabilityDenied` is an always-land class precisely because a refused
 //! authority is a security fact. But the kernel returns `Denied` *without
 //! entering the endpoint*, so `urn:log:write` never runs and never writes the
 //! entry — the one action that could record the refusal is the one that was
-//! refused. This is not something a module can fix from inside: the kernel
-//! would need a seam for reporting a pre-dispatch denial (a reporter alongside
-//! `Tracer`, or a `TraceEvent` variant), and that is a core decision.
+//! refused. No module can fix that from inside; it needed a kernel seam.
 //!
-//! What T2 offers instead is [`LogHandle::record_denial`], so a host that
-//! catches an `Error::Denied` — a transport, an MCP projection, the REPL — can
-//! land the entry from where it does see the refusal. It is a real hole until
-//! the kernel grows the seam, and it is named here rather than papered over.
+//! **Core 0.1.62 grew it.** A pre-dispatch refusal is now reported to the
+//! installed `Tracer` as a `TraceEvent` whose `notes` carry
+//! `(ikigai_core::DENIED_NOTE, scope)`, and [`crate::LogTracer`] turns that into
+//! the entry. A process with a tracer installed records its refusals with
+//! nobody catching anything.
+//!
+//! [`LogHandle::record_denial`] — T2's workaround, for a host that catches an
+//! `Error::Denied` — remains, because it still covers what the kernel cannot
+//! see: a module's own runtime gate ABOVE the declared floor (a path or host
+//! ACL), and the body checks below on the detached paths where no kernel gate
+//! ran. What it should no longer be used for is a kernel denial in a process
+//! that has a tracer, which would land the entry twice.
 //!
 //! ## Turtle in, SHACL on write
 //!
@@ -122,8 +128,6 @@ struct State {
     /// open the successor without the caller handing it over again — rotation is
     /// triggered from inside a write, where no caller is present to.
     vocabulary: Option<Arc<Vocabulary>>,
-    seals: SealPolicy,
-    rotation: RotationPolicy,
     /// The signer, parked here between segments. It moves INTO the writer at
     /// open and back out at close or rotation, so one key seam serves a whole
     /// chain rather than one segment.
@@ -146,8 +150,6 @@ impl LogHandle {
                 config,
                 writer: None,
                 vocabulary: None,
-                seals: SealPolicy::default(),
-                rotation: RotationPolicy::default(),
                 signer: None,
             }),
         }
@@ -193,8 +195,8 @@ impl LogHandle {
             return Ok(true);
         }
         let options = WriterOptions {
-            seals: state.seals,
-            rotation: state.rotation,
+            seals: state.config.seals,
+            rotation: state.config.rotation,
             // Discovered, not stated: the writer reads the newest segment of this
             // same instance and chains from its head, so the chain spans process
             // restarts and not merely rotations.
@@ -224,16 +226,22 @@ impl LogHandle {
     /// Set when checkpoints land and when segments roll over. Takes effect at the
     /// next segment; the open one keeps what it was opened with, for the same
     /// reason its level is fixed for its life.
+    ///
+    /// The cadences live **in the config** ([`LogConfig::seals`],
+    /// [`LogConfig::rotation`]) and this writes them there, so an operator's
+    /// `[seal]` / `[rotation]` tables and a host's programmatic call are one
+    /// setting with one answer rather than two that quietly disagree — and
+    /// `urn:log:config` reports whichever won.
     pub fn set_policies(&self, seals: SealPolicy, rotation: RotationPolicy) {
         let mut state = self.state.lock().expect("log state");
-        state.seals = seals;
-        state.rotation = rotation;
+        state.config.seals = seals;
+        state.config.rotation = rotation;
     }
 
     /// The policies in force for the next segment.
     pub fn policies(&self) -> (SealPolicy, RotationPolicy) {
         let state = self.state.lock().expect("log state");
-        (state.seals, state.rotation)
+        (state.config.seals, state.config.rotation)
     }
 
     /// Open this process's segment onto a sink the caller supplies — the
@@ -247,8 +255,8 @@ impl LogHandle {
         let mut state = self.state.lock().expect("log state");
         if state.writer.is_none() {
             let options = WriterOptions {
-                seals: state.seals,
-                rotation: state.rotation,
+                seals: state.config.seals,
+                rotation: state.config.rotation,
                 prev: None,
                 signer: state.signer.take(),
             };
@@ -378,8 +386,8 @@ impl LogHandle {
         });
 
         let options = WriterOptions {
-            seals: state.seals,
-            rotation: state.rotation,
+            seals: state.config.seals,
+            rotation: state.config.rotation,
             prev: Some(crate::line::Prev::Seal(closed.head.clone())),
             signer: closed.signer,
         };
@@ -430,6 +438,24 @@ impl LogHandle {
     /// Whether a segment is being written right now.
     pub fn is_open(&self) -> bool {
         self.state.lock().expect("log state").writer.is_some()
+    }
+
+    /// Whether an entry of `class_iri` would land right now: a segment is open
+    /// **and** its level includes the class. `false` for both reasons at once,
+    /// which is exactly what a caller deciding whether to BUILD an entry wants
+    /// to know.
+    ///
+    /// The rank was resolved once, at open, so this is one integer comparison
+    /// over the vocabulary graph behind one lock — cheap enough to ask before
+    /// every candidate entry, which is the point: [`crate::LogTracer`] asks it
+    /// per resolution so that an excluded class costs no allocation here.
+    pub fn emits(&self, class_iri: &str) -> bool {
+        self.state
+            .lock()
+            .expect("log state")
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.emits(class_iri))
     }
 
     /// Append one entry. `Ok(None)` when nothing is open or the level dial
@@ -503,17 +529,24 @@ impl LogHandle {
     /// Land a `log:CapabilityDenied` entry: someone was refused `capability`
     /// while attempting `action`.
     ///
-    /// **Public because the kernel refuses before the endpoint runs**, so the
-    /// action that was denied cannot record its own denial — see the module
-    /// docs. A host holding this handle and catching an `Error::Denied` (a
-    /// transport, an MCP projection, the REPL) is the only place the fact can
-    /// currently be written down.
+    /// **Largely superseded by [`crate::LogTracer`]**, which lands the same
+    /// class from the kernel's own report and needs nobody to catch anything.
+    /// Kept, and still public, for the two places that report a refusal the
+    /// kernel never saw: an endpoint's own runtime gate above the declared floor
+    /// (a path or host ACL), and the body checks below, which run on the
+    /// detached paths where no kernel gate did. A host with a tracer installed
+    /// should not also call this for a kernel denial, or the entry lands twice.
     ///
     /// Best-effort by nature: a log with no open segment cannot record that
     /// something was refused, and the refusal still has to reach the caller.
+    ///
+    /// The scope goes in `denied=`, not `cap=`. They are different facts —
+    /// `log:deniedScope` is what the caller LACKED and `log:capability` is what
+    /// it HELD — and the kernel reports both, so one column could not carry
+    /// them both without making every query about refusals ambiguous.
     pub fn record_denial(&self, now: Timestamp, capability: &str, action: &str) -> Option<u64> {
         let entry = Entry::new(now, CAPABILITY_DENIED_CLASS, subject_for_denial(self))
-            .with("cap", capability)
+            .with("denied", capability)
             .with("reason", action);
         self.write(entry).ok().flatten()
     }
@@ -835,9 +868,36 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     if let Some(instance) = opt(inv, "instance") {
         change.instance = Some(instance.to_string());
     }
+    // The cadences. A request has no tables, so the arg is the nested key
+    // flattened with an underscore — one name for one dial, spelled the way the
+    // surface it is on can spell it, and the error messages keep using the
+    // dotted config spelling because that is the line the operator edits.
+    let seal = crate::config::SealPatch {
+        every_entries: bound(inv, "seal_every_entries")?,
+        every_millis: bound(inv, "seal_every_millis")?,
+    };
+    let rotation = crate::config::RotationPatch {
+        max_entries: bound(inv, "rotation_max_entries")?,
+        max_age_millis: bound(inv, "rotation_max_age_millis")?,
+    };
+    if seal.every_entries.is_some() || seal.every_millis.is_some() {
+        change.seal = Some(seal);
+    }
+    if rotation.max_entries.is_some() || rotation.max_age_millis.is_some() {
+        change.rotation = Some(rotation);
+    }
+    // Present-but-wrong stops, before anything is written: a cadence of zero is
+    // a bound met before anything happened, and `"never"` is the spelling for
+    // turning a trigger off.
+    change.validate().map_err(|e| Error::InvalidArgument {
+        name: "cadence".to_string(),
+        detail: e.to_string(),
+    })?;
     if change.is_empty() {
         return Err(Error::MissingArgument(
-            "one of level|destination|directory|instance".to_string(),
+            "one of level|destination|directory|instance|seal_every_entries|seal_every_millis|\
+             rotation_max_entries|rotation_max_age_millis"
+                .to_string(),
         ));
     }
 
@@ -902,6 +962,51 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
             after.instance.clone(),
         );
     }
+    // The cadences record under their CONFIG-file names, not their argument
+    // names: the entry answers "why did this segment seal like that?", and the
+    // answer points at the line an operator would go and read.
+    for (key, from, to) in [
+        (
+            "seal.every_entries",
+            before.seals.every_entries,
+            after.seals.every_entries,
+        ),
+        (
+            "seal.every_millis",
+            before.seals.every_millis,
+            after.seals.every_millis,
+        ),
+    ] {
+        if from != to {
+            record(
+                CONFIG_CHANGE_CLASS,
+                key,
+                display_bound((from != u64::MAX).then_some(from)),
+                display_bound((to != u64::MAX).then_some(to)),
+            );
+        }
+    }
+    for (key, from, to) in [
+        (
+            "rotation.max_entries",
+            before.rotation.max_entries,
+            after.rotation.max_entries,
+        ),
+        (
+            "rotation.max_age_millis",
+            before.rotation.max_age_millis,
+            after.rotation.max_age_millis,
+        ),
+    ] {
+        if from != to {
+            record(
+                CONFIG_CHANGE_CLASS,
+                key,
+                display_bound(from),
+                display_bound(to),
+            );
+        }
+    }
 
     // Said in the response, because it is the part an operator gets wrong: T2
     // has no rotation, and a segment has exactly one level for its whole life,
@@ -914,6 +1019,31 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
         body.push_str("no segment is open, so nothing was recorded in the log\n");
     }
     Ok(plain(body))
+}
+
+/// One cadence argument as the [`crate::Bound`] it states, or `None` when the
+/// request did not state it. The shape is not judged here — [`Patch::validate`]
+/// does that, so a request and a config file are refused by one rule with one
+/// message.
+#[cfg(not(target_family = "wasm"))]
+fn bound(inv: &Invocation<'_>, name: &str) -> Result<Option<crate::config::Bound>> {
+    let Some(value) = opt(inv, name) else {
+        return Ok(None);
+    };
+    Ok(Some(match value.trim().parse::<i64>() {
+        Ok(count) => crate::config::Bound::Count(count),
+        Err(_) => crate::config::Bound::Word(value.trim().to_string()),
+    }))
+}
+
+/// A resolved bound as a `from=`/`to=` value: the number, or the word an
+/// operator would write to mean the same thing.
+#[cfg(not(target_family = "wasm"))]
+fn display_bound(value: Option<u64>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "never".to_string(),
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -933,12 +1063,13 @@ pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
             .title("The log's effective configuration")
             .summary(
                 "The merged log settings for this process — level, destination, directory, \
-                 instance — over built-in defaults ⊕ log.toml ⊕ {app}.log.toml, plus whether a \
-                 segment is open right now. Source serves the effective config (as=text/turtle \
-                 for the graph face); Sink changes it, writes the highest-precedence layer file, \
-                 and lands an always-land log:LevelChange or log:ConfigChange. A level change is \
-                 RECORDED NOW and EFFECTIVE AT NEXT PROCESS START: a segment has exactly one \
-                 level for its whole life, which is what lets a verifier reason per sealed \
+                 instance, and the seal and rotation cadences — over built-in defaults ⊕ \
+                 log.toml ⊕ {app}.log.toml, plus whether a segment is open right now. Source \
+                 serves the effective config (as=text/turtle for the graph face); Sink changes \
+                 it, writes the highest-precedence layer file, and lands an always-land \
+                 log:LevelChange or log:ConfigChange. Every change is RECORDED NOW and \
+                 EFFECTIVE AT NEXT PROCESS START: a segment has exactly one level and one \
+                 cadence for its whole life, which is what lets a verifier reason per sealed \
                  segment instead of tracking transitions inside sealed content.",
             )
             .verb(Verb::Meta)
@@ -986,6 +1117,42 @@ pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
                     .input(
                         ArgSpec::new("instance")
                             .summary("the instance name this process is attributed to")
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("seal_every_entries")
+                            .summary(
+                                "seal after this many entries — a positive integer, or \"never\" \
+                                 to disable this trigger ([seal] every_entries)",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("seal_every_millis")
+                            .summary(
+                                "seal after this many milliseconds — a positive integer, or \
+                                 \"never\" ([seal] every_millis)",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("rotation_max_entries")
+                            .summary(
+                                "roll over at this many entries — a positive integer, or \
+                                 \"never\" ([rotation] max_entries)",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("rotation_max_age_millis")
+                            .summary(
+                                "roll over at this age in milliseconds — a positive integer, or \
+                                 \"never\" ([rotation] max_age_millis)",
+                            )
                             .class(XSD_STRING)
                             .optional(),
                     )
