@@ -6,14 +6,46 @@
 //! `wasm32-unknown-unknown` and a browser host configures a `console.log`
 //! destination through exactly the same type.
 //!
-//! ## Four keys, flat
+//! ## Four flat keys, and two cadence tables
 //!
 //! ```toml
 //! level       = "info"       # a bare level name, a log: CURIE, or an absolute IRI
 //! destination = "file"       # off | console | file
 //! directory   = "/var/log/ikigai"   # segments land here (file destination only)
 //! instance    = "bug:serve"  # the attribution key; urn:ikigai:instance:{name}
+//!
+//! [seal]                     # when a #seal line is written
+//! every_entries = 1000
+//! every_millis  = 60000
+//!
+//! [rotation]                 # when a segment rolls over
+//! max_entries    = 100000
+//! max_age_millis = 86400000
 //! ```
+//!
+//! **The cadences nest and the rest stays flat**, because `every_entries` names
+//! nothing on its own — it is a bound *of a cadence*, and the two cadences have
+//! the same shape. Flattening them would need a prefix on every key
+//! (`seal_every_entries`), which is a table spelled badly; nesting also gives
+//! each table its own `deny_unknown_fields`, so a typo is blamed on the table it
+//! was written in. The four scalars above are properties of the log itself and
+//! have no such pair to belong to.
+//!
+//! Both cadences fire on **whichever bound is met first**, and a bound is a
+//! positive integer or the word `"never"`. Zero is not "disabled" — it is a
+//! bound that was met before anything happened — so it is refused, and disabling
+//! a trigger has its own spelling:
+//!
+//! ```toml
+//! [rotation]
+//! max_entries    = "never"   # roll over on age alone
+//! max_age_millis = 3600000
+//! ```
+//!
+//! **A cadence change takes effect at the next segment**, exactly like a level
+//! change and for the same reason: a verifier reasons per sealed segment, and a
+//! cadence that shifted inside sealed content would make "was this segment
+//! sealed on schedule?" unanswerable from the segment itself.
 //!
 //! Layered lowest-precedence-first over the host's own defaults:
 //! **host defaults → `log.toml` → `{app}.log.toml`**, merged **key-wise**, so a
@@ -48,6 +80,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::chain::{RotationPolicy, SealPolicy};
 use crate::line::is_iri;
 use crate::vocabulary::LOG_NS;
 
@@ -119,6 +152,84 @@ impl Destination {
             _ => None,
         }
     }
+}
+
+/// One cadence bound, exactly as an operator wrote it: a positive integer, or
+/// the word `"never"`.
+///
+/// Deliberately un-normalized at parse time. Serde could reject a bad value
+/// itself, but its error would carry the deserializer's words and not the key —
+/// and every other error in this module names the key, because the operator's
+/// next move is to edit that line. So the shape is accepted here and judged by
+/// [`Patch::validate`], which knows what it is called.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Bound {
+    /// A count or a duration in milliseconds, as written.
+    Count(i64),
+    /// A word. `never` is the only one this crate accepts; anything else is a
+    /// loud error rather than a fallback.
+    Word(String),
+}
+
+impl Bound {
+    /// The bound as the writer means it: `Some(n)` for a live trigger, `None`
+    /// for `"never"`.
+    ///
+    /// `key` is what a rejection blames, so it is the dotted spelling the
+    /// operator typed (`seal.every_entries`), not the Rust field name.
+    pub fn resolve(&self, key: &'static str) -> Result<Option<u64>, ConfigError> {
+        let bad = |value: String| ConfigError::BadValue {
+            key,
+            value,
+            expected: "a positive integer, or \"never\" to disable this trigger".to_string(),
+        };
+        match self {
+            // Zero is refused rather than read as "off": a bound of zero is met
+            // before anything has happened, so a writer that honored it would
+            // seal or rotate on every single entry — and an operator who meant
+            // "off" has a word for it.
+            Bound::Count(n) if *n > 0 => Ok(Some(*n as u64)),
+            Bound::Count(n) => Err(bad(n.to_string())),
+            Bound::Word(w) if w == "never" => Ok(None),
+            Bound::Word(w) => Err(bad(w.clone())),
+        }
+    }
+
+    /// The bound as an operator would write it back.
+    fn from_optional(value: Option<u64>) -> Bound {
+        match value {
+            Some(n) => Bound::Count(n as i64),
+            None => Bound::Word("never".to_string()),
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Bound::Count(n) => n.to_string(),
+            Bound::Word(w) => format!("{w:?}"),
+        }
+    }
+}
+
+/// The `[seal]` table of one layer.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SealPatch {
+    /// Seal once this many entries have accumulated since the last seal.
+    pub every_entries: Option<Bound>,
+    /// Seal once this many milliseconds have passed since the last seal.
+    pub every_millis: Option<Bound>,
+}
+
+/// The `[rotation]` table of one layer.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RotationPatch {
+    /// Roll over once the open segment holds this many entries.
+    pub max_entries: Option<Bound>,
+    /// Roll over once the open segment is this many milliseconds old.
+    pub max_age_millis: Option<Bound>,
 }
 
 /// What went wrong reading or merging a config. Every variant names the key it
@@ -203,6 +314,11 @@ pub struct LogConfig {
     /// The writing process, as an absolute IRI: the attribution key, since the
     /// log is per-process rather than per-machine.
     pub instance: String,
+    /// When a `#seal` line is written. Read once, at [`crate::Writer::open`]:
+    /// a cadence belongs to a segment for that segment's whole life.
+    pub seals: SealPolicy,
+    /// When a segment rolls over. Read once, at open, for the same reason.
+    pub rotation: RotationPolicy,
     /// The files that contributed, lowest precedence first — provenance, not
     /// configuration. Skipped in the TOML face so that face round-trips as a
     /// config file; present in the graph face, where it answers "why is the
@@ -223,6 +339,11 @@ impl Default for LogConfig {
             destination: Destination::Off,
             directory: None,
             instance: instance_iri(DEFAULT_INSTANCE_NAME),
+            // The cadences an operator who states nothing gets — and they are
+            // the policy defaults themselves rather than a second set of
+            // numbers, so making these configurable cannot move them.
+            seals: SealPolicy::default(),
+            rotation: RotationPolicy::default(),
             layers: Vec::new(),
         }
     }
@@ -331,6 +452,20 @@ impl LogConfig {
         self
     }
 
+    /// The seal cadence (builder).
+    #[must_use]
+    pub fn with_seals(mut self, seals: SealPolicy) -> Self {
+        self.seals = seals;
+        self
+    }
+
+    /// The rotation cadence (builder).
+    #[must_use]
+    pub fn with_rotation(mut self, rotation: RotationPolicy) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
     /// Fold one layer in, key-wise: a key the layer states wins, a key it stays
     /// silent about survives from below.
     ///
@@ -353,6 +488,36 @@ impl LogConfig {
         }
         if let Some(instance) = &patch.instance {
             self.instance = instance_iri(instance);
+        }
+        // Key-wise INSIDE the table too, not table-wise. A layer that states
+        // only `[seal] every_millis` must not silently reset `every_entries` to
+        // the default — which is precisely the "last file wins" bug the outer
+        // merge exists to avoid, one level down.
+        if let Some(seal) = &patch.seal {
+            if let Some(bound) = &seal.every_entries {
+                // Shape-checked by `Patch::parse`; re-deriving the check here
+                // would be a second implementation of one rule.
+                if let Ok(resolved) = bound.resolve("seal.every_entries") {
+                    self.seals.every_entries = resolved.unwrap_or(u64::MAX);
+                }
+            }
+            if let Some(bound) = &seal.every_millis {
+                if let Ok(resolved) = bound.resolve("seal.every_millis") {
+                    self.seals.every_millis = resolved.unwrap_or(u64::MAX);
+                }
+            }
+        }
+        if let Some(rotation) = &patch.rotation {
+            if let Some(bound) = &rotation.max_entries {
+                if let Ok(resolved) = bound.resolve("rotation.max_entries") {
+                    self.rotation.max_entries = resolved;
+                }
+            }
+            if let Some(bound) = &rotation.max_age_millis {
+                if let Ok(resolved) = bound.resolve("rotation.max_age_millis") {
+                    self.rotation.max_age_millis = resolved;
+                }
+            }
         }
     }
 
@@ -378,6 +543,27 @@ impl LogConfig {
             ));
         }
         out.push_str(&format!("instance = {:?}\n", self.instance_name()));
+        // The tables come last and the scalars first — in TOML a bare key after
+        // a table header belongs to that table, so this ordering is what makes
+        // the face round-trip rather than a matter of taste.
+        out.push_str("\n[seal]\n");
+        out.push_str(&format!(
+            "every_entries = {}\n",
+            seal_bound(self.seals.every_entries).render()
+        ));
+        out.push_str(&format!(
+            "every_millis = {}\n",
+            seal_bound(self.seals.every_millis).render()
+        ));
+        out.push_str("\n[rotation]\n");
+        out.push_str(&format!(
+            "max_entries = {}\n",
+            Bound::from_optional(self.rotation.max_entries).render()
+        ));
+        out.push_str(&format!(
+            "max_age_millis = {}\n",
+            Bound::from_optional(self.rotation.max_age_millis).render()
+        ));
         out
     }
 
@@ -408,6 +594,8 @@ impl LogConfig {
             ));
         }
         out.push_str(&format!("    log:instance <{}> ;\n", self.instance));
+        out.push_str(&format!("    log:sealCadence <{subject}#seal> ;\n"));
+        out.push_str(&format!("    log:rotationCadence <{subject}#rotation> ;\n"));
         for layer in &self.layers {
             out.push_str(&format!(
                 "    log:configLayer {:?} ;\n",
@@ -418,6 +606,26 @@ impl LogConfig {
             Some((name, _)) => out.push_str(&format!("    log:currentSegment <{name}> .\n\n")),
             None => out.push_str("    log:currentSegment log:none .\n\n"),
         }
+        out.push_str(&cadence_turtle(
+            &format!("{subject}#seal"),
+            [
+                (
+                    "everyEntries",
+                    (self.seals.every_entries != u64::MAX).then_some(self.seals.every_entries),
+                ),
+                (
+                    "everyMillis",
+                    (self.seals.every_millis != u64::MAX).then_some(self.seals.every_millis),
+                ),
+            ],
+        ));
+        out.push_str(&cadence_turtle(
+            &format!("{subject}#rotation"),
+            [
+                ("everyEntries", self.rotation.max_entries),
+                ("everyMillis", self.rotation.max_age_millis),
+            ],
+        ));
         out.push_str(&format!("<{}> a log:Instance .\n", self.instance));
         if let Some((name, instance)) = open_segment {
             out.push_str(&format!(
@@ -433,6 +641,30 @@ impl LogConfig {
         }
         out
     }
+}
+
+/// A [`SealPolicy`] bound as a [`Bound`]. `u64::MAX` is [`SealPolicy::manual`]'s
+/// spelling of "never", and it is translated back into the word rather than
+/// printed as 18 quintillion — a face that round-trips must not turn a disabled
+/// trigger into a number no operator would recognize as one.
+fn seal_bound(value: u64) -> Bound {
+    Bound::from_optional((value != u64::MAX).then_some(value))
+}
+
+/// One cadence, as the graph face states it: a skolemized node under the
+/// config's own IRI, its live bounds as integers and its disabled ones named by
+/// `log:unbounded`.
+fn cadence_turtle(node: &str, bounds: [(&str, Option<u64>); 2]) -> String {
+    let statements: Vec<String> = bounds
+        .into_iter()
+        .map(|(property, value)| match value {
+            Some(value) => format!("    log:{property} {value}"),
+            // Explicitly off, stated positively: an omitted property and a
+            // disabled trigger must not read alike.
+            None => format!("    log:unbounded log:{property}"),
+        })
+        .collect();
+    format!("<{node}> a log:Cadence ;\n{} .\n", statements.join(" ;\n"))
 }
 
 /// The short spelling of a level IRI — `info` for a `log:` level, the IRI
@@ -454,6 +686,10 @@ pub struct Patch {
     pub directory: Option<String>,
     /// The instance name this layer states.
     pub instance: Option<String>,
+    /// The `[seal]` cadence this layer states, key-wise within the table.
+    pub seal: Option<SealPatch>,
+    /// The `[rotation]` cadence this layer states, key-wise within the table.
+    pub rotation: Option<RotationPatch>,
 }
 
 impl Patch {
@@ -502,6 +738,22 @@ impl Patch {
                 });
             }
         }
+        if let Some(seal) = &self.seal {
+            if let Some(bound) = &seal.every_entries {
+                bound.resolve("seal.every_entries")?;
+            }
+            if let Some(bound) = &seal.every_millis {
+                bound.resolve("seal.every_millis")?;
+            }
+        }
+        if let Some(rotation) = &self.rotation {
+            if let Some(bound) = &rotation.max_entries {
+                bound.resolve("rotation.max_entries")?;
+            }
+            if let Some(bound) = &rotation.max_age_millis {
+                bound.resolve("rotation.max_age_millis")?;
+            }
+        }
         Ok(())
     }
 
@@ -527,6 +779,36 @@ impl Patch {
         if let Some(instance) = &self.instance {
             out.push_str(&format!("instance = {instance:?}\n"));
         }
+        // Tables after scalars — see `LogConfig::to_toml`. A table this layer
+        // does not state is omitted entirely rather than written empty: an
+        // empty `[seal]` and an absent one mean the same thing to the merge,
+        // and writing one back would invent a statement the operator never made.
+        if let Some(seal) = &self.seal {
+            let mut table = String::new();
+            if let Some(bound) = &seal.every_entries {
+                table.push_str(&format!("every_entries = {}\n", bound.render()));
+            }
+            if let Some(bound) = &seal.every_millis {
+                table.push_str(&format!("every_millis = {}\n", bound.render()));
+            }
+            if !table.is_empty() {
+                out.push_str("\n[seal]\n");
+                out.push_str(&table);
+            }
+        }
+        if let Some(rotation) = &self.rotation {
+            let mut table = String::new();
+            if let Some(bound) = &rotation.max_entries {
+                table.push_str(&format!("max_entries = {}\n", bound.render()));
+            }
+            if let Some(bound) = &rotation.max_age_millis {
+                table.push_str(&format!("max_age_millis = {}\n", bound.render()));
+            }
+            if !table.is_empty() {
+                out.push_str("\n[rotation]\n");
+                out.push_str(&table);
+            }
+        }
         out
     }
 
@@ -536,5 +818,13 @@ impl Patch {
             && self.destination.is_none()
             && self.directory.is_none()
             && self.instance.is_none()
+            && self
+                .seal
+                .as_ref()
+                .is_none_or(|s| s.every_entries.is_none() && s.every_millis.is_none())
+            && self
+                .rotation
+                .as_ref()
+                .is_none_or(|r| r.max_entries.is_none() && r.max_age_millis.is_none())
     }
 }

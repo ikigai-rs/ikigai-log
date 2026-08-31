@@ -91,10 +91,26 @@
 //! crate never holds, and the level is verified as RECORDED rather than as
 //! AUTHENTIC — a level MAC needs a key the application itself cannot hold.
 //!
+//! ## The kernel writes it
+//!
+//! [`LogTracer`] is an [`ikigai_core::Tracer`]: a host installs one with
+//! `Kernel::set_tracer` and every resolution lands as a `log:Resolution` (or a
+//! `log:CacheHit`, or a `log:CapabilityDenied` — the class carries what a
+//! boolean column could not be filtered on). Those entries are the trap-free
+//! ones: nobody is composing prose, so the target is an IRI because a `Request`
+//! holds an IRI.
+//!
+//! Two costs stated rather than left to be discovered. **Installing a tracer
+//! means a `TraceEvent` is BUILT for every resolution** — the kernel gates only
+//! on `set_tracer`, so the level dial filters what is WRITTEN, not what is
+//! built, and `error` is not free. And **`record()` cannot fail upward**, so
+//! everything it loses is counted and marked with an always-land `log:Dropped`;
+//! nothing is sampled, because a sampled log is holes with no brackets and a
+//! hash chain is not omission-evident. [`tracer`] has the whole argument.
+//!
 //! ## What this crate is not, yet
 //!
-//! The `ikigai_core::Tracer` implementation, SHACL on write, and retention with
-//! `log:Tombstone` are all still ahead.
+//! SHACL on write and retention with `log:Tombstone` are still ahead.
 //!
 //! ## Reading
 //!
@@ -116,6 +132,7 @@ mod line;
 #[cfg(not(target_family = "wasm"))]
 pub mod load;
 pub mod segments;
+pub mod tracer;
 mod vocabulary;
 mod writer;
 
@@ -127,8 +144,8 @@ pub use chain::{
     RotationPolicy, SealPolicy, SealSigner, SegmentReport, HASH_ALGORITHM,
 };
 pub use config::{
-    instance_iri, level_iri, ConfigError, Destination, LogConfig, Patch, DEFAULT_INSTANCE_NAME,
-    DEFAULT_LEVEL, INSTANCE_NS, STEM,
+    instance_iri, level_iri, Bound, ConfigError, Destination, LogConfig, Patch, RotationPatch,
+    SealPatch, DEFAULT_INSTANCE_NAME, DEFAULT_LEVEL, INSTANCE_NS, STEM,
 };
 pub use endpoints::{LogHandle, CAP_CONFIG, CAP_READ, CAP_WRITE, CONFIG_IRI, WRITE_IRI};
 pub use graph::{
@@ -143,11 +160,13 @@ pub use segments::{
     SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
 };
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
+pub use tracer::{class_for, entry_for, LogTracer, DROP_REASONS};
 pub use vocabulary::{
-    ClassDef, KeyDef, VocabError, Vocabulary, CAPABILITY_DENIED_CLASS, CHAIN_BROKEN_CLASS,
-    CONFIG_CHANGE_CLASS, DEFAULT_MIN_LEVEL, ENTRY_CLASS, ERROR_CLASS, LEVEL_CHANGE_CLASS,
-    LEVEL_CHANGE_REJECTED_CLASS, LOG_NS, MESSAGE_CLASS, PROCESS_START_CLASS, PROCESS_STOP_CLASS,
-    PROV_NS, ROTATION_CLASS, VOCABULARY_TTL, WARNING_CLASS,
+    ClassDef, KeyDef, VocabError, Vocabulary, CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS,
+    CHAIN_BROKEN_CLASS, CONFIG_CHANGE_CLASS, DEFAULT_MIN_LEVEL, DROPPED_CLASS, ENTRY_CLASS,
+    ERROR_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS, LOG_NS, MESSAGE_CLASS,
+    PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS, RESOLUTION_CLASS, ROTATION_CLASS,
+    VOCABULARY_TTL, WARNING_CLASS,
 };
 pub use writer::{Closed, ClosureSink, LineSink, WriteError, Writer, WriterOptions};
 #[cfg(not(target_family = "wasm"))]

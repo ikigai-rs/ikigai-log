@@ -17,12 +17,16 @@ rust-version = "1.89"
 
 [dependencies]
 # The published kernel, consumed from crates.io — the SAME version the hosts
-# use, so a host links exactly one `ikigai-core`. 0.1.56 is the true minimum:
-# `config::{config_home, layered_paths_in, data_home_in}` (the path algebra the
-# layered `log.toml` reads) arrived there and nowhere earlier; everything else
-# this crate touches (ActionSpec, ArgSpec `class`/`one_of`/`default_value`,
-# `Error::Denied`, `Invocation::now`) is older still.
-ikigai-core = "0.1.56"
+# use, so a host links exactly one `ikigai-core`. 0.1.62 is the true minimum:
+# `DENIED_NOTE` arrived there and nowhere earlier, and it is what makes a
+# pre-dispatch capability refusal reach an observer at all — the entry T2
+# reported it could not write. Before that: `config::{config_home,
+# layered_paths_in, data_home_in}` (the path algebra the layered `log.toml`
+# reads) is 0.1.56, and everything else this crate touches (`Tracer`,
+# `TraceEvent`, `Kernel::set_tracer`, ActionSpec, ArgSpec
+# `class`/`one_of`/`default_value`, `Error::Denied`, `Invocation::now`) is older
+# still.
+ikigai-core = "0.1.62"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
 # they carry a vocabulary and a handle — and `Endpoint::invoke` is `async_trait`.

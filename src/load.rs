@@ -142,6 +142,28 @@ pub fn write_layer(path: &Path, change: &Patch) -> Result<Patch, ConfigError> {
     if let Some(instance) = &change.instance {
         merged.instance = Some(instance.clone());
     }
+    // Key-wise inside the tables too, on the same rule as everything above it:
+    // a write that states one bound must not erase the neighbour already in the
+    // file. Merging table-wise here would silently drop the operator's other
+    // half of a cadence — the "last one wins" bug, one level down.
+    if let Some(seal) = &change.seal {
+        let merged_seal = merged.seal.get_or_insert_with(Default::default);
+        if let Some(bound) = &seal.every_entries {
+            merged_seal.every_entries = Some(bound.clone());
+        }
+        if let Some(bound) = &seal.every_millis {
+            merged_seal.every_millis = Some(bound.clone());
+        }
+    }
+    if let Some(rotation) = &change.rotation {
+        let merged_rotation = merged.rotation.get_or_insert_with(Default::default);
+        if let Some(bound) = &rotation.max_entries {
+            merged_rotation.max_entries = Some(bound.clone());
+        }
+        if let Some(bound) = &rotation.max_age_millis {
+            merged_rotation.max_age_millis = Some(bound.clone());
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::Unwritable {
             path: path.to_path_buf(),

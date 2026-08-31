@@ -173,6 +173,7 @@ fn every_class_is_placeable_on_the_dial() {
         log("Level"),
         log("Config"),
         log("Destination"),
+        log("Cadence"),
     ];
     for class in vocab.classes() {
         if structural.contains(&class.iri) {
@@ -1204,24 +1205,28 @@ fn a_write_without_the_capability_is_denied_before_the_endpoint_is_entered() {
 
     // ★ The kernel refuses BEFORE dispatch (core 0.1.49 onward), so the entry
     // that would record the refusal is written by the action that was refused —
-    // and never runs. `log:CapabilityDenied` is always-land and this is a real
-    // hole in T2: the fact can only be recorded by a HOST that catches the
-    // Denied, through `record_denial`. Closing it properly needs a kernel seam
-    // for pre-dispatch denials, which is core's decision and not this crate's.
+    // and never runs. With NO TRACER INSTALLED the refusal therefore reaches no
+    // observer in this process at all, which is what this asserts; core 0.1.62
+    // grew the seam that closes it, and
+    // `the_kernel_reports_a_refusal_the_denied_action_could_never_write` is the
+    // same scenario with a `LogTracer` in place.
     assert!(
         !captured.text().contains("log:CapabilityDenied"),
-        "if this ever starts passing, the kernel grew the seam and the module \
-         docs need rewriting: {}",
+        "without a tracer there is no observer the kernel can report to: {}",
         captured.text()
     );
 
-    // The door that IS available to a host, at the bottom of the dial.
+    // The door a host still has for a refusal the KERNEL never saw — a module's
+    // own runtime gate above the declared floor.
     handle
         .record_denial(at(1_700_000_000_500), CAP_WRITE, "appending a log entry")
         .expect("a refused authority is a security fact, so it lands at EVERY level");
     let written = captured.text();
     assert!(written.contains("log:CapabilityDenied"), "{written}");
-    assert!(written.contains(&format!("cap={CAP_WRITE}")), "{written}");
+    assert!(
+        written.contains(&format!("denied={CAP_WRITE}")),
+        "{written}"
+    );
 
     // The declared requirement and the enforced one are the same string.
     let described =
@@ -3342,4 +3347,1021 @@ fn a_writer_with_no_file_does_not_rotate_and_is_not_lost() {
         .write(message(1_700_000_002_000, "still logging"))
         .expect("writes");
     assert!(captured.text().contains("still logging"));
+}
+
+// =====================================================================================
+// T5 — the kernel writes the log
+// =====================================================================================
+
+use ikigai_core::{
+    ActionSpec, Description, EndpointSpace, Exact, FnEndpoint, ReprType, TraceEvent, Tracer,
+    DENIED_NOTE,
+};
+
+use crate::tracer::{class_for, entry_for, LogTracer, DROP_REASONS};
+use crate::vocabulary::{
+    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DROPPED_CLASS, RESOLUTION_CLASS,
+};
+
+const TRACED_IRI: &str = "urn:traced:thing";
+const GATED_IRI: &str = "urn:traced:gated";
+const CAP_TRACED: &str = "urn:cap:traced:read";
+
+/// A space with nothing to do with logging: two endpoints, one public and
+/// cacheable, one behind a declared capability. Resolving THESE is what the
+/// tracer observes, so nothing in these tests can pass by accident because the
+/// log happened to be resolving itself.
+fn traced_space() -> EndpointSpace {
+    let thing = FnEndpoint::new("tracedThing", |_inv| {
+        Ok(
+            Representation::new(ReprType::new("text/plain"), b"thing".to_vec())
+                // Cacheable, so a second resolution is a CACHE HIT and the class
+                // changes — which is the whole reason cache_hit is not a column.
+                .cacheable(),
+        )
+    });
+    let gated = FnEndpoint::new("tracedGated", |_inv| {
+        Ok(Representation::new(
+            ReprType::new("text/plain"),
+            b"gated".to_vec(),
+        ))
+    })
+    .with_description(
+        Description::new("tracedGated").action(ActionSpec::new(Verb::Source).requires(CAP_TRACED)),
+    );
+    EndpointSpace::new()
+        .bind(Exact::new(TRACED_IRI), thing)
+        .bind(Exact::new(GATED_IRI), gated)
+}
+
+/// A kernel over [`traced_space`] with `tracer` installed and the same clock the
+/// tracer stamps from — the arrangement a host builds.
+fn traced_kernel(tracer: Arc<LogTracer>, millis: u64) -> Kernel {
+    let kernel = Kernel::new(Arc::new(traced_space())).with_clock(Arc::new(Fixed(millis)));
+    kernel.set_tracer(tracer);
+    kernel
+}
+
+fn tracer_for(handle: Arc<LogHandle>, millis: u64) -> Arc<LogTracer> {
+    Arc::new(LogTracer::new(handle, Arc::new(Fixed(millis))))
+}
+
+fn get(iri: &str) -> Request {
+    Request::new(Verb::Source, Iri::parse(iri).expect("a valid IRI"))
+}
+
+/// Every entry line of a capture, parsed back through the T1 grammar — the
+/// oracle. String matching would pass on a line that does not parse, which is
+/// exactly the failure worth catching.
+fn entries(captured: &Captured) -> Vec<Entry> {
+    let text = captured.text();
+    let (header, _) = Header::parse(&text).expect("the header parses");
+    text.lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('@') && !line.starts_with('#'))
+        .map(|line| match Line::parse(line, &header.prefixes) {
+            Ok(Line::Entry(entry)) => entry,
+            other => panic!("{line}\nis not an entry: {other:?}"),
+        })
+        .collect()
+}
+
+/// The entries of one class.
+fn of_class(captured: &Captured, class: &str) -> Vec<Entry> {
+    entries(captured)
+        .into_iter()
+        .filter(|entry| entry.class == class)
+        .collect()
+}
+
+#[test]
+fn a_real_resolution_lands_as_one_resolution_entry_with_the_facts_the_kernel_had() {
+    let home = Scratch::new("tracer-resolution");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = traced_kernel(tracer, 1_700_000_000_000);
+
+    futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+        .expect("it resolves");
+
+    let resolutions = of_class(&captured, RESOLUTION_CLASS);
+    assert_eq!(resolutions.len(), 1, "{:#?}", entries(&captured));
+    let entry = &resolutions[0];
+    assert_eq!(entry.subject, TRACED_IRI, "the subject IS the target");
+    assert_eq!(entry.time, at(1_700_000_000_000), "stamped from the kernel");
+    assert!(
+        entry.get("worker").is_some(),
+        "the worker column: {entry:?}"
+    );
+    assert_eq!(entry.get("span"), Some("0"), "the root span");
+    assert_eq!(entry.get("parent"), None, "which has no parent");
+    assert_eq!(entry.get("dur"), Some("0"), "a fixed clock does not move");
+    assert_eq!(
+        entry.get("cap"),
+        None,
+        "root authority is stated by ABSENCE — the vocabulary says so, and an \
+         empty scope set is a different fact from full authority"
+    );
+}
+
+#[test]
+fn one_resolution_is_exactly_one_entry_because_nothing_in_the_write_path_resolves() {
+    // ★ THE catastrophic case. A tracer that wrote by RESOLVING would produce a
+    // TraceEvent for its own write, which would produce another, forever. The
+    // write path is `std::fs` (or a sink) and touches no kernel — this is what
+    // catches the day that stops being true, before production does.
+    let home = Scratch::new("tracer-recursion");
+    let (handle, captured) = open_handle(home.path(), None, "trace");
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = traced_kernel(tracer.clone(), 1_700_000_000_000);
+
+    futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+        .expect("it resolves");
+
+    // `trace` is the top of the dial: nothing is excluded here, so a second
+    // entry would be a second EVENT rather than a filtered one.
+    let written = entries(&captured);
+    let resolutions: Vec<_> = written
+        .iter()
+        .filter(|e| e.class == RESOLUTION_CLASS || e.class == CACHE_HIT_CLASS)
+        .collect();
+    assert_eq!(
+        resolutions.len(),
+        1,
+        "one resolution, one entry — anything more is the write path resolving:\n{written:#?}"
+    );
+    assert_eq!(
+        tracer.pending_drops()[2],
+        0,
+        "and the re-entrancy guard never fired, so the count is a real one \
+         rather than recursion being silently absorbed"
+    );
+}
+
+#[test]
+fn a_cache_hit_is_its_own_class_and_the_dial_can_therefore_exclude_it() {
+    let home = Scratch::new("tracer-cachehit");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = traced_kernel(tracer, 1_700_000_000_000);
+
+    for _ in 0..2 {
+        futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+            .expect("it resolves");
+    }
+
+    assert_eq!(
+        of_class(&captured, RESOLUTION_CLASS).len(),
+        1,
+        "the computed one: {:#?}",
+        entries(&captured)
+    );
+    assert!(
+        of_class(&captured, CACHE_HIT_CLASS).is_empty(),
+        "and at `debug` the cache hit is EXCLUDED — which is only possible \
+         because it is a class and not a boolean column: {:#?}",
+        entries(&captured)
+    );
+
+    // The same two resolutions one notch up the dial.
+    let home = Scratch::new("tracer-cachehit-trace");
+    let (handle, captured) = open_handle(home.path(), None, "trace");
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = traced_kernel(tracer, 1_700_000_000_000);
+    for _ in 0..2 {
+        futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+            .expect("it resolves");
+    }
+    let hits = of_class(&captured, CACHE_HIT_CLASS);
+    assert_eq!(hits.len(), 1, "{:#?}", entries(&captured));
+    assert_eq!(hits[0].subject, TRACED_IRI);
+    assert_eq!(
+        of_class(&captured, RESOLUTION_CLASS).len(),
+        1,
+        "and log:CacheHit is a SUBCLASS, so it does not double-count as one"
+    );
+}
+
+#[test]
+fn the_kernel_reports_a_refusal_the_denied_action_could_never_write() {
+    // ★★ The entry T2 could not write. `error` is the bottom of the dial: a
+    // refused authority is a security fact, so log:CapabilityDenied is
+    // always-land and landing HERE means it lands everywhere.
+    let home = Scratch::new("tracer-denied");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let tracer = tracer_for(handle, 1_700_000_000_777);
+    let kernel = traced_kernel(tracer, 1_700_000_000_777);
+
+    let error = futures::executor::block_on(kernel.issue(
+        get(GATED_IRI),
+        &Capability::scoped(["urn:cap:something:else"]),
+    ))
+    .expect_err("the floor refuses it before dispatch");
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+
+    let denials = of_class(&captured, CAPABILITY_DENIED_CLASS);
+    assert_eq!(denials.len(), 1, "{:#?}", entries(&captured));
+    let entry = &denials[0];
+    assert_eq!(entry.subject, GATED_IRI, "what the caller was refused");
+    assert_eq!(
+        entry.get("denied"),
+        Some(CAP_TRACED),
+        "the scope the caller LACKED, under the kernel's own note key"
+    );
+    assert_eq!(
+        entry.get("cap"),
+        Some("urn:cap:something:else"),
+        "and the authority it HELD — two different facts, two columns"
+    );
+    assert_eq!(
+        entry.get("dur"),
+        None,
+        "nothing ran, so there is no duration to state; dur=0 would claim it \
+         ran and finished instantly"
+    );
+    assert_eq!(
+        entry.time,
+        at(1_700_000_000_777),
+        "stamped when the refusal was observed — the kernel had nothing to \
+         stamp with, having run nothing"
+    );
+
+    // At `error` the resolutions themselves are excluded, which is what makes
+    // the always-land set worth having.
+    assert!(of_class(&captured, RESOLUTION_CLASS).is_empty());
+
+    // And it reaches the graph as two distinguishable facts — which is the only
+    // reason to have spent a second column on it.
+    let triples = reparse(
+        &to_turtle(&captured.text(), Vocabulary::builtin(), &Options::all()).expect("transrepts"),
+    );
+    let object_of = |predicate: &str| {
+        triples
+            .iter()
+            .find(|t| t.predicate.as_str() == format!("{LOG_NS}{predicate}"))
+            .map(|t| t.object.to_string())
+    };
+    assert_eq!(
+        object_of("refused").as_deref(),
+        Some(format!("<{GATED_IRI}>").as_str()),
+        "the subject reads through the class-declared log:subjectPredicate:\n{triples:#?}"
+    );
+    assert_eq!(
+        object_of("deniedScope").as_deref(),
+        Some(format!("<{CAP_TRACED}>").as_str()),
+        "an IRI, not a string — the range says so, so a query can join on it"
+    );
+}
+
+#[test]
+fn a_denial_is_a_refusal_whatever_the_level_and_at_every_level() {
+    for level in ["error", "warn", "info", "debug", "trace"] {
+        let home = Scratch::new(&format!("tracer-denied-{level}"));
+        let (handle, captured) = open_handle(home.path(), None, level);
+        let tracer = tracer_for(handle, 1_700_000_000_000);
+        let kernel = traced_kernel(tracer, 1_700_000_000_000);
+        let _ = futures::executor::block_on(
+            kernel.issue(get(GATED_IRI), &Capability::scoped(["urn:cap:nope"])),
+        );
+        assert_eq!(
+            of_class(&captured, CAPABILITY_DENIED_CLASS).len(),
+            1,
+            "log:always means every level, and {level} is a level"
+        );
+    }
+}
+
+#[test]
+fn a_failing_sink_does_not_panic_does_not_fail_the_resolution_and_leaves_a_marker() {
+    // ★ record() returns unit, so a write failure is invisible upward BY
+    // DESIGN. That is a silent-loss hazard, and the marker is the answer: a
+    // chain is tamper-evident and NOT omission-evident.
+    let home = Scratch::new("tracer-drops");
+    let failing = Arc::new(Mutex::new(false));
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = {
+        let failing = failing.clone();
+        let lines = lines.clone();
+        Box::new(ClosureSink(move |line: &str| {
+            if *failing.lock().expect("flag") {
+                // A ClosureSink cannot report an error, so a sink that fails is
+                // modelled the way a host's really would: by panicking out of
+                // somebody else's resolution.
+                panic!("the disk is full");
+            }
+            lines.lock().expect("lines").push(line.to_string());
+        }))
+    };
+    let config = crate::load::complete_in(
+        home.path(),
+        None,
+        LogConfig::default()
+            .with_instance("bug:test")
+            .with_level("debug")
+            .expect("a real level"),
+    )
+    .expect("the layers parse");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        config,
+    ));
+    handle
+        .open_with_sink(Vocabulary::shared_builtin(), at(1_700_000_000_000), sink)
+        .expect("the segment opens");
+
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = traced_kernel(tracer.clone(), 1_700_000_000_000);
+
+    *failing.lock().expect("flag") = true;
+    let repr = futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+        .expect("★ THE claim: a broken log does not break the resolution it observes");
+    assert_eq!(text(&repr), "thing");
+    assert_eq!(
+        tracer.pending_drops(),
+        [1, 0, 0, 0],
+        "counted as an ordinary write failure, not as a panic: the WRITER turns \
+         a panicking sink into a write error, because a panic unwinding from \
+         there would poison the handle's mutex and kill the log for the rest of \
+         the run — with no marker, since the marker is itself a write"
+    );
+
+    // The sink comes back, and the loss lands in the chain rather than staying
+    // a number nobody sees.
+    *failing.lock().expect("flag") = false;
+    futures::executor::block_on(kernel.issue(get("urn:traced:gated"), &Capability::root())).ok();
+    let written = lines.lock().expect("lines").join("\n");
+    assert!(
+        written.contains("log:Dropped") && written.contains("count=1"),
+        "a drop that leaves no marker is the one thing the design forbids:\n{written}"
+    );
+    assert!(
+        written.contains("reason=write-failed"),
+        "and it says WHICH way the fact was lost:\n{written}"
+    );
+    assert_eq!(
+        tracer.pending_drops(),
+        [0; DROP_REASONS.len()],
+        "the counter is cleared by the marker, not by time"
+    );
+}
+
+#[test]
+fn the_span_tree_round_trips_through_the_transreptor_as_log_invoked() {
+    // T3 materializes log:invoked from span/parent, so the honest end-to-end
+    // check of "the tree is right" is the graph, not the columns.
+    let home = Scratch::new("tracer-spans");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let tracer = tracer_for(handle.clone(), 1_700_000_000_000);
+
+    // A fan-out, stated as the events the kernel would report: a root and two
+    // children. Driving a real re-entrant fan-out would need a scheduler this
+    // crate does not depend on; the MAPPING is what is under test, and it is
+    // the same `record` either way.
+    let event = |target: &str, span: u64, parent: Option<u64>| TraceEvent {
+        target: target.to_string(),
+        thread: format!("ikigai-sched-{span}"),
+        started: Some(Time::from_millis(1_700_000_000_000 + span)),
+        ended: Some(Time::from_millis(1_700_000_000_010 + span)),
+        cache_hit: false,
+        span,
+        parent,
+        capability: None,
+        notes: Vec::new(),
+    };
+    tracer.record(event("urn:traced:root", 0, None));
+    tracer.record(event("urn:traced:left", 1, Some(0)));
+    tracer.record(event("urn:traced:right", 2, Some(0)));
+
+    let triples = reparse(
+        &to_turtle(&captured.text(), Vocabulary::builtin(), &Options::all()).expect("transrepts"),
+    );
+    let invoked: Vec<_> = triples
+        .iter()
+        .filter(|t| t.predicate.as_str() == format!("{LOG_NS}invoked"))
+        .collect();
+    assert_eq!(
+        invoked.len(),
+        2,
+        "the root informed both branches:\n{triples:#?}"
+    );
+    let workers: Vec<_> = triples
+        .iter()
+        .filter(|t| t.predicate.as_str() == format!("{LOG_NS}worker"))
+        .collect();
+    assert_eq!(
+        workers.len(),
+        3,
+        "a fan-out's branches show up on different workers — and the column is \
+         `worker`, never `thread`, because in ikigai a thread is a GOLDEN thread"
+    );
+}
+
+#[test]
+fn the_mapping_states_full_authority_by_absence_and_attenuation_by_repetition() {
+    let now = at(1_700_000_000_000);
+    let base = TraceEvent {
+        target: "urn:traced:thing".to_string(),
+        thread: "ikigai-sched-1".to_string(),
+        started: Some(Time::from_millis(1_700_000_000_000)),
+        ended: Some(Time::from_millis(1_700_000_000_012)),
+        cache_hit: false,
+        span: 4,
+        parent: Some(1),
+        capability: None,
+        notes: Vec::new(),
+    };
+    let root = entry_for(&base, class_for(&base), now);
+    assert_eq!(root.get("dur"), Some("12"));
+    assert_eq!(root.get("parent"), Some("1"));
+    assert_eq!(root.all("cap").count(), 0, "None = full authority");
+
+    let attenuated = TraceEvent {
+        capability: Some(vec!["urn:cap:a".to_string(), "urn:cap:b".to_string()]),
+        ..base.clone()
+    };
+    let entry = entry_for(&attenuated, class_for(&attenuated), now);
+    assert_eq!(
+        entry.all("cap").collect::<Vec<_>>(),
+        vec!["urn:cap:a", "urn:cap:b"],
+        "repeated per scope — a key may repeat in a line, which is why fields \
+         is a list and not a map"
+    );
+
+    let empty = TraceEvent {
+        capability: Some(Vec::new()),
+        ..base.clone()
+    };
+    assert_eq!(
+        entry_for(&empty, class_for(&empty), now).all("cap").count(),
+        0,
+        "an empty scope set writes no column — but it is a DIFFERENT fact from \
+         None, and the class/subject still land, so nothing is dropped"
+    );
+
+    // The class is chosen by the note before anything else: a refusal is a
+    // refusal whatever the rest of the event says.
+    let denied = TraceEvent {
+        cache_hit: true,
+        started: None,
+        ended: None,
+        notes: vec![(DENIED_NOTE.to_string(), "urn:cap:fs:read".to_string())],
+        ..base.clone()
+    };
+    assert_eq!(class_for(&denied), CAPABILITY_DENIED_CLASS);
+    let entry = entry_for(&denied, class_for(&denied), now);
+    assert_eq!(entry.time, now, "no started, so the observer's own clock");
+    assert_eq!(entry.get("dur"), None);
+    assert_eq!(entry.get("denied"), Some("urn:cap:fs:read"));
+}
+
+#[test]
+fn an_excluded_class_costs_no_entry_and_the_dial_is_read_once_at_open() {
+    // The claim the docs make about cost, made checkable: at `error` a
+    // resolution produces NOTHING here — the kernel still built the TraceEvent,
+    // which is the coupling that cannot be filtered from this side.
+    let home = Scratch::new("tracer-error-level");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    assert!(!handle.emits(RESOLUTION_CLASS), "the dial excludes it");
+    assert!(
+        handle.emits(DROPPED_CLASS) && handle.emits(CAPABILITY_DENIED_CLASS),
+        "and never the always-land set"
+    );
+    let tracer = tracer_for(handle.clone(), 1_700_000_000_000);
+    let kernel = traced_kernel(tracer, 1_700_000_000_000);
+    for _ in 0..5 {
+        futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+            .expect("it resolves");
+    }
+    assert!(
+        entries(&captured)
+            .iter()
+            .all(|e| e.class == PROCESS_START_CLASS),
+        "nothing but the segment's own start marker: {:#?}",
+        entries(&captured)
+    );
+
+    // A closed handle emits nothing at all — the two reasons collapse into one
+    // answer on purpose, because a caller deciding whether to BUILD an entry
+    // does not care which.
+    let closed = LogHandle::new(None, None, LogConfig::default());
+    assert!(!closed.emits(CAPABILITY_DENIED_CLASS));
+}
+
+// =====================================================================================
+// The cadences as config keys
+// =====================================================================================
+
+use crate::config::{Bound, RotationPatch, SealPatch};
+
+#[test]
+fn the_cadence_defaults_do_not_move_now_that_they_are_configurable() {
+    // ★ The regression pin. Making four numbers settable must not change what
+    // an operator who sets nothing gets — and the way to guarantee that is for
+    // the config's defaults to BE the policy defaults rather than a second set
+    // of numbers written down twice.
+    let default = LogConfig::default();
+    assert_eq!(default.seals, SealPolicy::default());
+    assert_eq!(default.rotation, RotationPolicy::default());
+    assert_eq!(default.seals.every_entries, 1_000);
+    assert_eq!(default.seals.every_millis, 60_000);
+    assert_eq!(default.rotation.max_entries, Some(100_000));
+    assert_eq!(default.rotation.max_age_millis, Some(86_400_000));
+
+    // An empty layer, and a layer that states something else, both leave them
+    // exactly where they were.
+    let mut config = LogConfig::default();
+    config.apply(&Patch::parse("", None).expect("an empty layer parses"));
+    config.apply(&Patch::parse("level = \"debug\"\n", None).expect("parses"));
+    assert_eq!(config.seals, SealPolicy::default());
+    assert_eq!(config.rotation, RotationPolicy::default());
+
+    // And through the real layering, from a home with no files in it.
+    let home = Scratch::new("cadence-defaults");
+    let layered = crate::load::complete_in(home.path(), None, LogConfig::default())
+        .expect("no files is the host defaults");
+    assert_eq!(layered.seals, SealPolicy::default());
+    assert_eq!(layered.rotation, RotationPolicy::default());
+}
+
+#[test]
+fn the_cadence_tables_merge_key_wise_inside_the_table() {
+    // The outer merge is key-wise so one app's destination cannot drop the
+    // shared level. One level down, the same rule: a layer that states one
+    // bound must not reset its neighbour.
+    let mut config = LogConfig::default();
+    config.apply(&Patch::parse("[seal]\nevery_millis = 5000\n", None).expect("parses"));
+    assert_eq!(config.seals.every_millis, 5_000, "the stated one changed");
+    assert_eq!(
+        config.seals.every_entries,
+        SealPolicy::default().every_entries,
+        "and the unstated one survived from below"
+    );
+
+    let home = Scratch::new("cadence-layers");
+    home.write(
+        "log.toml",
+        "[seal]\nevery_entries = 250\nevery_millis = 5000\n\n[rotation]\nmax_entries = 20000\n",
+    );
+    home.write("serve.log.toml", "[seal]\nevery_millis = 1000\n");
+    let layered = crate::load::complete_in(home.path(), Some("serve"), LogConfig::default())
+        .expect("the layers parse");
+    assert_eq!(layered.seals.every_millis, 1_000, "the app layer wins");
+    assert_eq!(layered.seals.every_entries, 250, "the shared one survives");
+    assert_eq!(layered.rotation.max_entries, Some(20_000));
+    assert_eq!(
+        layered.rotation.max_age_millis,
+        RotationPolicy::default().max_age_millis
+    );
+}
+
+#[test]
+fn never_disables_a_trigger_and_zero_is_refused_rather_than_read_as_off() {
+    let mut config = LogConfig::default();
+    config.apply(
+        &Patch::parse(
+            "[rotation]\nmax_entries = \"never\"\nmax_age_millis = 3600000\n",
+            None,
+        )
+        .expect("parses"),
+    );
+    assert_eq!(
+        config.rotation.max_entries, None,
+        "roll over on age alone — and the operator said so in a word"
+    );
+    assert_eq!(config.rotation.max_age_millis, Some(3_600_000));
+
+    let mut config = LogConfig::default();
+    config.apply(&Patch::parse("[seal]\nevery_entries = \"never\"\n", None).expect("parses"));
+    assert_eq!(
+        config.seals.every_entries,
+        SealPolicy::manual().every_entries,
+        "a seal cadence disables the same way"
+    );
+
+    // Zero is a bound met before anything happened, so it stops — loudly, and
+    // naming the key, because the operator's next move is to edit that line.
+    for (text, key) in [
+        ("[seal]\nevery_entries = 0\n", "seal.every_entries"),
+        ("[seal]\nevery_millis = -1\n", "seal.every_millis"),
+        ("[rotation]\nmax_entries = 0\n", "rotation.max_entries"),
+        (
+            "[rotation]\nmax_age_millis = \"forever\"\n",
+            "rotation.max_age_millis",
+        ),
+    ] {
+        match Patch::parse(text, None) {
+            Err(ConfigError::BadValue { key: blamed, .. }) => assert_eq!(blamed, key),
+            other => panic!("{text:?} should be refused naming {key}, got {other:?}"),
+        }
+    }
+
+    // And a misspelled key inside a table is blamed on the table it was written
+    // in, which is what `deny_unknown_fields` on each one buys.
+    let err = Patch::parse("[seal]\nevery_entrys = 10\n", None).expect_err("a typo is loud");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "an unknown key stops rather than being ignored: {err:?}"
+    );
+}
+
+#[test]
+fn both_faces_carry_the_cadences_and_the_toml_face_round_trips() {
+    // ★ A key that parses from TOML but is invisible in the graph face is a
+    // half-landed change. Both faces, or it did not land.
+    let config = LogConfig::default()
+        .with_seals(SealPolicy {
+            every_entries: 250,
+            every_millis: 5_000,
+        })
+        .with_rotation(RotationPolicy {
+            max_entries: None,
+            max_age_millis: Some(3_600_000),
+        });
+
+    let toml = config.to_toml();
+    assert!(
+        toml.contains("[seal]\nevery_entries = 250\nevery_millis = 5000\n"),
+        "{toml}"
+    );
+    assert!(
+        toml.contains("[rotation]\nmax_entries = \"never\"\nmax_age_millis = 3600000\n"),
+        "a disabled trigger comes back as the WORD, not as 18 quintillion: {toml}"
+    );
+    let mut round_tripped = LogConfig::default();
+    round_tripped.apply(&Patch::parse(&toml, None).expect("the face is a config file"));
+    assert_eq!(round_tripped.seals, config.seals);
+    assert_eq!(round_tripped.rotation, config.rotation);
+
+    let turtle = config.to_turtle(CONFIG_IRI, None);
+    let triples = reparse(&turtle);
+    let has = |subject: &str, predicate: &str, object: &str| {
+        triples.iter().any(|t| {
+            t.subject.to_string() == format!("<{subject}>")
+                && t.predicate.as_str() == format!("{LOG_NS}{predicate}")
+                && t.object.to_string() == object
+        })
+    };
+    assert!(
+        has(CONFIG_IRI, "sealCadence", &format!("<{CONFIG_IRI}#seal>")),
+        "{turtle}"
+    );
+    assert!(
+        has(
+            &format!("{CONFIG_IRI}#seal"),
+            "everyEntries",
+            "\"250\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        ),
+        "{turtle}"
+    );
+    assert!(
+        has(
+            &format!("{CONFIG_IRI}#rotation"),
+            "unbounded",
+            &format!("<{LOG_NS}everyEntries>")
+        ),
+        "a disabled trigger is stated POSITIVELY — an omitted property and an \
+         explicit never must not read alike: {turtle}"
+    );
+    assert!(
+        !turtle.contains("[]"),
+        "skolemized; no blank nodes: {turtle}"
+    );
+}
+
+#[test]
+fn a_cadence_change_takes_effect_at_the_next_segment_and_lands_an_always_land_entry() {
+    // `error` is the bottom of the dial: a config change brackets a gap, so it
+    // has to land wherever the dial is set.
+    let home = Scratch::new("cadence-sink");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let opened_with = handle.policies();
+    let kernel = kernel(handle.clone());
+
+    let repr = futures::executor::block_on(kernel.issue(
+        sink_request(
+            CONFIG_IRI,
+            &[
+                ("seal_every_entries", "7"),
+                ("rotation_max_entries", "never"),
+            ],
+        ),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect("the change lands");
+    assert!(
+        text(&repr).contains("seal.every_entries"),
+        "{}",
+        text(&repr)
+    );
+
+    // Recorded now…
+    let changes: Vec<_> = entries(&captured)
+        .into_iter()
+        .filter(|e| e.class == CONFIG_CHANGE_CLASS)
+        .collect();
+    let keys: Vec<_> = changes
+        .iter()
+        .filter_map(|e| e.get("key").map(str::to_string))
+        .collect();
+    assert!(
+        keys.contains(&"seal.every_entries".to_string())
+            && keys.contains(&"rotation.max_entries".to_string()),
+        "one entry per key that actually changed, named the way the config file \
+         names them: {keys:?}"
+    );
+    let rotation = changes
+        .iter()
+        .find(|e| e.get("key") == Some("rotation.max_entries"))
+        .expect("it changed");
+    assert_eq!(rotation.get("to"), Some("never"));
+    assert_eq!(rotation.get("effective"), Some("next-segment"));
+
+    // …and effective at the NEXT segment. The open one keeps what it opened
+    // with, for the same reason its level is fixed for its life: a verifier
+    // reasons per sealed segment, and a cadence that shifted inside sealed
+    // content would make "was this sealed on schedule?" unanswerable.
+    assert_eq!(
+        handle.policies().0.every_entries,
+        7,
+        "queued for the next one"
+    );
+    assert_eq!(
+        opened_with.0.every_entries,
+        SealPolicy::default().every_entries,
+        "and the segment being written was opened with the old cadence"
+    );
+
+    // The persisted layer says the same thing, in the operator's own spelling.
+    let written = home.read("log.toml");
+    assert!(written.contains("[seal]\nevery_entries = 7\n"), "{written}");
+    assert!(written.contains("max_entries = \"never\""), "{written}");
+
+    // A bad cadence over the wire stops, on the same rule as a bad one in a file.
+    let err = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("seal_every_millis", "0")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect_err("zero is not a cadence");
+    assert!(
+        matches!(&err, Error::InvalidArgument { detail, .. }
+            if detail.contains("seal.every_millis")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_configured_cadence_is_what_the_writer_actually_runs_on() {
+    // The whole point of the keys: the numbers reach the writer, not just the
+    // config resource. Seven entries at `seal.every_entries = 7` is one seal.
+    let home = Scratch::new("cadence-effective");
+    home.write(
+        "log.toml",
+        "[seal]\nevery_entries = 3\nevery_millis = \"never\"\n",
+    );
+    let (handle, captured) = open_handle(home.path(), None, "info");
+    for i in 0..3u64 {
+        handle
+            .write(message(1_700_000_000_000 + i, "tick"))
+            .expect("writes");
+    }
+    let seals = captured
+        .text()
+        .lines()
+        .filter(|line| line.starts_with("#seal"))
+        .count();
+    assert_eq!(
+        seals,
+        1,
+        "three entries plus the always-land ProcessStart crossed the bound \
+         exactly once:\n{}",
+        captured.text()
+    );
+}
+
+#[test]
+fn a_patch_states_only_what_it_states_and_writes_back_only_that() {
+    let patch = Patch {
+        seal: Some(SealPatch {
+            every_entries: Some(Bound::Count(250)),
+            every_millis: None,
+        }),
+        rotation: Some(RotationPatch::default()),
+        ..Patch::default()
+    };
+    let toml = patch.to_toml();
+    assert!(toml.contains("[seal]\nevery_entries = 250\n"), "{toml}");
+    assert!(
+        !toml.contains("every_millis"),
+        "a bound this layer did not state is not invented: {toml}"
+    );
+    assert!(
+        !toml.contains("[rotation]"),
+        "and an empty table is omitted rather than written back as a statement \
+         the operator never made: {toml}"
+    );
+    assert!(!patch.is_empty(), "it does state one thing");
+    assert!(
+        Patch {
+            rotation: Some(RotationPatch::default()),
+            ..Patch::default()
+        }
+        .is_empty(),
+        "an empty table states nothing, which is what the write endpoint asks"
+    );
+    // The scalars come first: in TOML a bare key after a table header belongs to
+    // that table, so this ordering is what makes the face round-trip.
+    let full = LogConfig::default().to_toml();
+    assert!(
+        full.find("instance").expect("stated") < full.find("[seal]").expect("stated"),
+        "{full}"
+    );
+    assert_eq!(
+        Patch::parse(&full, None)
+            .expect("round-trips")
+            .level
+            .as_deref(),
+        Some("info")
+    );
+}
+
+/// What an installed tracer costs, and what resolution volume does to the
+/// rotation defaults.
+///
+/// `#[ignore]`d for the same reason as the measurement above: a timing threshold
+/// in CI is a flake generator, and the claims worth asserting are asserted where
+/// they cannot be flaky. Run it with
+/// `cargo test --release measure_tracer -- --ignored --nocapture`.
+///
+/// Two numbers it exists to produce, both of which the docs state as fact and
+/// should therefore be re-derivable rather than believed:
+///
+/// 1. **The level dial filters what is WRITTEN, not what is BUILT.** At `error`
+///    a resolution writes nothing, and the cost that remains is the kernel's
+///    `TraceEvent` — which it builds whether or not this side will keep it.
+/// 2. **Resolution volume is a different order from hand-written entries**, so
+///    the number here is what the rotation defaults have to be judged against.
+///
+/// Measured 2026-08-31, release build, M-series laptop, 50,000 computed (never
+/// cached) resolutions, min of three runs:
+///
+/// | arm | ns/resolution |
+/// |---|---|
+/// | no tracer | 566 |
+/// | a tracer that DISCARDS every event | 628 (+62, +11%) |
+/// | `LogTracer` at `error` — writes nothing | 692 (+126, +22%) |
+/// | `LogTracer` at `debug` — one flushed line | 2,177 (+1,611, +285%) |
+///
+/// The second row is the coupling the module docs state: the kernel builds the
+/// event whether or not anybody keeps it, so a low level is **not** free. The
+/// third row is what this crate adds on top of that to decide it does not want
+/// it — one lock and one integer comparison, no allocation.
+///
+/// And the volume: a segment of exactly the default `max_entries` (100,000) is
+/// **13.1 MB** at ~138 B/entry, written in 535 ms and transrepting to 49.3 MB of
+/// Turtle in **596 ms**. Which means the entry bound beats the 24-hour age bound
+/// above **1.16 resolutions per second sustained** — see the README.
+#[test]
+#[ignore = "measurement, not an assertion — see the doc comment"]
+fn measure_tracer_cost_and_the_volume_the_rotation_defaults_face() {
+    const N: u64 = 50_000;
+
+    /// A tracer that throws every event away — the arm that isolates what the
+    /// KERNEL pays from what this crate pays.
+    struct Discard;
+    impl Tracer for Discard {
+        fn record(&self, _event: TraceEvent) {}
+    }
+
+    // Each arm three times, min taken: the cost being measured is ~hundreds of
+    // nanoseconds against a scheduler and a filesystem, so a single run is
+    // noise with a number attached.
+    let run_bare = |tracer: Option<Arc<dyn Tracer>>| -> std::time::Duration {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let kernel = Kernel::new(Arc::new(traced_space())).with_clock(Arc::new(Fixed(1)));
+            if let Some(tracer) = &tracer {
+                kernel.set_tracer(tracer.clone());
+            }
+            let cap = Capability::scoped([CAP_TRACED]);
+            let request = || Request::new(Verb::Source, Iri::parse(GATED_IRI).expect("iri"));
+            futures::executor::block_on(kernel.issue(request(), &cap)).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..N {
+                futures::executor::block_on(kernel.issue(request(), &cap)).unwrap();
+            }
+            best = best.min(start.elapsed());
+        }
+        best
+    };
+    let run = |level: &str, install: bool| -> (std::time::Duration, usize) {
+        let mut best = std::time::Duration::MAX;
+        let mut written = 0;
+        for attempt in 0..3 {
+            let home = Scratch::new(&format!("measure-{level}-{install}-{attempt}"));
+            let (handle, captured) = open_handle(home.path(), None, level);
+            let kernel = Kernel::new(Arc::new(traced_space())).with_clock(Arc::new(Fixed(1)));
+            if install {
+                kernel.set_tracer(tracer_for(handle.clone(), 1));
+            }
+            // ★ `urn:traced:gated` is UNCACHEABLE, so every iteration is a real
+            // COMPUTED resolution rather than a cache hit — otherwise this would
+            // be measuring the cache and calling it the tracer.
+            let request = || Request::new(Verb::Source, Iri::parse(GATED_IRI).expect("iri"));
+            let cap = Capability::scoped([CAP_TRACED]);
+            futures::executor::block_on(kernel.issue(request(), &cap)).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..N {
+                futures::executor::block_on(kernel.issue(request(), &cap)).unwrap();
+            }
+            best = best.min(start.elapsed());
+            written = entries(&captured).len();
+        }
+        (best, written)
+    };
+
+    let per = |d: std::time::Duration| d.as_nanos() as f64 / N as f64;
+    let (none, _) = run("error", false);
+    let discard = run_bare(Some(Arc::new(Discard)));
+    let (at_error, wrote_at_error) = run("error", true);
+    let (at_debug, wrote_at_debug) = run("debug", true);
+    println!("{N} computed resolutions (release, min of 3):");
+    println!(
+        "  no tracer       {none:?}   {:.0} ns/resolution",
+        per(none)
+    );
+    println!(
+        "  tracer, discards  {discard:?}   {:.0} ns/resolution  ← the kernel's \
+         TraceEvent alone: BUILT for every resolution, filtered by nobody",
+        per(discard)
+    );
+    println!(
+        "  tracer @ error  {at_error:?}   {:.0} ns/resolution  ({wrote_at_error} written)",
+        per(at_error)
+    );
+    println!(
+        "  tracer @ debug  {at_debug:?}   {:.0} ns/resolution  ({wrote_at_debug} written)",
+        per(at_debug)
+    );
+    println!(
+        "  ⇒ installing a tracer costs {:.0} ns/resolution at `error`, where it \
+         writes nothing — that is the TraceEvent the kernel builds either way, \
+         plus this side's emits() check",
+        per(at_error) - per(none)
+    );
+    println!(
+        "  ⇒ and {:.0} ns/resolution at `debug`, where it writes one flushed line",
+        per(at_debug) - per(none)
+    );
+
+    // Volume, against T4's rotation defaults — measured on a real file, because
+    // the bytes per entry are what the entry bound is really a bound on.
+    let home = Scratch::new("measure-volume");
+    let handle = chained_handle(home.path(), "bug:volume", "debug", 1_700_000_000_000);
+    let (segment, _) = handle.open_segment().expect("open");
+    let tracer = tracer_for(handle.clone(), 1_700_000_000_000);
+    let event = |span: u64| TraceEvent {
+        target: "urn:calendar:today".to_string(),
+        thread: "ikigai-sched-2".to_string(),
+        started: Some(Time::from_millis(1_700_000_000_000 + span)),
+        ended: Some(Time::from_millis(1_700_000_000_012 + span)),
+        cache_hit: false,
+        span,
+        parent: Some(0),
+        capability: Some(vec!["urn:cap:fs:read".to_string()]),
+        notes: Vec::new(),
+    };
+    let default_max = RotationPolicy::default().max_entries.expect("bounded");
+    let start = std::time::Instant::now();
+    for span in 0..default_max {
+        tracer.record(event(span));
+    }
+    let elapsed = start.elapsed();
+    let path = path_of(home.path(), &segment);
+    let bytes = std::fs::metadata(&path).unwrap().len();
+    println!(
+        "\na segment of exactly the default max_entries ({default_max}): {elapsed:?} to write, \
+         {:.1} MB ({:.0} B/entry)",
+        bytes as f64 / 1_048_576.0,
+        bytes as f64 / default_max as f64
+    );
+    println!(
+        "  write throughput ≈ {:.0} entries/s, flushed per entry",
+        default_max as f64 / elapsed.as_secs_f64()
+    );
+    let day = RotationPolicy::default().max_age_millis.expect("bounded") / 1_000;
+    println!(
+        "  ⇒ the entry bound beats the {day}s age bound above {:.2} resolutions/s sustained",
+        default_max as f64 / day as f64
+    );
+
+    // And what reading one of those costs, since a segment is the unit a query
+    // names: rotation is a READ-side dial as much as a write-side one.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let start = std::time::Instant::now();
+    let turtle = to_turtle(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    println!(
+        "  transrepting it: {:?} → {:.1} MB of Turtle",
+        start.elapsed(),
+        turtle.len() as f64 / 1_048_576.0
+    );
 }

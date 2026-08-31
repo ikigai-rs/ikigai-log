@@ -64,6 +64,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -583,11 +584,9 @@ impl Writer {
             fields,
         }
         .render(&self.header.prefixes)?;
-        self.sink
-            .write_line(&line)
-            .map_err(|e| io_error(&self.path, e))?;
+        guarded(|| self.sink.write_line(&line)).map_err(|e| io_error(&self.path, e))?;
         // Per entry, deliberately. See the module docs.
-        self.sink.flush().map_err(|e| io_error(&self.path, e))?;
+        guarded(|| self.sink.flush()).map_err(|e| io_error(&self.path, e))?;
         self.seq = seq;
         // The chain folds in the line as WRITTEN — the same bytes a verifier
         // will read back — so the two agree by construction rather than by two
@@ -620,10 +619,8 @@ impl Writer {
             self.chain.head(),
             self.signer.as_deref(),
         );
-        self.sink
-            .write_line(&seal.render())
-            .map_err(|e| io_error(&self.path, e))?;
-        self.sink.flush().map_err(|e| io_error(&self.path, e))?;
+        guarded(|| self.sink.write_line(&seal.render())).map_err(|e| io_error(&self.path, e))?;
+        guarded(|| self.sink.flush()).map_err(|e| io_error(&self.path, e))?;
         self.sealed_through = self.seq;
         self.sealed_head = self.chain.head().to_string();
         self.last_seal_at = now;
@@ -737,7 +734,7 @@ impl Writer {
     fn end_with(mut self, marker: Entry, now: Timestamp) -> Result<Closed, WriteError> {
         self.write(marker)?;
         self.seal(now)?;
-        self.sink.flush().map_err(|e| io_error(&self.path, e))?;
+        guarded(|| self.sink.flush()).map_err(|e| io_error(&self.path, e))?;
         Ok(Closed {
             segment: self.header.name,
             head: self.sealed_head,
@@ -747,6 +744,30 @@ impl Writer {
             #[cfg(not(target_family = "wasm"))]
             lock: self._lock,
         })
+    }
+}
+
+/// Call into the sink without letting it take the log with it.
+///
+/// ★ [`LineSink`] is a **host** seam — a browser's `console.log`, a bridge into
+/// somebody else's logging framework — and the writer lives behind
+/// [`crate::LogHandle`]'s state `Mutex`. A panic that unwound from a sink would
+/// therefore poison that mutex, and every subsequent write, close, rotation and
+/// config read in the process would panic on the poison: the log would be dead
+/// for the rest of the run, and — because the marker that records a loss is
+/// itself a write — dead with **no marker**. That is the worst available outcome
+/// for the one subsystem whose job is to notice things, so a panicking sink is
+/// turned into an ordinary write error, which every caller here already knows
+/// how to report.
+///
+/// Nothing is left half-done by the conversion: the sink is called before the
+/// sequence advances and before the chain folds the line in, so a sink that
+/// fails — by returning `Err` or by unwinding — leaves the writer exactly as it
+/// was.
+fn guarded<T>(call: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    match catch_unwind(AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other("the sink panicked")),
     }
 }
 
