@@ -1,33 +1,12 @@
-# CI for ikigai-log. The crate is pure — a line grammar and a vocabulary parser,
-# no I/O — so the default build is the whole build, and it must stay wasm-clean:
-# the browser destination writes the same lines through `console.log`, and the
-# transreptor runs wherever the kernel does.
 name: ci
-
 on:
+  push: { branches: [main] }
   pull_request:
-  push:
-    branches: [main]
-
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-
-      - name: fmt
-        run: cargo fmt --all -- --check
-
-      - name: clippy (native, all targets)
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: test
-        run: cargo test
-
-      - name: clippy (wasm lib)
-        run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    with:
+      wasm-lib: true
