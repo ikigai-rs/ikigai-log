@@ -116,7 +116,7 @@
 //! * **Nothing propagates.** A failed write does not fail the resolution.
 //! * **Nothing panics.** `record()` runs inside somebody else's resolution, and
 //!   a panic there would take down a request that had nothing to do with
-//!   logging. The body runs under [`catch_unwind`](std::panic::catch_unwind),
+//!   logging. The body runs under [`std::panic::catch_unwind`],
 //!   which also covers the seams this crate does not own: a host's
 //!   [`ClosureSink`](crate::ClosureSink), or a `Mutex` poisoned by an unrelated
 //!   thread.
