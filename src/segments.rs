@@ -4,7 +4,7 @@
 //! ## `urn:log:{segment}` is a PREFIX binding, and that has a consequence
 //!
 //! The tail names a segment and `as=` selects the face, so the grammar is a
-//! [`UriTemplate`] rather than an [`Exact`]. A template matches **everything**
+//! [`ikigai_core::UriTemplate`] rather than an [`ikigai_core::Exact`]. A template matches **everything**
 //! under `urn:log:`, `urn:log:write` included — so the exact bindings must be
 //! registered FIRST and the template LAST. [`crate::endpoints::space`] does
 //! that. `urn:log:verify` is the case that proves it: bound below the template
