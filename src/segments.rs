@@ -371,12 +371,14 @@ impl Endpoint for SegmentEndpoint {
                 ActionSpec::new(Verb::Exists)
                     .summary("whether a segment with this IRI is here")
                     .requires(CAP_READ)
+                    .input(segment_binding())
                     .output(TEXT_PLAIN),
             )
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("the segment, as a graph or as itself")
                     .requires(CAP_READ)
+                    .input(segment_binding())
                     .input(
                         ArgSpec::new("as")
                             .summary("the face: the graph by default, or the segment file")
@@ -415,6 +417,22 @@ impl Endpoint for SegmentEndpoint {
                     .output(LOG_MEDIA_TYPE),
             )
     }
+}
+
+/// The `{segment}` variable of [`SEGMENT_TEMPLATE`], as the binding input every
+/// action declares. Declared on the action rather than assumed from the grammar
+/// because the manifold forms a target IRI from the CONTRACT: an action whose
+/// template variable is not an input cannot be driven from `urn:kernel:actions`
+/// at all, however well the endpoint itself reads `inv.bindings`.
+#[cfg(not(target_family = "wasm"))]
+fn segment_binding() -> ArgSpec {
+    ArgSpec::new(SEGMENT_BINDING)
+        .summary(
+            "the segment's name, the tail of its IRI: `{instance}:{stamp}`, as \
+             `urn:log:segments` lists it",
+        )
+        .class(XSD_STRING)
+        .binding()
 }
 
 #[cfg(not(target_family = "wasm"))]

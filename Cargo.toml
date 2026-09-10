@@ -82,3 +82,9 @@ futures = "0.3" # block_on, for the endpoint tests
 # hand-rolled stand-in would prove nothing. Dev-only: a host mounts whichever
 # SPARQL space it wants, and this crate depends on none of them at runtime.
 ikigai-sparql = "0.1.6"
+
+# The module recipe as one test (`tests/conformance.rs`): every endpoint this
+# crate binds, every action each declares, every checkable rule at once. 0.1.0 is
+# the first release; it pulls ikigai-core 0.1.67 (`Kernel::entries` listing the
+# kernel's own operations), which the caret above admits.
+ikigai-conformance = "0.1.0"

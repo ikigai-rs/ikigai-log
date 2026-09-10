@@ -85,7 +85,9 @@ urn:log:bug:serve:2026-08-23T09-00-00Z:41
 The `fields` argument is a line's own **tail syntax**, scanned by the same code
 that reads it back out of the file — one grammar, not two, so quoting, escaping
 and repeated keys (`cap=` twice, for a resolution under two capability scopes)
-behave identically in both directions.
+behave identically in both directions. Prose goes in `msg=`, or arrives as the
+piped `content` (`… | urn:log:write`) — both declared, so the door a pipeline
+uses is one the manifold shows.
 
 ## Queryable across segments — and the segment IS the named graph
 
@@ -452,6 +454,37 @@ breaks, rotations, retention tombstones, dropped entries, process start/stop,
 capability denials, key changes — which is what `log:always` (rank −1) declares.
 The same argument is why there is no sampling: sampling is holes everywhere with
 nothing to bracket them.
+
+## Conformance
+
+The module **passes
+[`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)** with
+no opt-outs: `tests/conformance.rs` builds the space over a scratch log directory
+holding one segment and walks it twice — once with the segment **live** (the
+handle open, the tail still being appended to) and once **finished** (closed,
+ending in `log:ProcessStop` and a final `#seal`) — so both cache paths are
+exercised: a live segment is served uncacheable, a finished one is cached under
+its file's golden thread, and both name `urn:file:<path>` as the thread a watcher
+must cut. `urn:log:transrept` is declared `pure` and `cacheable` (Turtle from
+bytes, no file, no clock); `urn:log:config`, `urn:log:segments` and
+`urn:log:verify` are live by design and say so in their descriptions.
+
+Two namespaces are registered as the module's own beside the well-known ones:
+`log:` (`https://ikigai-rs.dev/ns/log#`), defined in
+[`src/vocabulary.ttl`](src/vocabulary.ttl) — and since registering a namespace
+waives the vocabulary check for everything under it, the test parses both Turtle
+faces and requires every `log:` term they emit to be a subject of that file — and
+`sig:` (`https://ikigai-rs.dev/ns/sign#`), `ikigai-sign`'s, defined in that
+crate's README and held to the three terms a seal carries.
+
+One check is skipped, suite-wide: **NAMES**. The six ids (`logWrite`, `logConfig`,
+`logSegments`, `logVerify`, `logSegment`, `logTransrept`) are camelCase, and they
+are live MCP tool names — renamed in one coordinated pass across every module,
+not six ids out of step. What the suite cannot see is pinned by hand in the same
+file: declared outputs against served media types in both directions with `as`
+omitted, the finished segment's Source cached and its Exists live (the suite's
+`cacheable` is per endpoint, and holds both), and that the walk's one write is the
+pipeline probe's — a refused write under no grants lands nowhere.
 
 ## Status
 
