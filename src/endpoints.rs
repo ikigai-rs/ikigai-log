@@ -741,6 +741,20 @@ pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
                             .class(XSD_STRING)
                             .optional(),
                     )
+                    // Declared, not merely read: a pipeline's upstream value and a
+                    // top-level `sink`'s body both arrive as `content`, and a Sink
+                    // that reads it without saying so has a door its contract does
+                    // not show — an agent forming a call from the manifold would
+                    // never find it.
+                    .input(
+                        ArgSpec::new("content")
+                            .summary(
+                                "the piped value — the same column as msg, for `… | \
+                                 urn:log:write`; msg wins when both are given",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
                     .input(
                         ArgSpec::new("fields")
                             .summary(
