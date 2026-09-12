@@ -84,7 +84,12 @@ futures = "0.3" # block_on, for the endpoint tests
 ikigai-sparql = "0.1.6"
 
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
-# crate binds, every action each declares, every checkable rule at once. 0.1.0 is
-# the first release; it pulls ikigai-core 0.1.67 (`Kernel::entries` listing the
-# kernel's own operations), which the caret above admits.
-ikigai-conformance = "0.1.0"
+# crate binds, every action each declares, every checkable rule at once. 0.2.0
+# adds DECLARATIONS (a declaration whose target the walk never reached is
+# reported, rather than silently doing nothing) and carries OUTPUTS from 0.1.1,
+# which the 0.1.0 pin never ran. The floor is 0.2.0, not `0.1`, because this
+# crate's suite is now written to be clean under DECLARATIONS and a resolve that
+# fell back to 0.1.x would be checking less than the file claims. It pulls
+# ikigai-core 0.1.67 (`Kernel::entries` listing the kernel's own operations),
+# which the caret above admits.
+ikigai-conformance = "0.2.0"

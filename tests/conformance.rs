@@ -18,6 +18,19 @@
 //!   cannot append to it (the Sink answers `closed:`), and the file is
 //!   byte-identical afterwards.
 //!
+//! ★ **Both lives are SEALED, and that is a fixture decision with a reason.** The
+//! fixture opens its segment under a seal cadence of one entry
+//! ([`SEAL_EVERY_ENTRY`]), so the `log:ProcessStart` that `open` writes is
+//! checkpointed immediately and the segment carries a `#seal` from its first line
+//! onward. A finished segment seals at close whatever the cadence is; a LIVE one
+//! under the default cadence (1,000 entries or 60s, and the kernel's clock here
+//! does not move) would never reach one, and then the whole `sig:` half of the
+//! segment face — `sig:contentHash`, `sig:algorithm`, `sig:value` — is
+//! unexercised. Conformance 0.2.0's DECLARATIONS check is what found that:
+//! `Suite::namespace(SIG_NS)` accounted for no term in the live walk, because no
+//! probed face had one. A live segment that has checkpointed is also the ordinary
+//! production shape — a long-running log seals and keeps going — so this makes
+//! the fixture more representative, not less.
 //! `urn:log:transrept` is the one pure function here — Turtle from bytes, no
 //! file, no clock — so it is declared `pure` and `cacheable`. Everything else
 //! that reads is live by design (`urn:log:config` carries process state no
@@ -45,6 +58,18 @@
 //!   [`ikigai_log::VOCABULARY_TTL`]. `sig:` is `ikigai-sign`'s namespace,
 //!   defined in that crate's prose; the three terms a seal carries are held to
 //!   that list.
+//!
+//!   ★ **What a seal's terms would do WITHOUT that registration**: nothing
+//!   resolves them. `sig:` is not in `ikigai-vocab` and `ikigai-sign` publishes
+//!   no machine-readable vocabulary for it — the three terms are defined in that
+//!   crate's README prose — so VOCABULARY would report `sig:contentHash`,
+//!   `sig:algorithm` and `sig:value` as undefined the moment any walk reached a
+//!   sealed segment. `Suite::namespace(SIG_NS)` is therefore a real waiver
+//!   standing in for a vocabulary that does not exist yet, and the by-hand list
+//!   [`SIG_TERMS`] is this crate's local substitute for it. Whether `sig:` should
+//!   become a published vocabulary (in `ikigai-vocab`, or served from
+//!   `ikigai-sign`) is `ikigai-sign`'s question, recorded in
+//!   `ikigai-sign-PENDING.md` §1 and not settled here.
 //! - **The Sink is fired exactly once under root, and a refused write lands
 //!   nowhere** (in [`conforms`]): the kernel refuses `ENFORCED`'s no-grants call
 //!   before dispatch and this kernel has no tracer, so the only entry the walk
@@ -65,8 +90,8 @@ use std::sync::Arc;
 use ikigai_conformance::{rdf, Check, Checks, Fixture, Report, Suite};
 use ikigai_core::{ArgRef, Capability, Clock, Iri, Kernel, Representation, Request, Time, Verb};
 use ikigai_log::{
-    Destination, LogConfig, LogHandle, Timestamp, Vocabulary, CAP_READ, CONFIG_IRI, LOG_NS,
-    SEGMENTS_IRI, SIG_NS, TRANSREPT_IRI, VERIFY_IRI, VOCABULARY_TTL, WRITE_IRI,
+    Destination, LogConfig, LogHandle, SealPolicy, Timestamp, Vocabulary, CAP_READ, CONFIG_IRI,
+    LOG_NS, SEGMENTS_IRI, SIG_NS, TRANSREPT_IRI, VERIFY_IRI, VOCABULARY_TTL, WRITE_IRI,
 };
 
 /// The six endpoints `space()` binds, by description id — pinned against the
@@ -89,6 +114,21 @@ const T0: u64 = 1_700_000_000_000;
 /// crate's README and nowhere machine-readable, so this is the list the face is
 /// held to.
 const SIG_TERMS: [&str; 3] = ["contentHash", "algorithm", "value"];
+
+/// Checkpoint on every entry, and never on time.
+///
+/// The time bound is disabled because the kernel's clock here is [`Fixed`] and a
+/// time-based seal could never come due; the entry bound is 1 so the
+/// `log:ProcessStart` that `Writer::open_with` writes is sealed before the walk
+/// starts, and every face the walk probes over the segment carries the seal's
+/// three `sig:` terms. Without this the LIVE segment reaches no seal at all and
+/// DECLARATIONS reports `Suite::namespace(SIG_NS)` as scope nobody needs — which
+/// is how this was found. The module docs say why the fixture, not the
+/// registration, is the thing that was wrong.
+const SEAL_EVERY_ENTRY: SealPolicy = SealPolicy {
+    every_entries: 1,
+    every_millis: u64::MAX,
+};
 
 /// A scratch directory that removes itself.
 struct Scratch(PathBuf);
@@ -137,6 +177,10 @@ struct Log {
 impl Log {
     /// Open a segment under `INSTANCE`; `finished` closes it again so it ends in
     /// `log:ProcessStop` and a final seal.
+    ///
+    /// Either way the segment is sealed before the walk sees it
+    /// ([`SEAL_EVERY_ENTRY`]), which is what puts `sig:` terms in the faces the
+    /// walk probes.
     fn new(finished: bool) -> Log {
         let scratch = Scratch::new(if finished { "finished" } else { "live" });
         let dir = scratch.0.clone();
@@ -145,7 +189,8 @@ impl Log {
             .with_level("info")
             .expect("a real level")
             .with_destination(Destination::File)
-            .with_directory(dir.clone());
+            .with_directory(dir.clone())
+            .with_seals(SEAL_EVERY_ENTRY);
         let handle = Arc::new(LogHandle::new(Some(dir.clone()), None, config));
         let opened = handle
             .open(Vocabulary::shared_builtin(), Timestamp::from_millis(T0))
@@ -158,6 +203,17 @@ impl Log {
                 .expect("the segment closes");
         }
         let path = segment_file(&dir);
+        // The fixture's whole point, stated where it is cheap to see fail: an
+        // unsealed segment emits no `sig:` term, and then `Suite::namespace`
+        // registers scope nothing uses. DECLARATIONS catches that too, but from
+        // the far end of a walk.
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("the segment file reads")
+                .contains("\n#seal "),
+            "the fixture segment is checkpointed before the walk: {}",
+            path.display()
+        );
         let kernel = Kernel::new(Arc::new(ikigai_log::endpoints::space(handle)))
             .with_clock(Arc::new(Fixed(T0 + 2_000)));
         Log {
