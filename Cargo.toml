@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-log"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
@@ -25,7 +25,10 @@ rust-version = "1.89"
 # reads) is 0.1.56, and everything else this crate touches (`Tracer`,
 # `TraceEvent`, `Kernel::set_tracer`, ActionSpec, ArgSpec
 # `class`/`one_of`/`default_value`, `Error::Denied`, `Invocation::now`) is older
-# still.
+# still — including `Kernel::issue_traced` and `TraceScope`, the per-call tracer
+# seam the per-tenant `LogTracer` exists to be handed to, which landed in 0.1.48.
+# This crate never CALLS it (a host does), but rustdoc resolves the link, so it
+# belongs in this accounting.
 ikigai-core = "0.1.62"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —

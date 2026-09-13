@@ -135,13 +135,21 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
+        // ⚠ The counter is not belt-and-braces over the nanoseconds: two tests
+        // starting together really do read the same `SystemTime` (the clock's
+        // resolution is coarser than its unit), and then two fixtures share one
+        // directory, the second is disambiguated because the first holds the
+        // instance lock, and `segment_file` finds two segments where it demands
+        // one. Seen 2026-09-13, in a suite that had passed for days.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ikigai-log-conformance-{}-{}-{tag}",
+            "ikigai-log-conformance-{}-{}-{}-{tag}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("the clock is after the epoch")
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         Scratch(dir)

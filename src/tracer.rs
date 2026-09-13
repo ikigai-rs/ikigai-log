@@ -22,6 +22,11 @@
 //! | `notes` | `key=value` columns, through the vocabulary's term table |
 //! | `notes[DENIED_NOTE]` | **the CLASS**: `log:CapabilityDenied`, plus `denied=` |
 //!
+//! One column is **not** in that table because no `TraceEvent` carries it:
+//! `principal=`, the tenant a per-tenant tracer was built for. The kernel does
+//! not know who a host is serving and this crate does not ask it — see
+//! [`Principal`].
+//!
 //! `cache_hit` selects a CLASS and never a boolean column, because a class is
 //! what the level dial can exclude: `log:CacheHit` is `rdfs:subClassOf
 //! log:Resolution` at `log:minLevel log:trace`, one notch above the resolutions
@@ -125,6 +130,42 @@
 //!   this. The reason is one of four fixed tokens rather than composed prose;
 //!   see [`DROP_REASONS`].
 //!
+//! ## ★ Per-tenant: attribution, and the one lock everything goes through
+//!
+//! A daemon logging its own work installs one tracer with `set_tracer` and the
+//! instance in the segment header is the whole attribution story. A server
+//! handling several principals at once needs a second axis — **who the work was
+//! done for**, distinct from **which process did it** — and the kernel already
+//! provides the seam: [`Kernel::issue_traced`](ikigai_core::Kernel::issue_traced)
+//! takes a tracer per call and gives it its own span-id space, threaded across
+//! `fan_out`. What this module adds is the other two halves.
+//!
+//! **Attribution** is [`Principal`] and the `principal=` column it writes,
+//! which transrepts to `log:onBehalfOf` plus a skolemized `prov:Delegation`.
+//! The host names the principal; this crate records it and authenticates
+//! nothing.
+//!
+//! **Write concurrency** was already safe and it is worth saying exactly why,
+//! because the reason is not "the writer is careful". [`LogHandle`] holds its
+//! [`Writer`](crate::Writer) behind one `Mutex` and holds that lock across the
+//! whole of an append — sequence number, render, `write_line`, `flush`, chain
+//! advance, and any seal the entry triggers. [`Writer`](crate::Writer) is not `Sync` and is
+//! reachable no other way, so **an unserialized variant of this crate does not
+//! compile**; N tracers through one handle cannot interleave a line, skip a
+//! sequence number or fold the chain out of order. Rotation takes the same lock
+//! for its whole duration, so no entry can land mid-rotation either — the
+//! `log:ChainBroken` that nobody caused is not reachable from this direction.
+//!
+//! The one thing that WAS racy is now closed: [`LogHandle::write`] releases the
+//! lock before rotating (it must — `rotate` takes it), so two threads could both
+//! observe the same segment as due and rotate it twice, the second rolling a
+//! successor one entry old. The decision is now made under the lock and behind a
+//! rotation-in-progress flag. The remaining, deliberate looseness is that a
+//! writer entering that window appends to the segment that is about to roll, so
+//! a segment can exceed its entry bound by the number of threads that were in
+//! flight. Bounded, recorded, and cheaper than holding a lock across a
+//! filesystem operation.
+//!
 //! ## Which processes install it
 //!
 //! The module ships the knob; the **host** decides the policy — the same answer
@@ -155,7 +196,7 @@ use ikigai_core::{Clock, TraceEvent, Tracer, DENIED_NOTE};
 use crate::endpoints::LogHandle;
 use crate::line::{Entry, Timestamp};
 use crate::vocabulary::{
-    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DROPPED_CLASS, RESOLUTION_CLASS,
+    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DROPPED_CLASS, PRINCIPAL_KEY, RESOLUTION_CLASS,
 };
 
 /// The `reason=` token on each `log:Dropped` entry, one per way this tracer can
@@ -187,6 +228,185 @@ thread_local! {
     static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// =====================================================================================
+// The principal: attribution that is not the process
+// =====================================================================================
+
+/// The longest principal IRI this crate will write.
+///
+/// A bound rather than a truncation: a principal is caller-supplied in the
+/// general case, it lands on **every** entry of a connection, and a log line is
+/// the one artifact in this crate that must stay one line and stay greppable.
+/// 512 bytes is far past every IRI shape the ecosystem uses (a `urn:*` name, a
+/// certificate fingerprint, a DID) and far short of a line that no longer reads
+/// as a line, and the refusal names the length so an operator can see what was
+/// asked for.
+pub const MAX_PRINCIPAL_LEN: usize = 512;
+
+/// The subject of the probe line [`Principal::new`] renders and parses back.
+/// Its own IRI, so a principal that swallowed the subject column is caught by
+/// the column coming back as something else.
+const PROBE_SUBJECT: &str = "urn:ikigai:log:principal-probe";
+
+/// Why an IRI cannot be a [`Principal`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrincipalError {
+    /// Longer than [`MAX_PRINCIPAL_LEN`].
+    TooLong {
+        /// How long it was.
+        length: usize,
+    },
+    /// It does not survive a round trip through the line grammar as a **bare**
+    /// column: it is not an absolute IRI, or it holds something the scanner
+    /// treats as structure, so writing it would need quoting and a quoted
+    /// principal is one `grep` cannot find.
+    NotAColumn {
+        /// What was offered.
+        offered: String,
+        /// What went wrong, in one clause.
+        detail: String,
+    },
+    /// It is not an IRI RDF will accept, so the graph face would degrade it to
+    /// a literal and the delegation could not be stated at all.
+    NotAnRdfIri {
+        /// What was offered.
+        offered: String,
+    },
+}
+
+impl std::fmt::Display for PrincipalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrincipalError::TooLong { length } => write!(
+                f,
+                "a principal may be at most {MAX_PRINCIPAL_LEN} bytes and this one is {length}"
+            ),
+            PrincipalError::NotAColumn { offered, detail } => {
+                write!(f, "{offered} cannot be written as a principal: {detail}")
+            }
+            PrincipalError::NotAnRdfIri { offered } => {
+                write!(f, "{offered} is not an IRI RDF will accept")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PrincipalError {}
+
+/// Who a [`LogTracer`]'s entries were written **for** — the tenant, the
+/// connection's identity, the agent a host is serving. Distinct from the
+/// instance, which is the process that did the work; both facts are real and
+/// neither replaces the other.
+///
+/// ## ★ This crate records a principal; it does not authenticate one
+///
+/// Where the IRI comes from is the **host's** question and deliberately not
+/// answered here. A wire server has a certificate fingerprint, a passkey host
+/// has a credential id, a peer has a peer name — inventing a fourth identity
+/// model inside a logging module would put the least-informed component in
+/// charge of the most consequential answer. So the host names the principal and
+/// this crate writes down exactly what it was told, which is the only claim the
+/// log can honestly make about it.
+///
+/// ## ★★ And it is caller-supplied data reaching a greppable format
+///
+/// So the constructor **parses the output rather than filtering the input**: it
+/// renders a probe line carrying this value and parses that line back, and
+/// accepts the principal only if every column comes back unchanged and the
+/// value was written BARE. A principal that would have to be quoted (a space, a
+/// tab, a newline, a `"`) is refused rather than escaped — escaping would be
+/// lossless and still wrong, because `grep 'principal=urn:agent:x'` is half the
+/// reason the format is what it is, and a quoted column is invisible to it.
+///
+/// The refusal happens **once, when a connection's tracer is built** — not per
+/// entry — so a host learns immediately, by `Result`, rather than discovering a
+/// silently unattributed log later.
+///
+/// ```
+/// use ikigai_log::Principal;
+///
+/// assert!(Principal::new("urn:agent:calendar").is_ok());
+/// assert!(Principal::new("urn:agent:two words").is_err()); // would be quoted
+/// assert!(Principal::new("no-scheme").is_err()); // not an absolute IRI
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Principal(String);
+
+impl Principal {
+    /// The principal named by `iri`, or why it cannot be one.
+    pub fn new(iri: impl Into<String>) -> Result<Principal, PrincipalError> {
+        let iri = iri.into();
+        if iri.len() > MAX_PRINCIPAL_LEN {
+            return Err(PrincipalError::TooLong { length: iri.len() });
+        }
+        let refuse = |detail: &str| {
+            Err(PrincipalError::NotAColumn {
+                offered: iri.clone(),
+                detail: detail.to_string(),
+            })
+        };
+        // ★ PARSE THE OUTPUT. Everything below is a statement about a rendered
+        // line, not about the characters that went in: the rules for what a
+        // column may hold live in `line`, and a second copy of them here would
+        // be a second copy to keep in step.
+        let prefixes = std::collections::BTreeMap::new();
+        let probe = Entry::new(Timestamp::from_millis(0), RESOLUTION_CLASS, PROBE_SUBJECT)
+            .with(PRINCIPAL_KEY, iri.clone());
+        let line = match probe.render(&prefixes) {
+            Ok(line) => line,
+            Err(e) => return refuse(&e.to_string()),
+        };
+        // Bare, not quoted. The one property `render` would happily give up:
+        // it escapes rather than refuses, which is right for a message and
+        // wrong for an identity that has to be found by `grep`.
+        if !line.ends_with(&format!(" {PRINCIPAL_KEY}={iri}")) {
+            return refuse(
+                "it would have to be quoted, and a quoted principal is one `grep` cannot find",
+            );
+        }
+        let back = match Entry::parse(&line, &prefixes) {
+            Ok(entry) => entry,
+            Err(e) => return refuse(&e.to_string()),
+        };
+        if back.subject != PROBE_SUBJECT || back.class != RESOLUTION_CLASS {
+            return refuse("it displaces another column");
+        }
+        if back.get(PRINCIPAL_KEY) != Some(iri.as_str()) || back.fields.len() != 1 {
+            return refuse("it does not read back as the value that went in");
+        }
+        // And an IRI the graph face can state a delegation with. `value_term`
+        // degrades an unusable IRI to a literal rather than dropping it, which
+        // is the right posture for a segment already on disk and the wrong one
+        // for a value this crate is about to write on purpose.
+        if oxrdf::NamedNode::new(&iri).is_err() {
+            return Err(PrincipalError::NotAnRdfIri { offered: iri });
+        }
+        Ok(Principal(iri))
+    }
+
+    /// The IRI, as it is written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Principal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The per-reason loss counters, shared by every tracer derived from one base.
+///
+/// ★ Shared rather than per-tracer because a per-connection tracer is
+/// **short-lived** and the thing it counts is a loss: a tenant tracer that
+/// counted its own drops and was then dropped with the connection would carry
+/// the only record that something was lost out of the process with it. One
+/// ledger per handle means the next entry that lands — from any tracer — marks
+/// the loss.
+#[derive(Default)]
+struct Drops([AtomicU64; DROP_REASONS.len()]);
+
 /// Writes the kernel's [`TraceEvent`]s into this process's log segment.
 ///
 /// Install with [`Kernel::set_tracer`](ikigai_core::Kernel::set_tracer). Holds
@@ -194,14 +414,50 @@ thread_local! {
 /// segment per process however many things write to it, and the same [`Clock`]
 /// the kernel holds, so a denial — which the kernel stamps with nothing, having
 /// run nothing — is stamped on the same timeline as its neighbours.
+///
+/// ## ★ One handle, N tracers: the per-tenant shape
+///
+/// [`on_behalf_of`](Self::on_behalf_of) derives a tracer that attributes its
+/// entries to a [`Principal`] and shares this one's handle, clock and drop
+/// ledger. That is what a serving host hands to
+/// [`Kernel::issue_traced`](ikigai_core::Kernel::issue_traced) per connection —
+/// and `issue_traced` is the whole reason the derived tracer is worth having,
+/// because a per-call tracer is the only form the kernel isolates: the global
+/// slot holds exactly one collector, so N tenants through `set_tracer` is N
+/// tenants' events landing in whichever was installed last.
+///
+/// Derivation is cheap — three `Arc` clones and a `String` — so per connection
+/// is the intended granularity, not a cost to design around.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use ikigai_core::{Capability, Kernel, Request, SystemClock};
+/// # use ikigai_log::{LogHandle, LogTracer, Principal};
+/// # async fn serve(kernel: &Kernel, handle: Arc<LogHandle>, request: Request,
+/// #                capability: &Capability, peer: &str)
+/// #     -> Result<(), Box<dyn std::error::Error>> {
+/// let base = LogTracer::new(handle, Arc::new(SystemClock));
+/// // Per connection, once — the refusal for an unwritable principal lands
+/// // here rather than silently per entry.
+/// let tenant = Arc::new(base.on_behalf_of(Principal::new(peer)?));
+/// kernel.issue_traced(request, capability, tenant).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct LogTracer {
     handle: Arc<LogHandle>,
     clock: Arc<dyn Clock>,
-    drops: [AtomicU64; DROP_REASONS.len()],
+    drops: Arc<Drops>,
+    /// Who this tracer's entries were written for. `None` on the process's own
+    /// tracer: an entry with no `principal=` is the host's own work, which is a
+    /// different fact from work done for an unknown principal and is kept
+    /// distinct by writing no column rather than an empty one.
+    principal: Option<Principal>,
 }
 
 impl LogTracer {
-    /// A tracer writing into `handle`, stamping from `clock`.
+    /// A tracer writing into `handle`, stamping from `clock`, attributing to
+    /// the process alone.
     ///
     /// `clock` must be the kernel's own. The kernel already stamps `started` on
     /// everything it ran; this is consulted only where the kernel had nothing to
@@ -210,8 +466,36 @@ impl LogTracer {
         LogTracer {
             handle,
             clock,
-            drops: Default::default(),
+            drops: Arc::new(Drops::default()),
+            principal: None,
         }
+    }
+
+    /// A tracer that writes the same segment as this one and attributes every
+    /// entry it records to `principal`.
+    ///
+    /// Hand it to [`Kernel::issue_traced`](ikigai_core::Kernel::issue_traced),
+    /// never to `set_tracer`: the global slot is single-tenant by construction
+    /// and installing a second tracer there replaces the first.
+    ///
+    /// The handle, the clock and the drop ledger are shared. **The drop ledger
+    /// especially**: it is per HANDLE rather than per tracer, so a loss counted
+    /// by a connection that has since gone away is still marked by the next
+    /// entry that lands, from whichever tracer lands it. A per-connection ledger
+    /// would carry the only record that something was lost out of the process
+    /// with the connection.
+    pub fn on_behalf_of(&self, principal: Principal) -> LogTracer {
+        LogTracer {
+            handle: Arc::clone(&self.handle),
+            clock: Arc::clone(&self.clock),
+            drops: Arc::clone(&self.drops),
+            principal: Some(principal),
+        }
+    }
+
+    /// Who this tracer attributes its entries to, if anyone.
+    pub fn principal(&self) -> Option<&Principal> {
+        self.principal.as_ref()
     }
 
     /// The handle this tracer writes through.
@@ -226,8 +510,10 @@ impl LogTracer {
     /// is written on the next successful pass — or permanently, if the log
     /// stopped being writable at all. A host that wants the number without
     /// waiting reads it here.
+    /// Shared with every tracer derived from the same base, so the number a
+    /// host reads is the process's loss and not one connection's.
     pub fn pending_drops(&self) -> [u64; DROP_REASONS.len()] {
-        std::array::from_fn(|i| self.drops[i].load(Ordering::Relaxed))
+        std::array::from_fn(|i| self.drops.0[i].load(Ordering::Relaxed))
     }
 
     /// Land the pending `log:Dropped` markers now, without waiting for the next
@@ -236,6 +522,11 @@ impl LogTracer {
     /// process.
     ///
     /// Returns how many markers were written.
+    ///
+    /// A marker carries **no `principal=`**, whichever tracer flushes it: the
+    /// ledger is shared across a handle, so attributing the count to whichever
+    /// tenant's entry happened to land next would be a fact this crate does not
+    /// have. A drop is the process's.
     pub fn flush_drops(&self, now: Timestamp) -> usize {
         let Some((segment, _)) = self.handle.open_segment() else {
             // Nothing is open, so nothing can be marked. The counts stay,
@@ -245,7 +536,7 @@ impl LogTracer {
         };
         let mut written = 0;
         for (index, reason) in DROP_REASONS.iter().enumerate() {
-            let count = self.drops[index].swap(0, Ordering::Relaxed);
+            let count = self.drops.0[index].swap(0, Ordering::Relaxed);
             if count == 0 {
                 continue;
             }
@@ -258,7 +549,7 @@ impl LogTracer {
                 // than losing the fact that something was lost — a drop with no
                 // marker is the one thing this design forbids outright.
                 Err(_) => {
-                    self.drops[index].fetch_add(count, Ordering::Relaxed);
+                    self.drops.0[index].fetch_add(count, Ordering::Relaxed);
                 }
             }
         }
@@ -266,11 +557,12 @@ impl LogTracer {
     }
 
     fn drop_one(&self, index: usize) {
-        self.drops[index].fetch_add(1, Ordering::Relaxed);
+        self.drops.0[index].fetch_add(1, Ordering::Relaxed);
     }
 
     fn any_pending(&self) -> bool {
         self.drops
+            .0
             .iter()
             .any(|count| count.load(Ordering::Relaxed) != 0)
     }
@@ -291,7 +583,12 @@ impl LogTracer {
         if !self.handle.emits(class) {
             return;
         }
-        match self.handle.write(entry_for(&event, class, now)) {
+        match self.handle.write(entry_for_principal(
+            &event,
+            class,
+            now,
+            self.principal.as_ref(),
+        )) {
             Ok(_) => {}
             Err(crate::WriteError::Render(_)) => self.drop_one(DROP_UNWRITABLE),
             Err(_) => self.drop_one(DROP_WRITE_FAILED),
@@ -341,11 +638,35 @@ pub fn class_for(event: &TraceEvent) -> &'static str {
 ///
 /// `now` is the fallback stamp, used only when the event carries no `started`
 /// of its own: a pre-dispatch denial, or a kernel built without a clock.
+///
+/// Attributes to the process alone;
+/// [`entry_for_principal`] is the per-tenant form.
 pub fn entry_for(event: &TraceEvent, class: &str, now: Timestamp) -> Entry {
+    entry_for_principal(event, class, now, None)
+}
+
+/// [`entry_for`], attributing the entry to `principal` as well as to the
+/// process that wrote it.
+///
+/// The column goes **first**, before `worker=`: an attribution is what a reader
+/// scanning a mixed segment is separating lines by, and the eye wants it in the
+/// same place on every line that has one. An entry with no principal writes no
+/// column at all — the host's own work is not work done for an unknown
+/// principal, and an empty column would conflate them.
+pub fn entry_for_principal(
+    event: &TraceEvent,
+    class: &str,
+    now: Timestamp,
+    principal: Option<&Principal>,
+) -> Entry {
     let started = event
         .started
         .map(|time| Timestamp::from_millis(time.as_millis()));
-    let mut entry = Entry::new(started.unwrap_or(now), class, event.target.clone())
+    let mut entry = Entry::new(started.unwrap_or(now), class, event.target.clone());
+    if let Some(principal) = principal {
+        entry = entry.with(PRINCIPAL_KEY, principal.as_str());
+    }
+    entry = entry
         .with("worker", event.thread.clone())
         .with("span", event.span.to_string());
     if let Some(parent) = event.parent {

@@ -132,6 +132,20 @@ struct State {
     /// open and back out at close or rotation, so one key seam serves a whole
     /// chain rather than one segment.
     signer: Option<Box<dyn SealSigner>>,
+    /// Set while a write-triggered rotation is under way.
+    ///
+    /// ★ [`LogHandle::write`] must release the state lock before rotating —
+    /// [`LogHandle::rotate`] takes it itself — and in that window a second
+    /// writer can judge the SAME segment due and roll it again, producing a
+    /// successor one entry old for no reason. The decision is therefore made
+    /// under the lock, and this flag is what makes it a decision rather than an
+    /// observation: without it both threads pass the due check before either
+    /// acts.
+    ///
+    /// Native only: a browser has no segment files, so there is nothing to
+    /// rotate into and the whole trigger is `cfg`'d out there.
+    #[cfg(not(target_family = "wasm"))]
+    rotating: bool,
 }
 
 impl LogHandle {
@@ -151,6 +165,8 @@ impl LogHandle {
                 writer: None,
                 vocabulary: None,
                 signer: None,
+                #[cfg(not(target_family = "wasm"))]
+                rotating: false,
             }),
         }
     }
@@ -319,6 +335,26 @@ impl LogHandle {
         let Some(writer) = state.writer.take() else {
             return Ok(None);
         };
+        // ★ A successor may not be STAMPED before its predecessor started.
+        //
+        // Segment IRIs end in a UTC stamp and half this crate reads IRI order as
+        // chain order — `urn:log:verify`'s walk, `predecessor_of`, the newest
+        // segment a restart chains from. Rotation is triggered from inside a
+        // write and stamped from that entry's own time, and under concurrent
+        // writers an entry's time is NOT monotonic: a thread reads the clock,
+        // then waits for the write lock, and can land its entry — and trigger a
+        // rotation — long after a thread that read the clock later. Measured
+        // 2026-09-13 with eight tracers: segments stamped tens of seconds out of
+        // order, `urn:log:verify` reporting five `PrevMismatch`es on a chain that
+        // was perfectly intact, and a `log:ChainBroken` entry written during
+        // rotation about a predecessor that was not the predecessor.
+        //
+        // Clamping costs the stamp its exactness (it can name the instant the
+        // predecessor opened rather than the instant the trigger entry was
+        // stamped) and buys back an invariant the whole module rests on. Two
+        // rotations inside one second then share a base and `reserve_segment`
+        // disambiguates them in order.
+        let now = now.max(writer.header().started);
         // Judged on the WRITER, not on the config: the config can have been
         // repointed since the segment opened, and what decides whether there is
         // something to roll is whether this writer has a file — a console
@@ -488,12 +524,54 @@ impl LogHandle {
             }
         };
         // The lock is released before rotating: `rotate` takes it itself, and a
-        // rotation under an already-held lock would deadlock the log.
+        // rotation under an already-held lock would deadlock the log. That
+        // window is exactly why the decision is re-made under the lock — see
+        // `rotate_if_due`.
         #[cfg(not(target_family = "wasm"))]
         if _rotation_due {
-            self.rotate(now)?;
+            self.rotate_if_due(now)?;
         }
         Ok(seq)
+    }
+
+    /// [`rotate`](Self::rotate), but only when the segment that is open **now**
+    /// still meets its policy, and only once at a time.
+    ///
+    /// ★ The concurrency half of rotation. `write` cannot hold the state lock
+    /// across `rotate`, so between deciding that a segment is due and rolling it
+    /// there is a window in which another writer decides the same thing about
+    /// the same segment. Re-judging under the lock closes most of it — the
+    /// successor is not due — and the `rotating` flag closes the rest, which is
+    /// the part re-judging alone cannot: two threads can both pass the check
+    /// before either has rotated anything.
+    ///
+    /// `rotate` itself stays unconditional and public: an operator asking for a
+    /// rotation is not asking whether one is due.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn rotate_if_due(
+        &self,
+        now: Timestamp,
+    ) -> std::result::Result<Option<String>, WriteError> {
+        {
+            let mut state = self.state.lock().expect("log state");
+            if state.rotating {
+                return Ok(None);
+            }
+            if !state
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.rotation_due(now))
+            {
+                return Ok(None);
+            }
+            state.rotating = true;
+        }
+        let outcome = self.rotate(now);
+        // Cleared on failure as well: a rotation that could not complete left
+        // the predecessor writable and open, and a flag stuck on would mean the
+        // segment never rolls again for the life of the process.
+        self.state.lock().expect("log state").rotating = false;
+        outcome
     }
 
     /// The effective configuration.

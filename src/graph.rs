@@ -119,6 +119,12 @@ const PROV_STARTED_AT_TIME: &str = "http://www.w3.org/ns/prov#startedAtTime";
 const PROV_WAS_ASSOCIATED_WITH: &str = "http://www.w3.org/ns/prov#wasAssociatedWith";
 const PROV_WAS_ATTRIBUTED_TO: &str = "http://www.w3.org/ns/prov#wasAttributedTo";
 const PROV_SOFTWARE_AGENT: &str = "http://www.w3.org/ns/prov#SoftwareAgent";
+const PROV_AGENT_CLASS: &str = "http://www.w3.org/ns/prov#Agent";
+const PROV_ACTED_ON_BEHALF_OF: &str = "http://www.w3.org/ns/prov#actedOnBehalfOf";
+const PROV_QUALIFIED_DELEGATION: &str = "http://www.w3.org/ns/prov#qualifiedDelegation";
+const PROV_DELEGATION_CLASS: &str = "http://www.w3.org/ns/prov#Delegation";
+const PROV_AGENT: &str = "http://www.w3.org/ns/prov#agent";
+const PROV_HAD_ACTIVITY: &str = "http://www.w3.org/ns/prov#hadActivity";
 
 const LOG_SEGMENT_CLASS: &str = "https://ikigai-rs.dev/ns/log#Segment";
 const LOG_INSTANCE_CLASS: &str = "https://ikigai-rs.dev/ns/log#Instance";
@@ -141,6 +147,10 @@ const SIG_ALGORITHM: &str = "https://ikigai-rs.dev/ns/sign#algorithm";
 /// module that rebinds `span`/`parent` to a different column still joins.
 const LOG_SPAN: &str = "https://ikigai-rs.dev/ns/log#span";
 const LOG_PARENT_SPAN: &str = "https://ikigai-rs.dev/ns/log#parentSpan";
+
+/// The column whose value names the principal an entry's work was done for.
+/// Keyed on the PROPERTY for the same reason as the two above.
+const LOG_ON_BEHALF_OF: &str = crate::vocabulary::ON_BEHALF_OF_PROPERTY;
 
 // =====================================================================================
 // Errors
@@ -305,6 +315,11 @@ pub fn to_triples(
     let mut spans: BTreeMap<(usize, String), NamedNode> = BTreeMap::new();
     let mut edges: Vec<(usize, String, NamedNode)> = Vec::new();
 
+    // Every principal this segment's entries were written for, so the
+    // per-principal facts (`a prov:Agent`, and the instance's unqualified
+    // delegation to it) land ONCE rather than once per entry.
+    let mut principals: BTreeSet<NamedNode> = BTreeSet::new();
+
     for row in &rows {
         if !options.admits(&row.entry, row.seq) {
             continue;
@@ -351,6 +366,7 @@ pub fn to_triples(
         }
 
         let mut flagged: BTreeSet<&str> = BTreeSet::new();
+        let mut delegations = 0usize;
         for (key, value) in &row.entry.fields {
             match vocab.key(key) {
                 Some(def) => {
@@ -364,6 +380,54 @@ pub fn to_triples(
                     }
                     if def.property == LOG_PARENT_SPAN {
                         edges.push((row.run, value.clone(), node.clone()));
+                    }
+                    if def.property == LOG_ON_BEHALF_OF {
+                        // ★ The delegation, in standard terms. `log:onBehalfOf`
+                        // above already states it precisely and is what a query
+                        // over this vocabulary will use; this is the same fact
+                        // for a consumer that has PROV and nothing of ours — and
+                        // it has to be the QUALIFIED form, because PROV's
+                        // unqualified `prov:actedOnBehalfOf` is agent-to-agent
+                        // and cannot say which activity the delegation was for.
+                        // One instance serving three tenants in one segment
+                        // would otherwise read as three blanket delegations with
+                        // no way back to the entries.
+                        //
+                        // Skolemized like everything else here: `{entry}:
+                        // delegation`, suffixed only if one entry somehow names
+                        // two principals (this crate's tracer writes one; a
+                        // hand-assembled line is not forbidden to write more,
+                        // and two delegations sharing an IRI would be one node
+                        // with two agents).
+                        if let Ok(agent) = NamedNode::new(value) {
+                            let ordinal = delegations + 1;
+                            delegations += 1;
+                            let delegation = iri(&match ordinal {
+                                1 => format!("{}:{}:delegation", header.name, row.seq),
+                                n => format!("{}:{}:delegation:{n}", header.name, row.seq),
+                            })?;
+                            out.push(triple(
+                                &instance,
+                                PROV_QUALIFIED_DELEGATION,
+                                Term::NamedNode(delegation.clone()),
+                            ));
+                            out.push(triple(
+                                &delegation,
+                                RDF_TYPE,
+                                term_iri(PROV_DELEGATION_CLASS)?,
+                            ));
+                            out.push(triple(
+                                &delegation,
+                                PROV_AGENT,
+                                Term::NamedNode(agent.clone()),
+                            ));
+                            out.push(triple(
+                                &delegation,
+                                PROV_HAD_ACTIVITY,
+                                Term::NamedNode(node.clone()),
+                            ));
+                            principals.insert(agent);
+                        }
                     }
                 }
                 None => {
@@ -390,6 +454,22 @@ pub fn to_triples(
                 }
             }
         }
+    }
+
+    // ── The principals, once each ──────────────────────────────────────────
+    //
+    // `prov:actedOnBehalfOf` is PROV's own unqualified projection of the
+    // qualified delegations above — true, useful on its own ("which principals
+    // did this instance serve?"), and emitted once per principal rather than
+    // once per entry because that is all it can honestly say: without the
+    // activity it is a fact about the segment, not about a line.
+    for agent in principals {
+        out.push(triple(&agent, RDF_TYPE, term_iri(PROV_AGENT_CLASS)?));
+        out.push(triple(
+            &instance,
+            PROV_ACTED_ON_BEHALF_OF,
+            Term::NamedNode(agent),
+        ));
     }
 
     // ── log:invoked: parent → child, within one run ────────────────────────

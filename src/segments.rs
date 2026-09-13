@@ -82,7 +82,7 @@ use ikigai_core::{
 use crate::endpoints::{LogHandle, CAP_READ};
 use crate::graph::{to_turtle, Options, LOG_MEDIA_TYPE, TURTLE_MEDIA_TYPE};
 #[cfg(not(target_family = "wasm"))]
-use crate::line::{Header, Line, Timestamp};
+use crate::line::{Header, Line, Prev, Timestamp};
 use crate::vocabulary::Vocabulary;
 #[cfg(not(target_family = "wasm"))]
 use crate::vocabulary::{PROCESS_STOP_CLASS, ROTATION_CLASS};
@@ -866,12 +866,123 @@ fn chains_in(directory: &Path) -> Vec<(String, Vec<(String, String)>)> {
             .push((header.name, text));
     }
     for chain in by_instance.values_mut() {
-        // The segment IRI ends in a fixed-width UTC stamp, so IRI order IS
-        // chronological order within an instance — the same property that makes
-        // `grep '^2026-08-23T09:'` a query.
-        chain.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let ordered = std::mem::take(chain);
+        *chain = in_chain_order(ordered);
     }
     by_instance.into_iter().collect()
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// One instance's segments, oldest first — by **the chain**, falling back to IRI
+/// order when the links do not form one over exactly this set.
+///
+/// ★ IRI order is a PROXY for chain order, and it is one that can be wrong. The
+/// stamp a segment is named for is the instant the entry that triggered the
+/// rotation was stamped, and under concurrent writers an entry's time is not
+/// monotonic — a thread that read the clock early can land its entry late. The
+/// writer now clamps a successor's stamp so it never sorts before its
+/// predecessor's, but a log written before that clamp existed is on disk
+/// forever, and verifying one in the wrong order reports a `PrevMismatch` on
+/// every segment of a chain that is perfectly intact. That is the worst possible
+/// failure for this subsystem: the alarm that cries wolf is the alarm nobody
+/// reads.
+///
+/// So the order comes from the thing that is actually authoritative: `@prev`
+/// names the predecessor's final seal, and a segment's final seal is stated in
+/// its last `#seal` line. Nothing here VERIFIES those hashes — recomputing is
+/// [`verify_segment`]'s job and happens next — so a tamperer gains nothing: a
+/// link they break stops forming a chain, the fallback to IRI order applies, and
+/// the mismatch is reported exactly as before.
+fn in_chain_order(mut chain: Vec<(String, String)>) -> Vec<(String, String)> {
+    // The segment IRI ends in a fixed-width UTC stamp, so IRI order is
+    // chronological within an instance — the same property that makes
+    // `grep '^2026-08-23T09:'` a query. It is the fallback, and the order the
+    // links are resolved against.
+    chain.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let Some(order) = chain_order(&chain) else {
+        return chain;
+    };
+    let mut slots: Vec<Option<(String, String)>> = chain.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|index| slots[index].take().expect("each index exactly once"))
+        .collect()
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// The indices of `chain` in link order, or `None` when the links do not form a
+/// single chain over exactly this set — a fork, a cycle, a missing middle, two
+/// segments ending at one head, or no unique start.
+fn chain_order(chain: &[(String, String)]) -> Option<Vec<usize>> {
+    use std::collections::HashMap;
+
+    let mut heads: Vec<String> = Vec::with_capacity(chain.len());
+    let mut prevs: Vec<Prev> = Vec::with_capacity(chain.len());
+    let mut ends_at: HashMap<&str, usize> = HashMap::new();
+    for (_, text) in chain.iter() {
+        let (header, _) = Header::parse(text).ok()?;
+        heads.push(stated_head_in(text, &header)?);
+        prevs.push(header.prev);
+    }
+    for (index, head) in heads.iter().enumerate() {
+        if ends_at.insert(head.as_str(), index).is_some() {
+            return None;
+        }
+    }
+    let mut follows: HashMap<&str, usize> = HashMap::new();
+    for (index, prev) in prevs.iter().enumerate() {
+        if let Prev::Seal(hash) = prev {
+            if follows.insert(hash.as_str(), index).is_some() {
+                return None;
+            }
+        }
+    }
+    // The start is the one segment nothing in this set precedes: genesis, or a
+    // `@prev` naming a seal that is not here (the chain continues off the end of
+    // what was listed, which is ordinary — retention removes the oldest).
+    let mut starts = (0..chain.len()).filter(|&index| match &prevs[index] {
+        Prev::Genesis => true,
+        Prev::Seal(hash) => !ends_at.contains_key(hash.as_str()),
+    });
+    let start = starts.next()?;
+    if starts.next().is_some() {
+        return None;
+    }
+    let mut order = Vec::with_capacity(chain.len());
+    let mut seen = vec![false; chain.len()];
+    let mut current = start;
+    loop {
+        if seen[current] {
+            return None;
+        }
+        seen[current] = true;
+        order.push(current);
+        match follows.get(heads[current].as_str()) {
+            Some(&next) => current = next,
+            None => break,
+        }
+    }
+    (order.len() == chain.len()).then_some(order)
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// The chain head a segment STATES: its last `#seal`, or h₀ over its header when
+/// nothing has been sealed yet.
+///
+/// Found by scanning backwards for the marker rather than by walking every line,
+/// because this runs once per segment purely to put the segments in order — the
+/// walk that actually recomputes the chain is [`verify_segment`].
+fn stated_head_in(text: &str, header: &Header) -> Option<String> {
+    match text.rfind("\n#seal ") {
+        Some(at) => {
+            let line = text[at + 1..].lines().next()?;
+            match Line::parse(line, &header.prefixes) {
+                Ok(Line::Seal(seal)) => Some(seal.hash),
+                _ => None,
+            }
+        }
+        None => Some(crate::chain::Chain::open(header).head().to_string()),
+    }
 }
 
 // =====================================================================================

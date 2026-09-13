@@ -94,6 +94,19 @@ pub const ROTATION_CLASS: &str = "https://ikigai-rs.dev/ns/log#Rotation";
 /// failure belongs in the record it is a failure of.
 pub const CHAIN_BROKEN_CLASS: &str = "https://ikigai-rs.dev/ns/log#ChainBroken";
 
+/// `log:onBehalfOf` — the principal an entry's work was done FOR, as opposed to
+/// the process that did it.
+///
+/// Named here as a PROPERTY IRI rather than as a column name because the
+/// transreptor keys the delegation triples it materializes on the property, the
+/// same way it keys the span join: a host that rebinds the column with its own
+/// `log:keyName` still gets the delegation.
+pub const ON_BEHALF_OF_PROPERTY: &str = "https://ikigai-rs.dev/ns/log#onBehalfOf";
+
+/// The `key=` column [`ON_BEHALF_OF_PROPERTY`] is bound to in the built-in
+/// vocabulary — what [`crate::LogTracer`] writes and what `grep` looks for.
+pub const PRINCIPAL_KEY: &str = "principal";
+
 /// The level a class is written at when neither it nor any of its superclasses
 /// declares one: the day-to-day default, so an undeclared extension is visible
 /// rather than silently invisible.

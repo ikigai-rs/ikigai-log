@@ -196,6 +196,13 @@ log:capability a rdf:Property ;
     rdfs:label "capability" ;
     rdfs:comment "One capability IRI of the authority this entry ran under; repeated per scope, absent for full authority. PROV has no term for the authority an activity ran under — this is ikigai's own axis, and it is a large part of why the log is worth more than a trace." .
 
+log:onBehalfOf a rdf:Property ;
+    log:keyName "principal" ;
+    rdfs:domain log:Entry ;
+    rdfs:range prov:Agent ;
+    rdfs:label "onBehalfOf" ;
+    rdfs:comment "The principal this entry's work was done FOR, distinct from the process that did it. Both facts are real and neither replaces the other: prov:wasAssociatedWith names the instance on every entry, and this names whoever the instance was serving when a per-tenant tracer wrote the line. Deliberately NOT rdfs:subPropertyOf prov:wasAssociatedWith — that inference would make the two indistinguishable to a PROV reader, which is the exact confusion this term exists to remove. The standard-terms rendering is a skolemized prov:Delegation at {entry}:delegation, which the transreptor materializes beside this triple so a consumer with neither a reasoner nor a copy of this vocabulary still reads the delegation in PROV." .
+
 log:durationMs a rdf:Property ;
     log:keyName "dur" ;
     rdfs:domain log:Entry ;
