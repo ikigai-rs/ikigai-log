@@ -368,6 +368,66 @@ Half of the `error` cost is the kernel's, not this crate's. "The log is
 effectively off, so it is free" is wrong; the honest lever is not installing a
 tracer.
 
+### One process, several principals
+
+The global tracer slot holds exactly one collector. That is right for a daemon
+logging its own work and wrong for a server handling several tenants at once, so
+`LogTracer::on_behalf_of` derives a tracer that attributes every entry to a
+`Principal` and shares the base's handle, clock and drop ledger. Hand it to
+`Kernel::issue_traced` — the per-call form, which the kernel isolates and which
+threads its own span-id space across `fan_out` — never to `set_tracer`:
+
+```rust
+let base = LogTracer::new(handle, clock);
+let tenant = Arc::new(base.on_behalf_of(Principal::new(peer)?));
+kernel.issue_traced(request, capability, tenant).await?;
+```
+
+```
+2026-09-13T09:14:22.031Z log:Resolution urn:calendar:today seq=41 principal=urn:agent:alice worker=ikigai-sched-2 span=7 dur=12
+```
+
+Three things are load-bearing about that column:
+
+* **It is a second axis, not a replacement.** `prov:wasAssociatedWith` still names
+  the instance on every entry — *which process did it* — and `log:onBehalfOf`
+  names *who it was done for*. The graph face states the second in standard terms
+  as well, as a skolemized `prov:Delegation` at `{entry}:delegation`; it has to be
+  the QUALIFIED form, because `prov:actedOnBehalfOf` is agent-to-agent and cannot
+  name the activity, so one instance serving three tenants would otherwise read as
+  three blanket delegations with no way back to the entries.
+* **This crate records a principal; it does not authenticate one.** Where the IRI
+  comes from is the host's question — a certificate fingerprint, a passkey
+  credential, a peer name. A logging module inventing a fourth identity model
+  would put the least-informed component in charge of the most consequential
+  answer.
+* **A principal is caller-supplied data reaching a greppable format**, so
+  `Principal::new` **parses the output rather than filtering the input**: it
+  renders a probe line, parses it back, and accepts the value only if every column
+  survives and the value was written *bare*. One that would have to be quoted is
+  refused, not escaped — escaping is lossless and still wrong, because
+  `grep 'principal=urn:agent:alice'` is half of why the format is what it is. The
+  refusal happens once, when a connection's tracer is built.
+
+**N tracers, one segment, one hash chain.** `LogHandle` holds its writer behind
+one lock and holds it across the whole of an append — sequence number, render,
+write, flush, chain advance, seal — and `Writer` is not `Sync`, so the
+unserialized variant does not compile. Rotation takes the same lock for its whole
+duration, so nothing lands mid-rotation. Two things that were *not* sound have
+been fixed:
+
+* **A successor may not be stamped before its predecessor started.** Rotation is
+  triggered from inside a write and stamped from that entry's time, and under
+  concurrent writers an entry's time is not monotonic — a thread reads the clock,
+  then waits for the lock. Measured with eight tracers: segments stamped tens of
+  seconds out of order and `urn:log:verify` reporting five broken links on a chain
+  that was perfectly intact. The stamp is now clamped.
+* **The verify walk follows the chain, not the file names.** IRI order is a proxy
+  for chain order and a log written before that clamp is on disk forever, so
+  `urn:log:verify` now orders each instance's segments by `@prev` and falls back
+  to IRI order when the links do not form one. Nothing there verifies a hash —
+  that happens next — so a broken link still reports exactly as before.
+
 **`Tracer::record` returns `()`**, so a write failure is invisible upward by
 design. Nothing propagates, nothing panics, and everything lost is counted and
 lands as an always-land `log:Dropped count=N reason=…` — a drop that leaves no
@@ -497,8 +557,8 @@ the file itself on request, windowed by `since` / `until` / `from_seq` /
 `to_seq`, and answering `Exists` in O(header) so a chain walk can follow a
 `@prev` without reading what it points at), `urn:log:segments` to list what
 there is to query, **`LogTracer` — the kernel writing its own resolutions,
-cache hits and capability denials** — the operator-settable seal and rotation
-cadences, and **all four tamper-evidence layers**: the in-memory hash chain, seals on a count-or-time
+cache hits and capability denials, per process or per principal** — the
+operator-settable seal and rotation cadences, and **all four tamper-evidence layers**: the in-memory hash chain, seals on a count-or-time
 cadence with a signer seam, `@prev` carrying the chain across rotations and
 restarts, and rotation as verify + seal + validate with `log:ChainBroken` as an
 entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
@@ -516,10 +576,10 @@ entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
 * No retention and no `log:Tombstone`, no central collection, no SHACL on write —
   "validate" in a rotation is the structural walk, not shapes, and this README
   will not let that word carry more than it does.
-* **The tracer is per-process and single-tenant.** It rides the kernel's global
-  tracer slot, which is the right shape for a daemon logging its own work and the
-  wrong one for a wire server tracing one tenant's connection — that wants
-  `Kernel::issue_traced`, and nothing here projects onto it yet.
+* **A principal is recorded, never authenticated, and never correlated.** The
+  host names it; nothing here checks that the name is the one that authenticated,
+  and there is no index from a principal to its entries — finding one tenant's
+  work is still `grep`, or a transreption of the whole segment.
 
 **Logging is off until a host opens a writer**, and binding the endpoints does
 not open one. The module cannot tell whether it is inside a daemon or a one-shot

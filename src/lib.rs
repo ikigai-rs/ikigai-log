@@ -100,6 +100,16 @@
 //! ones: nobody is composing prose, so the target is an IRI because a `Request`
 //! holds an IRI.
 //!
+//! ★ **One process, several principals.** The global tracer slot holds exactly
+//! one collector, which is right for a daemon logging its own work and wrong for
+//! a server handling several tenants at once. [`LogTracer::on_behalf_of`] derives
+//! a tracer that attributes every entry to a [`Principal`] and shares the base's
+//! handle, clock and drop ledger; hand it to `Kernel::issue_traced`, which is the
+//! only form the kernel isolates per call. N of them through one [`LogHandle`]
+//! cannot interleave a line or fold the chain out of order, because the writer
+//! lives behind one lock that is held across the whole append — and `Writer` is
+//! not `Sync`, so there is no other way to reach it.
+//!
 //! Two costs stated rather than left to be discovered. **Installing a tracer
 //! means a `TraceEvent` is BUILT for every resolution** — the kernel gates only
 //! on `set_tracer`, so the level dial filters what is WRITTEN, not what is
@@ -160,13 +170,16 @@ pub use segments::{
     SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
 };
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
-pub use tracer::{class_for, entry_for, LogTracer, DROP_REASONS};
+pub use tracer::{
+    class_for, entry_for, entry_for_principal, LogTracer, Principal, PrincipalError, DROP_REASONS,
+    MAX_PRINCIPAL_LEN,
+};
 pub use vocabulary::{
     ClassDef, KeyDef, VocabError, Vocabulary, CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS,
     CHAIN_BROKEN_CLASS, CONFIG_CHANGE_CLASS, DEFAULT_MIN_LEVEL, DROPPED_CLASS, ENTRY_CLASS,
     ERROR_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS, LOG_NS, MESSAGE_CLASS,
-    PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS, RESOLUTION_CLASS, ROTATION_CLASS,
-    VOCABULARY_TTL, WARNING_CLASS,
+    ON_BEHALF_OF_PROPERTY, PRINCIPAL_KEY, PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS,
+    RESOLUTION_CLASS, ROTATION_CLASS, VOCABULARY_TTL, WARNING_CLASS,
 };
 pub use writer::{Closed, ClosureSink, LineSink, WriteError, Writer, WriterOptions};
 #[cfg(not(target_family = "wasm"))]

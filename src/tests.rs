@@ -618,13 +618,21 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
+        // ⚠ The counter is not belt-and-braces over the nanoseconds: two tests
+        // starting together really do read the same `SystemTime` — the clock's
+        // resolution is coarser than its unit — and two fixtures sharing one
+        // directory then share an instance name, which the writer disambiguates
+        // rather than refusing. Seen in `tests/conformance.rs` on 2026-09-13,
+        // in a suite that had passed for days.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ikigai-log-{}-{}-{tag}",
+            "ikigai-log-{}-{}-{}-{tag}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("the clock is after the epoch")
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         Scratch(dir)
@@ -4363,5 +4371,786 @@ fn measure_tracer_cost_and_the_volume_the_rotation_defaults_face() {
         "  transrepting it: {:?} → {:.1} MB of Turtle",
         start.elapsed(),
         turtle.len() as f64 / 1_048_576.0
+    );
+}
+
+// =====================================================================================
+// T6 — per-tenant tracing: attribution, and N tracers through one writer
+// =====================================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::tracer::{entry_for_principal, Principal, PrincipalError, MAX_PRINCIPAL_LEN};
+use crate::vocabulary::{ON_BEHALF_OF_PROPERTY, PRINCIPAL_KEY};
+use crate::writer::WriterOptions;
+
+fn prov(term: &str) -> String {
+    format!("{PROV}{term}")
+}
+
+/// A resolution of `target`, as the kernel would report it.
+fn resolution(target: &str, span: u64, millis: u64) -> TraceEvent {
+    TraceEvent {
+        target: target.to_string(),
+        thread: format!("ikigai-sched-{span}"),
+        started: Some(Time::from_millis(millis)),
+        ended: Some(Time::from_millis(millis + 3)),
+        cache_hit: false,
+        span,
+        parent: None,
+        capability: None,
+        notes: Vec::new(),
+    }
+}
+
+#[test]
+fn a_principal_is_refused_unless_it_renders_as_a_bare_greppable_column() {
+    // ★ The rule is about the OUTPUT, so every case here is a statement about a
+    // line: not "this character is dangerous" but "this value does not come
+    // back out of a line as what went in, or does not come back bare".
+    for offered in [
+        "urn:agent:two words", // would be quoted — invisible to grep
+        "urn:agent:tab\there",
+        "urn:agent:newline\nhere", // would be escaped, not split — still refused
+        "urn:agent:quote\"here",
+        "urn:agent:back\\slash",
+        "urn:agent:angle<bracket>",
+        "#seal 1-9 sha256:deadbeef", // seal-shaped, and quoted for the space
+        "",
+        "no-scheme",
+        "   ",
+    ] {
+        assert!(
+            Principal::new(offered).is_err(),
+            "{offered:?} must be refused, never escaped and never truncated"
+        );
+    }
+
+    // A bound that refuses. The value lands on EVERY entry of a connection, so
+    // an unbounded one is an unbounded line.
+    let long = format!("urn:agent:{}", "x".repeat(MAX_PRINCIPAL_LEN));
+    assert_eq!(
+        Principal::new(&long),
+        Err(PrincipalError::TooLong { length: long.len() }),
+        "and the refusal says how long it was, so an operator can see what was asked for"
+    );
+
+    for accepted in [
+        "urn:agent:calendar",
+        "urn:peer:plasma",
+        "https://example.org/people/1",
+        "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+        // A certificate fingerprint, which is where a wire server's answer
+        // actually comes from today.
+        "urn:ikigai:client:sha256:9f86d081884c7d659a2feaa0c55ad015",
+    ] {
+        assert!(
+            Principal::new(accepted).is_ok(),
+            "{accepted} is exactly the shape a host will hand over"
+        );
+    }
+}
+
+#[test]
+fn an_accepted_principal_is_still_the_value_after_the_line_it_was_written_into() {
+    // The constructor's own claim, re-checked against a REAL entry rather than
+    // the probe: a principal that displaced a column or needed quoting would
+    // show up here even if the probe somehow did not.
+    for iri in [
+        "urn:agent:calendar",
+        "https://example.org/people/1",
+        "urn:ikigai:client:sha256:9f86d081884c7d659a2feaa0c55ad015",
+    ] {
+        let principal = Principal::new(iri).expect("a writable principal");
+        let event = resolution("urn:traced:thing", 4, 1_700_000_000_000);
+        let entry = entry_for_principal(
+            &event,
+            class_for(&event),
+            at(1_700_000_000_000),
+            Some(&principal),
+        );
+        let line = entry.render(&prefixes()).expect("it renders");
+        assert!(
+            line.contains(&format!(" {PRINCIPAL_KEY}={iri} ")),
+            "bare and greppable, or the format has given up half its query surface:\n{line}"
+        );
+        let back = Entry::parse(&line, &prefixes()).expect("it parses back");
+        assert_eq!(back.get(PRINCIPAL_KEY), Some(iri));
+        assert_eq!(back.subject, "urn:traced:thing", "no column was displaced");
+        assert_eq!(back.class, RESOLUTION_CLASS);
+        assert_eq!(back.get("worker"), Some("ikigai-sched-4"));
+    }
+}
+
+#[test]
+fn the_process_tracer_writes_no_principal_column_at_all() {
+    let event = resolution("urn:traced:thing", 1, 1_700_000_000_000);
+    let entry = entry_for(&event, class_for(&event), at(1_700_000_000_000));
+    assert_eq!(
+        entry.get(PRINCIPAL_KEY),
+        None,
+        "the host's own work is not work done for an unknown principal, and an \
+         empty column would conflate the two"
+    );
+}
+
+#[test]
+fn two_principals_through_one_handle_are_each_attributed() {
+    let home = Scratch::new("tenant-attribution");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let base = LogTracer::new(handle.clone(), Arc::new(Fixed(1_700_000_000_000)));
+    let alice = base.on_behalf_of(Principal::new("urn:agent:alice").expect("writable"));
+    let bob = base.on_behalf_of(Principal::new("urn:agent:bob").expect("writable"));
+
+    alice.record(resolution("urn:traced:one", 0, 1_700_000_000_001));
+    bob.record(resolution("urn:traced:two", 0, 1_700_000_000_002));
+    base.record(resolution("urn:traced:three", 0, 1_700_000_000_003));
+
+    let text = captured.text();
+    let entries: Vec<Entry> = text
+        .lines()
+        .filter(|line| line.contains("log:Resolution"))
+        .map(|line| Entry::parse(line, &prefixes()).expect("parses"))
+        .collect();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].get(PRINCIPAL_KEY), Some("urn:agent:alice"));
+    assert_eq!(entries[1].get(PRINCIPAL_KEY), Some("urn:agent:bob"));
+    assert_eq!(
+        entries[2].get(PRINCIPAL_KEY),
+        None,
+        "the base tracer is the process's own, and stays so after deriving from it"
+    );
+    assert_eq!(entries[0].subject, "urn:traced:one");
+    assert_eq!(entries[1].subject, "urn:traced:two");
+}
+
+#[test]
+fn the_drop_ledger_is_shared_so_a_closed_connection_cannot_carry_a_loss_away() {
+    let home = Scratch::new("tenant-drops");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let base = LogTracer::new(handle.clone(), Arc::new(Fixed(1_700_000_000_000)));
+
+    {
+        let tenant = base.on_behalf_of(Principal::new("urn:agent:gone").expect("writable"));
+        // An unwritable note: the key is free text an endpoint supplied, and
+        // `x y` is not a column. The entry is lost and the loss is counted.
+        let mut event = resolution("urn:traced:thing", 0, 1_700_000_000_001);
+        event.notes.push(("not a key".to_string(), "v".to_string()));
+        tenant.record(event);
+        assert_ne!(
+            tenant.pending_drops(),
+            [0; DROP_REASONS.len()],
+            "something was lost"
+        );
+    } // the connection goes away, and with it that tracer
+
+    assert_ne!(
+        base.pending_drops(),
+        [0; DROP_REASONS.len()],
+        "★ the ledger is the HANDLE's, not the connection's — a per-tracer count \
+         would have walked out of the process with the tenant that lost the entry"
+    );
+    base.record(resolution("urn:traced:next", 0, 1_700_000_000_002));
+    let text = captured.text();
+    let dropped: Vec<Entry> = text
+        .lines()
+        .filter(|line| line.contains("log:Dropped"))
+        .map(|line| Entry::parse(line, &prefixes()).expect("parses"))
+        .collect();
+    assert_eq!(dropped.len(), 1, "the marker landed:\n{text}");
+    assert_eq!(
+        dropped[0].get(PRINCIPAL_KEY),
+        None,
+        "and it is the PROCESS's loss: the ledger is shared, so naming whichever \
+         tenant happened to flush it would be a fact this crate does not have"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ Write concurrency: N tracers, one segment, one hash chain
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The number of principals the concurrency tests run at once, and how many
+/// resolutions each records. Enough that any unserialized append would land in
+/// the middle of another; small enough to stay a unit test.
+const TENANTS: u64 = 8;
+const PER_TENANT: u64 = 60;
+
+/// Every assertion the concurrency tests make about a finished segment, in one
+/// place so that the SAME predicate can be aimed at a deliberately broken
+/// segment and shown to fail. A check that cannot fail is not a check.
+///
+/// Three properties, one per way a lost lock would show up:
+///
+/// * every line still parses and the chain still verifies (a spliced line, or
+///   entries folded in an order the seal does not agree with),
+/// * sequence numbers are dense and strictly increasing from 1 (two appends
+///   that read the same counter),
+/// * every entry that names a principal names one of the expected ones, and the
+///   target it carries belongs to that principal (a line assembled from two
+///   writers' columns).
+fn a_sound_segment(text: &str, expected: &[String]) -> Result<u64, String> {
+    let report = verify_segment(text, Vocabulary::builtin(), None);
+    if !report.ok() {
+        return Err(format!("verification: {:?}", report.findings));
+    }
+    let (header, offset) = Header::parse(text).map_err(|e| format!("header: {e}"))?;
+    let mut expect_seq = 0u64;
+    let mut attributed = 0u64;
+    for raw in text[offset..].lines() {
+        let entry = match Line::parse(raw, &header.prefixes) {
+            Ok(Line::Entry(entry)) => entry,
+            Ok(_) => continue,
+            Err(e) => return Err(format!("line {raw:?}: {e}")),
+        };
+        let seq: u64 = entry
+            .get("seq")
+            .ok_or("an entry with no seq=")?
+            .parse()
+            .map_err(|_| "a seq that is not a number")?;
+        expect_seq += 1;
+        if seq != expect_seq {
+            return Err(format!("sequence: expected {expect_seq}, found {seq}"));
+        }
+        let Some(principal) = entry.get(PRINCIPAL_KEY) else {
+            continue;
+        };
+        if !expected.iter().any(|p| p == principal) {
+            return Err(format!("an unexpected principal: {principal}"));
+        }
+        // The target's own text names the tenant that asked for it, so a line
+        // assembled from two writers' columns is caught rather than merely
+        // suspected.
+        let tenant = principal.rsplit(':').next().unwrap_or_default();
+        if !entry.subject.contains(tenant) {
+            return Err(format!(
+                "{principal} is attributed a target it did not ask for: {}",
+                entry.subject
+            ));
+        }
+        attributed += 1;
+    }
+    Ok(attributed)
+}
+
+/// Drive `TENANTS` derived tracers at one handle from `TENANTS` threads and
+/// hand back the segment they wrote.
+fn a_concurrently_written_segment() -> (String, Vec<String>) {
+    let home = Scratch::new("tenant-race");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let base = Arc::new(LogTracer::new(
+        handle.clone(),
+        Arc::new(Fixed(1_700_000_000_000)),
+    ));
+    let principals: Vec<String> = (0..TENANTS).map(|t| format!("urn:agent:t{t}")).collect();
+
+    // One barrier so the threads start together rather than in sequence — a
+    // race that never happens proves nothing either.
+    let gate = Arc::new(std::sync::Barrier::new(TENANTS as usize));
+    let threads: Vec<_> = principals
+        .iter()
+        .map(|iri| {
+            let tracer = base.on_behalf_of(Principal::new(iri).expect("writable"));
+            let gate = Arc::clone(&gate);
+            let tenant = iri.rsplit(':').next().expect("a tenant").to_string();
+            std::thread::spawn(move || {
+                gate.wait();
+                for i in 0..PER_TENANT {
+                    tracer.record(resolution(
+                        &format!("urn:traced:{tenant}:{i}"),
+                        i,
+                        1_700_000_000_000 + i,
+                    ));
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("a tracer thread");
+    }
+    // Close, so the tail is sealed and the whole segment is under a checkpoint —
+    // otherwise the mutation cases below would be caught only by the sequence
+    // check and the chain would never be consulted.
+    handle.close(at(1_700_000_100_000)).expect("closes");
+    (captured.text(), principals)
+}
+
+#[test]
+fn concurrent_per_tenant_tracers_write_one_sound_segment() {
+    let (text, principals) = a_concurrently_written_segment();
+    let attributed = a_sound_segment(&text, &principals).expect("a sound segment");
+    assert_eq!(
+        attributed,
+        TENANTS * PER_TENANT,
+        "every resolution landed, attributed to the tenant that asked for it"
+    );
+
+    // And each tenant's own count, which is the fact the arc exists for: an
+    // audit that cannot say WHICH principal is an audit of nothing.
+    for principal in &principals {
+        let seen = text
+            .lines()
+            .filter(|line| line.contains(&format!("{PRINCIPAL_KEY}={principal} ")))
+            .count() as u64;
+        assert_eq!(seen, PER_TENANT, "{principal} is short");
+    }
+}
+
+#[test]
+fn the_soundness_check_fails_against_a_segment_a_lost_lock_would_have_written() {
+    // ★ The other half of the test above. `a_sound_segment` passes on what this
+    // crate writes; that is worth nothing unless it FAILS on what an
+    // unserialized writer would have written. Each mutation below is one
+    // symptom of a lost lock, applied to a segment that was otherwise sound.
+    //
+    // (The unserialized writer itself cannot be built to compare against:
+    // `Writer` is not `Sync` and is reachable only through `LogHandle`'s mutex,
+    // so the broken variant does not compile. These are its output.)
+    let (sound, principals) = a_concurrently_written_segment();
+    assert!(a_sound_segment(&sound, &principals).is_ok());
+
+    let lines: Vec<&str> = sound.lines().collect();
+    let entry_at = |n: usize| {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("log:Resolution"))
+            .nth(n)
+            .map(|(i, l)| (i, *l))
+            .expect("an entry line")
+    };
+
+    // 1. Two appends that read the same sequence counter.
+    let (index, line) = entry_at(20);
+    let (before, _) = entry_at(19);
+    let duplicated = {
+        let mut copy = lines.clone();
+        let previous_seq = lines[before]
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("seq="))
+            .expect("a seq column")
+            .to_string();
+        let own_seq = line
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("seq="))
+            .expect("a seq column")
+            .to_string();
+        let rewritten = line.replace(&format!("seq={own_seq}"), &format!("seq={previous_seq}"));
+        copy[index] = &rewritten;
+        copy.join("\n")
+    };
+    assert!(
+        a_sound_segment(&duplicated, &principals).is_err(),
+        "a repeated sequence number must be caught — it is what two writers \
+         sharing one counter produce"
+    );
+
+    // 2. One write landing in the middle of another.
+    let spliced = {
+        let mut copy = lines.clone();
+        let (first, _) = entry_at(30);
+        let (second, _) = entry_at(31);
+        let half = lines[first].len() / 2;
+        let joined = format!("{}{}", &lines[first][..half], &lines[second][half..]);
+        copy[first] = &joined;
+        copy.join("\n")
+    };
+    assert!(
+        a_sound_segment(&spliced, &principals).is_err(),
+        "a spliced line must be caught — it is what an append that did not hold \
+         the lock across write_line produces"
+    );
+
+    // 3. Two entries folded into the chain in the order they did not land in.
+    let transposed = {
+        let mut copy = lines.clone();
+        let (first, _) = entry_at(40);
+        let (second, _) = entry_at(41);
+        copy.swap(first, second);
+        copy.join("\n")
+    };
+    assert!(
+        a_sound_segment(&transposed, &principals).is_err(),
+        "a transposition must be caught — the chain folds lines in file order, \
+         so an out-of-order fold is a seal that no longer agrees"
+    );
+}
+
+#[test]
+fn concurrent_writers_rotate_a_segment_exactly_once() {
+    // ★ Rotation is the sharp edge, for two reasons that pull in opposite
+    // directions: `write` cannot hold the state lock across `rotate` (rotate
+    // takes it), and a writer landing mid-rotation would produce a
+    // `log:ChainBroken` nobody caused. What makes it safe is that `rotate`
+    // holds the lock for its WHOLE body — verify, seal, reserve, reopen — so
+    // nothing lands in the middle of one; what makes it correct is that the
+    // decision to rotate is re-made under that lock, or two threads roll the
+    // same segment twice and the second successor is one entry old.
+    let dir = Scratch::new("tenant-rotation");
+    let config = LogConfig::default()
+        .with_instance("bug:rotating")
+        .with_level("debug")
+        .expect("a real level")
+        .with_destination(Destination::File)
+        .with_directory(dir.path());
+    let handle = Arc::new(LogHandle::new(Some(dir.path().to_path_buf()), None, config));
+    // Policies take effect at the next segment, so they are set before the
+    // first one opens.
+    handle.set_policies(
+        SealPolicy::default(),
+        RotationPolicy {
+            max_entries: Some(25),
+            max_age_millis: None,
+        },
+    );
+    handle
+        .open(Vocabulary::shared_builtin(), at(1_700_000_000_000))
+        .expect("the segment opens");
+    let base = Arc::new(LogTracer::new(
+        handle.clone(),
+        Arc::new(Fixed(1_700_000_000_000)),
+    ));
+
+    // One shared clock reading per entry, advancing a second at a time: segment
+    // file names carry a one-second stamp, so this is what keeps the segments
+    // distinguishable and their order on disk the order they were written in.
+    let tick = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let gate = Arc::new(std::sync::Barrier::new(TENANTS as usize));
+    let threads: Vec<_> = (0..TENANTS)
+        .map(|t| {
+            let tracer = base.on_behalf_of(Principal::new(format!("urn:agent:t{t}")).expect("ok"));
+            let gate = Arc::clone(&gate);
+            let tick = Arc::clone(&tick);
+            std::thread::spawn(move || {
+                gate.wait();
+                for i in 0..PER_TENANT {
+                    let now = tick.fetch_add(1_000, Ordering::SeqCst);
+                    tracer.record(resolution(&format!("urn:traced:t{t}:{i}"), i, now));
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("a tracer thread");
+    }
+    handle
+        .close(at(tick.load(Ordering::SeqCst) + 1_000))
+        .expect("closes");
+
+    let segments = segments_on_disk(dir.path());
+    assert!(
+        segments.len() > 4,
+        "the policy really did roll the log several times: {} segment(s)",
+        segments.len()
+    );
+    let report = verify_chain(&segments, Vocabulary::builtin());
+    assert!(
+        report.ok(),
+        "★ the whole chain verifies across every rotation that happened under \
+         concurrent writers:\n{}",
+        report.render()
+    );
+    for segment in &report.segments[..report.segments.len() - 1] {
+        assert!(
+            segment.entries >= 25,
+            "★ {} holds only {} entries — a segment rolled before it was due is \
+             the signature of two writers judging the same segment due and both \
+             acting on it",
+            segment.name,
+            segment.entries
+        );
+    }
+    // Nothing was lost across the rotations, and everything is still attributed.
+    let attributed: usize = segments
+        .iter()
+        .map(|(_, text)| {
+            text.lines()
+                .filter(|line| line.contains(&format!(" {PRINCIPAL_KEY}=urn:agent:t")))
+                .count()
+        })
+        .sum();
+    assert_eq!(attributed as u64, TENANTS * PER_TENANT);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The graph face: delegation in standard terms
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_principal_transrepts_to_log_on_behalf_of_and_a_qualified_prov_delegation() {
+    let home = Scratch::new("tenant-graph");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let base = LogTracer::new(handle.clone(), Arc::new(Fixed(1_700_000_000_000)));
+    let alice = base.on_behalf_of(Principal::new("urn:agent:alice").expect("writable"));
+    alice.record(resolution("urn:traced:one", 0, 1_700_000_000_001));
+    base.record(resolution("urn:traced:two", 1, 1_700_000_000_002));
+
+    let text = captured.text();
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let (header, _) = Header::parse(&text).expect("a segment");
+    // The tenant's entry is the second line written (log:ProcessStart is first).
+    let entry = format!("{}:2", header.name);
+    let delegation = format!("{entry}:delegation");
+
+    assert!(
+        triples
+            .iter()
+            .any(|t| t.subject.to_string() == format!("<{entry}>")
+                && t.predicate.as_str() == ON_BEHALF_OF_PROPERTY
+                && t.object.to_string() == "<urn:agent:alice>"),
+        "the precise fact, ours, one triple per entry:\n{triples:#?}"
+    );
+    // ★ And the SAME fact in PROV, for a consumer that has neither a reasoner
+    // nor a copy of this vocabulary. It has to be the qualified form: PROV's
+    // prov:actedOnBehalfOf is agent-to-agent and cannot name the activity, so
+    // one instance serving three tenants would read as three blanket
+    // delegations with no way back to the entries.
+    for (subject, predicate, object) in [
+        (
+            header.instance.clone(),
+            prov("qualifiedDelegation"),
+            delegation.clone(),
+        ),
+        (delegation.clone(), RDF_TYPE.to_string(), prov("Delegation")),
+        (
+            delegation.clone(),
+            prov("agent"),
+            "urn:agent:alice".to_string(),
+        ),
+        (delegation.clone(), prov("hadActivity"), entry.clone()),
+        (
+            "urn:agent:alice".to_string(),
+            RDF_TYPE.to_string(),
+            prov("Agent"),
+        ),
+        (
+            header.instance.clone(),
+            prov("actedOnBehalfOf"),
+            "urn:agent:alice".to_string(),
+        ),
+    ] {
+        assert!(
+            triples
+                .iter()
+                .any(|t| t.subject.to_string() == format!("<{subject}>")
+                    && t.predicate.as_str() == predicate
+                    && t.object.to_string() == format!("<{object}>")),
+            "missing <{subject}> <{predicate}> <{object}>:\n{triples:#?}"
+        );
+    }
+
+    // The instance is still on every entry — both facts are real and neither
+    // replaces the other.
+    assert!(
+        triples
+            .iter()
+            .any(|t| t.subject.to_string() == format!("<{entry}>")
+                && t.predicate.as_str() == prov("wasAssociatedWith")
+                && t.object.to_string() == format!("<{}>", header.instance)),
+        "the PROCESS attribution survives the tenant one"
+    );
+    // And the principal is NOT stated as prov:wasAssociatedWith: an inference
+    // that made the two indistinguishable would undo the whole distinction.
+    assert!(
+        !triples
+            .iter()
+            .any(|t| t.predicate.as_str() == prov("wasAssociatedWith")
+                && t.object.to_string() == "<urn:agent:alice>"),
+        "the tenant and the process must not collapse into one predicate"
+    );
+
+    // The host's own entry carries none of it.
+    let own = format!("{}:3", header.name);
+    assert!(
+        !triples
+            .iter()
+            .any(|t| t.subject.to_string() == format!("<{own}>")
+                && t.predicate.as_str() == ON_BEHALF_OF_PROPERTY),
+        "an entry with no principal says nothing about one"
+    );
+}
+
+#[test]
+fn a_principal_no_rdf_parser_would_accept_cannot_reach_the_graph_in_the_first_place() {
+    // The graph face degrades an unusable IRI to a literal rather than dropping
+    // the triple — right for a segment already on disk, and the reason the
+    // constructor refuses one rather than relying on it: a degraded principal
+    // is an entry whose delegation cannot be stated at all.
+    assert!(matches!(
+        Principal::new("urn:agent:{brace}"),
+        Err(PrincipalError::NotAnRdfIri { .. })
+    ));
+    // It passes the line grammar — which is exactly why parsing the line back
+    // is not, on its own, enough.
+    assert!(crate::line::is_iri("urn:agent:{brace}"));
+}
+
+#[test]
+fn the_verify_walk_follows_the_chain_rather_than_the_file_names() {
+    // ★ The other half of the rotation fix, and the half that matters for a log
+    // ALREADY ON DISK. The writer now clamps a successor's stamp so IRI order
+    // stays chain order; a segment written before that clamp existed is on disk
+    // forever, and verifying one in name order reports a PrevMismatch on every
+    // link of a chain that is perfectly intact — the alarm that cries wolf.
+    //
+    // So: two segments whose chain is sound and whose NAMES are backwards,
+    // assembled the only way that is now possible, by writing the files
+    // directly. The `@name` is hashed into h₀, so relabelling a segment is not
+    // an option — these are genuine segments that were genuinely stamped out of
+    // order.
+    let dir = Scratch::new("verify-chain-order");
+    let config = LogConfig::default()
+        .with_instance("bug:backwards")
+        .with_level("info")
+        .expect("a real level")
+        .with_destination(Destination::File)
+        .with_directory(dir.path());
+
+    let first = Captured::default();
+    let mut writer = Writer::open_with_sink_and(
+        &config,
+        Vocabulary::shared_builtin(),
+        at(1_700_000_060_000), // the LATER stamp, on the EARLIER segment
+        first.sink(),
+        WriterOptions::default(),
+    )
+    .expect("opens");
+    writer
+        .write(message(1_700_000_061_000, "one"))
+        .expect("writes");
+    let closed = writer
+        .rotate_out(at(1_700_000_062_000), None)
+        .expect("rotates out");
+
+    let second = Captured::default();
+    let mut writer = Writer::open_with_sink_and(
+        &config,
+        Vocabulary::shared_builtin(),
+        at(1_700_000_000_000), // the EARLIER stamp, on the LATER segment
+        second.sink(),
+        WriterOptions {
+            prev: Some(Prev::Seal(closed.head.clone())),
+            ..WriterOptions::default()
+        },
+    )
+    .expect("opens");
+    writer
+        .write(message(1_700_000_001_000, "two"))
+        .expect("writes");
+    writer.close(at(1_700_000_002_000)).expect("closes");
+
+    dir.write("a.log", &first.text());
+    dir.write("b.log", &second.text());
+
+    let handle = Arc::new(LogHandle::new(Some(dir.path().to_path_buf()), None, config));
+    let kernel = kernel(handle);
+    let body = text_of(&source(&kernel, VERIFY_IRI, &[]));
+    assert!(
+        body.contains("verified 2 segment(s), 0 broken"),
+        "★ the chain is intact and must verify, however the stamps sort — \
+         `@prev` names the predecessor's seal and that is what order means \
+         here:\n{body}"
+    );
+}
+
+#[test]
+fn a_second_racer_does_not_roll_the_successor_the_first_one_just_opened() {
+    // ★ The rotation window, tested as the DECISION rather than as a race.
+    //
+    // `write` must release the state lock before rotating, and in that window a
+    // second writer can judge the same segment due. Both then call into
+    // rotation; the first rolls the segment, and the second — unless the
+    // decision is re-made under the lock — force-rolls the successor it just
+    // opened, one entry old. What the second racer calls is exactly this, so
+    // this is exactly what it must do: nothing.
+    //
+    // Stated as a unit rather than as a thread race on purpose. The race itself
+    // did not reproduce in twenty runs of the eight-tracer rotation test with
+    // the guard removed — the window between the unlock and the relock is a few
+    // instructions wide — so a test built on it would have been a test that
+    // passes either way, which is worth nothing.
+    let dir = Scratch::new("rotate-racer");
+    let config = LogConfig::default()
+        .with_instance("bug:racer")
+        .with_level("info")
+        .expect("a real level")
+        .with_destination(Destination::File)
+        .with_directory(dir.path());
+    let handle = Arc::new(LogHandle::new(Some(dir.path().to_path_buf()), None, config));
+    handle.set_policies(
+        SealPolicy::default(),
+        RotationPolicy {
+            max_entries: Some(5),
+            max_age_millis: None,
+        },
+    );
+    handle
+        .open(Vocabulary::shared_builtin(), at(1_700_000_000_000))
+        .expect("opens");
+    for i in 1..=5 {
+        handle
+            .write(message(1_700_000_000_000 + i, "filler"))
+            .expect("writes");
+    }
+    let successor = handle.open_segment().expect("a successor is open").0;
+    assert_eq!(
+        segments_on_disk(dir.path()).len(),
+        2,
+        "the policy rolled it once"
+    );
+
+    // The second racer.
+    assert!(
+        handle
+            .rotate_if_due(at(1_700_000_000_010))
+            .expect("asking is not an error")
+            .is_none(),
+        "the successor is one entry old and is not due"
+    );
+    assert_eq!(
+        handle.open_segment().expect("still open").0,
+        successor,
+        "★ and nothing rolled: a segment that rolled before it was due is a \
+         segment of two always-land markers and nothing else"
+    );
+
+    // The operator's path is unconditional, and stays so — asking for a
+    // rotation is not asking whether one is due.
+    assert!(handle
+        .rotate(at(1_700_000_000_020))
+        .expect("rotates")
+        .is_some());
+    assert_eq!(segments_on_disk(dir.path()).len(), 3);
+}
+
+#[test]
+fn a_rotation_never_stamps_a_successor_before_its_predecessor_started() {
+    // ★ The measured half of the concurrency work, and the one that was really
+    // broken. A rotation is triggered from inside a write and stamped from that
+    // entry's own time; under concurrent writers an entry's time is not
+    // monotonic, because a thread reads the clock and THEN waits for the write
+    // lock. Segments came out stamped tens of seconds out of order, and since
+    // IRI order is what `urn:log:verify`, `predecessor_of` and the restart chain
+    // all read as chain order, an intact chain verified as five broken links.
+    let dir = Scratch::new("rotate-clamp");
+    let handle = chained_handle(dir.path(), "bug:clamp", "info", 1_700_000_060_000);
+    let first = handle.open_segment().expect("open").0;
+
+    // A rotation triggered by an entry stamped a minute before the segment it is
+    // rotating even opened — a thread that read the clock early and got the lock
+    // late.
+    let second = handle
+        .rotate(at(1_700_000_000_000))
+        .expect("rotates")
+        .expect("a successor");
+    assert!(
+        second > first,
+        "★ {second} must not sort before {first}: half this crate reads IRI \
+         order as chain order"
+    );
+    let segments = segments_on_disk(dir.path());
+    assert!(
+        verify_chain(&segments, Vocabulary::builtin()).ok(),
+        "and the chain verifies in the order the file names give"
     );
 }
