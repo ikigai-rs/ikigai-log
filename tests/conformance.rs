@@ -384,8 +384,11 @@ fn a_finished_segment_conforms_and_caches_under_its_file() {
         "a finished segment is immutable under the walk: the Sink answers `closed:` and writes nothing"
     );
 
-    // By hand: the Source is cached under exactly the file's IRI — the name a
-    // watcher on the log directory must cut.
+    // By hand: the Source is cached under the file's IRI — the name a watcher on
+    // the log directory must cut. Since ikigai-core 0.1.73 the kernel also hangs
+    // every cacheable answer on its OWN name's thread (ledger #549), so the set
+    // is the file plus `log.iri` on a newer core and the file alone on an older
+    // one. Any third thread is foreign and still refused.
     let source = request(Verb::Source, &log.iri, &[]);
     assert!(
         !log.kernel.is_cached(&source, &reader()),
@@ -393,7 +396,14 @@ fn a_finished_segment_conforms_and_caches_under_its_file() {
     );
     let repr = issue(&log.kernel, source.clone(), &reader());
     let threads: Vec<String> = repr.threads().iter().map(|t| t.to_string()).collect();
-    assert_eq!(threads, [log.thread()], "the thread is the segment file");
+    assert!(
+        threads.contains(&log.thread()),
+        "the segment file is a thread: {threads:?}"
+    );
+    assert!(
+        threads.iter().all(|t| *t == log.thread() || *t == log.iri),
+        "no thread but the segment file and the segment's own name: {threads:?}"
+    );
     assert!(
         log.kernel.is_cached(&source, &reader()),
         "a finished segment is served from the cache the second time"
