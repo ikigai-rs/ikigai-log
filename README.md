@@ -201,8 +201,10 @@ Transreption is **O(segment)** — every line is parsed on every read. Over a
 
 Two things follow, and both are honest rather than flattering. **A finished
 segment caches and a live one does not**: a segment whose last entry is
-`log:ProcessStop` *or `log:Rotation`* will never be appended to, so it is
-cacheable under a golden thread on its file; anything else — this process's open
+`log:ProcessStop` *or `log:Rotation`*, sealed, with nothing after it, will never
+be appended to, so it is cacheable under a golden thread on its file (a marker
+followed by more entries, or by no seal, is not how the writer ends a segment,
+and caching it would be the one mistake a reader cannot take back); anything else — this process's open
 segment, or one whose process died — stays live, because caching a live tail
 would be a lie about the one fact a reader came for, and a watcher cutting a
 thread per appended entry is thrash rather than freshness.
@@ -284,12 +286,24 @@ legitimate, sanctioned omission — an attacker who can do it opens a hole the
 chain then blesses as perfectly intact. So verification also checks that **every
 gap is bracketed by an always-land marker**:
 
-* two adjacent segments at different levels require a `log:LevelChange` in one of
-  them;
+* two adjacent segments at different levels require a **sealed**
+  `log:LevelChange` in one of them that records **that** change — its `from=` and
+  `to=` must lead from one segment's level to the other's, in one step or
+  several. A bracket about some other change explains nothing, and one in an
+  unsealed tail is committed to no checkpoint, so anyone could have appended it;
 * entry sequence numbers must be dense, because emission advances the counter
   only for entries actually written — a level-filtered entry consumes no sequence
   number, so **a jump means lines were removed, not filtered**;
-* seal coverage must be contiguous from 1, so a deleted checkpoint is visible;
+* seal coverage must be contiguous from 1, so a deleted checkpoint is visible —
+  and each seal's `first-last` must be the run of entries its hash actually
+  covers. The range is in no hash and the signature covers only the hash, but
+  every entry line states its own `seq=` and every line is chained, so the range
+  is checked against the entries and never believed on its own: widening it is
+  how an unsealed tail used to be made to look sealed;
+* **nothing follows an orderly end.** The writer ends a segment by writing
+  `log:ProcessStop` or `log:Rotation` and sealing it at once, so an entry past
+  that marker, or a marker no seal covers, was appended afterwards, and it is
+  `BROKEN` — whatever class the appended line claims to be;
 * a rotation marker's `next=` must name the segment that follows. `@prev` catches
   a segment removed from the *middle* — the one after it still points at what
   should have been there — but nothing points forward at the **last** segment, so
@@ -309,6 +323,16 @@ And two things it does **not** establish, said plainly rather than implied:
 An unmarked end or an unsealed tail is reported as `noted`, not `BROKEN`. A
 crashed process is not a tamperer, a file alone cannot tell the two apart, and a
 verifier that cried wolf on every daemon restart would be a verifier nobody read.
+The exception is the tail of a segment that **ended**: an orderly end is sealed
+at once, so a tail after one is not what a crash leaves. (The one honest path to
+it is a final seal that failed to write — a full disk at the last line — and that
+is reported `BROKEN` too, because the forged ending looks exactly the same and is
+the one a tamperer reaches for.)
+
+A segment file whose header will not parse is reported as
+`segment <path> BROKEN unreadable` in every walk. It belongs to no chain anyone
+can name, and leaving it out would be the verifier vouching for what it could not
+read.
 
 ## Attributed per process, not per machine
 

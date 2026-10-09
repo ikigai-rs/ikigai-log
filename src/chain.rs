@@ -36,6 +36,18 @@
 //! must be contiguous ([`Finding::SealRangeGap`]), and the **final** seal of a
 //! segment is what the next segment's `@prev` names.
 //!
+//! ★ **The range is bound THROUGH the entries, not by the signature.** A seal's
+//! `first-last` is in no hash and the signature covers only the tagged hash, so
+//! on its own the range is a number anyone can edit — and widening `last` is how
+//! an unsealed tail used to be made to look sealed. But every entry line carries
+//! its own `seq=`, every line is chained, and the hash a seal states commits to
+//! the line holding the sequence it covers. So the verifier checks the range
+//! against that line ([`Finding::SealRangeMismatch`]) and from then on believes
+//! only the entries. That is why the signature was deliberately NOT widened to
+//! cover the range: it would be a format change buying nothing the chained
+//! `seq=` column does not already give, and every segment already on disk
+//! verifies exactly as before.
+//!
 //! ## 3. ★ The chain spans rotations
 //!
 //! This is the layer earlier designs missed. If each file chains from scratch,
@@ -62,14 +74,22 @@
 //! So verification also checks that **every gap is BRACKETED by an always-land
 //! marker**. Concretely, today:
 //!
-//! * two adjacent segments at different levels require a `log:LevelChange` (or a
-//!   `log:ConfigChange` naming `key=level`) in one of them —
-//!   [`Finding::UnbracketedLevelChange`];
+//! * two adjacent segments at different levels require a sealed
+//!   `log:LevelChange` (or a `log:ConfigChange` naming `key=level`) in one of
+//!   them, recording that change — [`Finding::UnbracketedLevelChange`];
 //! * entry sequence numbers must be dense within a segment, because
 //!   [`Writer::write`](crate::Writer::write) advances the counter only for
 //!   entries it actually emits — a level-filtered entry consumes no sequence
 //!   number, so a jump means lines were REMOVED, not filtered;
-//! * seal coverage must be contiguous from 1.
+//! * seal coverage must be contiguous from 1, and each seal's range must be the
+//!   run of entries its hash actually covers — [`Finding::SealRangeMismatch`];
+//! * **nothing follows an orderly end.** The writer ends a segment by writing
+//!   `log:ProcessStop` or `log:Rotation` and sealing it at once, so entries past
+//!   that marker, or a marker no seal covers, were appended afterwards —
+//!   [`Finding::AfterTheEnd`], breaking, where a crashed tail is only noted;
+//! * a level bracket must say WHICH change it records (its `from=`/`to=` must
+//!   lead from one segment's level to the next) and must sit under a seal — one
+//!   in an unsealed tail is committed to nothing.
 //!
 //! ## ★ What verification does NOT establish
 //!
@@ -355,7 +375,11 @@ impl RotationPolicy {
 /// One thing verification found. Every variant names the range it is about,
 /// because localization IS the product: "this segment is broken" is not an
 /// answer, "between sequence 2001 and 3000 of this segment" is.
+///
+/// `#[non_exhaustive]` because what verify checks grows with what audits find,
+/// and a new check should not be a breaking change for every exhaustive `match`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Finding {
     /// The segment's bytes do not parse as a segment.
     Malformed {
@@ -375,6 +399,24 @@ pub enum Finding {
         stated: String,
         /// What the entries actually hash to.
         recomputed: String,
+    },
+    /// A seal states a range the entries do not support: its hash is the chain at
+    /// sequence `covered` — the last entry before the seal line — but its range
+    /// says `first`-`last`.
+    ///
+    /// ★ The range is not signed and is not an input to any hash, so on its own it
+    /// is a number anyone can edit. It is bound to the evidence THROUGH the
+    /// entries: every entry line carries its `seq=`, the line is chained, and the
+    /// hash the seal states commits to the line holding `covered`. A range that
+    /// disagrees with that line was edited, and an edited range is how a tail gets
+    /// hidden (widen `last` and the unsealed entries look sealed).
+    SealRangeMismatch {
+        /// First sequence the seal claims.
+        first: u64,
+        /// Last sequence the seal claims.
+        last: u64,
+        /// The sequence its hash actually commits to.
+        covered: u64,
     },
     /// Seal coverage is not contiguous — a checkpoint line was removed.
     SealRangeGap {
@@ -422,9 +464,15 @@ pub enum Finding {
         /// The successor that is not here.
         successor: String,
     },
-    /// Two adjacent segments ran at different levels and nothing recorded the
-    /// change. **The omission check**: the chain would otherwise bless the hole
-    /// as perfectly intact.
+    /// Two adjacent segments ran at different levels and no SEALED entry in
+    /// either records that change. **The omission check**: the chain would
+    /// otherwise bless the hole as perfectly intact.
+    ///
+    /// A bracket counts only when its `from=`/`to=` lead from the earlier
+    /// segment's level to the later one's (a run of recorded changes may get
+    /// there in several steps), and only when a seal covers it: a bracket in an
+    /// unsealed tail is committed to nothing and could have been appended by
+    /// anyone.
     UnbracketedLevelChange {
         /// The earlier segment.
         from_segment: String,
@@ -434,6 +482,29 @@ pub enum Finding {
         to_segment: String,
         /// Its level.
         to: String,
+    },
+    /// The segment ended in an orderly way — a `log:ProcessStop` or `log:Rotation`
+    /// at sequence `ended_at` — and yet sequences `from`-`to` sit past its end or
+    /// past its final seal.
+    ///
+    /// **Breaking, because the writer cannot produce it.** An orderly end writes
+    /// its marker, seals it at once, and writes nothing after: [`Writer::close`]
+    /// and [`Writer::rotate_out`] both end that way. So entries after an end
+    /// marker, or an end marker no seal covers, were appended afterwards. The one
+    /// honest path to the second shape is a seal that failed to write (a full
+    /// disk at the last line), and that is reported here too: a file alone cannot
+    /// tell that apart from a forged ending, and the forged ending is the one a
+    /// tamperer reaches for, because it is what makes a segment read as finished.
+    ///
+    /// [`Writer::close`]: crate::Writer::close
+    /// [`Writer::rotate_out`]: crate::Writer::rotate_out
+    AfterTheEnd {
+        /// The sequence of the first end marker.
+        ended_at: u64,
+        /// First sequence past the end or past the final seal.
+        from: u64,
+        /// Last such sequence.
+        to: u64,
     },
     /// The segment's last entry is neither an orderly stop nor a rotation, so the
     /// process died. **Noted, not breaking**: a crash is not tampering, and a
@@ -485,6 +556,21 @@ impl fmt::Display for Finding {
                 "seal {first}-{last} states {stated} but the entries hash to {recomputed} — \
                  the alteration is between sequence {first} and {last}"
             ),
+            Finding::SealRangeMismatch {
+                first,
+                last,
+                covered,
+            } => write!(
+                f,
+                "seal {first}-{last} states a range its hash does not cover: the hash is the \
+                 chain at sequence {covered} — the range was edited"
+            ),
+            Finding::AfterTheEnd { ended_at, from, to } => write!(
+                f,
+                "the segment ended at sequence {ended_at}, yet sequences {from}-{to} lie past \
+                 that end or its final seal: an orderly end is sealed at once and nothing \
+                 follows it, so these were appended afterwards"
+            ),
             Finding::SealRangeGap { after, next_first } => write!(
                 f,
                 "seal coverage jumps from {after} to {next_first}: a checkpoint line is missing"
@@ -520,7 +606,8 @@ impl fmt::Display for Finding {
             } => write!(
                 f,
                 "the level went from {from} (<{from_segment}>) to {to} (<{to_segment}>) with no \
-                 log:LevelChange to bracket it: the gap that opened is unexplained"
+                 sealed log:LevelChange recording that change: the gap that opened is \
+                 unexplained"
             ),
             Finding::UnmarkedEnd { last_class } => match last_class {
                 Some(class) => write!(
@@ -565,17 +652,35 @@ pub struct SegmentReport {
     /// FORWARD link in the chain, and the only thing that can notice a chain
     /// truncated at its head.
     pub successor: Option<String>,
-    /// Whether this segment RECORDS a level change — the always-land marker that
-    /// brackets the gap one opens. Carried on the report rather than checked
-    /// inline because the check spans two segments: the config write lands its
-    /// entry in whatever segment was open at the time, and the change takes
-    /// effect at the next one, so either end may hold the bracket.
-    pub records_level_change: bool,
+    /// The level changes this segment RECORDS under a seal, as `(from, to)`
+    /// absolute level IRIs, in the order they were written — the always-land
+    /// markers that bracket the gap a change opens. Carried on the report rather
+    /// than checked inline because the check spans two segments: the config
+    /// write lands its entry in whatever segment was open at the time and the
+    /// change takes effect at the next one, while a writer opening at a level
+    /// its predecessor did not run at records the change in the NEW segment, so
+    /// either end may hold the bracket.
+    ///
+    /// Only sealed brackets are here. One in an unsealed tail is committed to no
+    /// checkpoint, and trusting it would let anyone explain a gap by appending a
+    /// line.
+    pub level_changes: Vec<(String, String)>,
     /// Everything found.
     pub findings: Vec<Finding>,
 }
 
 impl SegmentReport {
+    /// Whether this segment records any sealed level change.
+    pub fn records_level_change(&self) -> bool {
+        !self.level_changes.is_empty()
+    }
+
+    /// Whether these bytes had no readable header at all — so nothing about the
+    /// segment but the finding that says so is known.
+    pub fn is_unreadable(&self) -> bool {
+        self.instance.is_empty() && self.level.is_empty()
+    }
+
     /// Whether the segment verified — no BREAKING finding. See
     /// [`Finding::is_breaking`] for why that is not "no findings".
     pub fn ok(&self) -> bool {
@@ -626,6 +731,15 @@ impl ChainReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for report in &self.segments {
+            if report.is_unreadable() {
+                // No header, so no level, instance, chain link or head to state
+                // — and stating defaults for them would read as facts.
+                out.push_str(&format!("segment {} BROKEN unreadable\n", report.name));
+                for line in report.render_findings().lines() {
+                    out.push_str(&format!("  {line}\n"));
+                }
+                continue;
+            }
             out.push_str(&format!(
                 "segment {} {} entries={} seals={} level={} prev={}",
                 report.name,
@@ -692,24 +806,7 @@ pub fn verify_segment(
 ) -> SegmentReport {
     let (header, offset) = match Header::parse(text) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            return SegmentReport {
-                name: String::new(),
-                instance: String::new(),
-                level: String::new(),
-                prev: Prev::Genesis,
-                head: String::new(),
-                entries: 0,
-                seals: 0,
-                signed_with: Vec::new(),
-                successor: None,
-                records_level_change: false,
-                findings: vec![Finding::Malformed {
-                    line: 1,
-                    detail: error.to_string(),
-                }],
-            }
-        }
+        Err(error) => return unreadable(String::new(), error.to_string()),
     };
 
     let mut findings = Vec::new();
@@ -718,10 +815,19 @@ pub fn verify_segment(
     let mut seals = 0usize;
     let mut signed_with: Vec<String> = Vec::new();
     let mut last_seq: Option<u64> = None;
+    // The POSITION of the last entry read: its own `seq=`, or its ordinal in a
+    // hand-assembled segment that writes none. A seal's range is checked
+    // against this, so the range is only ever believed where the chained
+    // entries agree with it.
+    let mut position = 0u64;
     let mut sealed_through = 0u64;
     let mut head = chain.head().to_string();
     let mut last_class: Option<String> = None;
-    let mut level_bracketed = false;
+    // The first orderly end marker, by position. Nothing may follow it.
+    let mut ended_at: Option<u64> = None;
+    // `(position, from, to)` for every level bracket, sealed or not — which of
+    // them a seal covers is only known once the last seal has been read.
+    let mut brackets: Vec<(u64, String, String)> = Vec::new();
     let mut successor: Option<String> = None;
     // By PROPERTY, not by column name: `next` is what the built-in vocabulary
     // binds log:successor to, and a module that rebound it is still understood.
@@ -741,8 +847,13 @@ pub fn verify_segment(
                 // tampering is caught along with everything else.
                 chain.advance(raw.trim_end_matches(['\n', '\r']));
                 check_sequence(&entry, &mut last_seq, &mut findings);
-                if brackets_a_level_change(&entry, vocab) {
-                    level_bracketed = true;
+                position = stated_seq(&entry).unwrap_or(entries);
+                if let Some((from, to)) = level_bracket(&entry, vocab) {
+                    brackets.push((position, from, to));
+                }
+                let ends = is_an_end(&entry.class, vocab);
+                if ends && ended_at.is_none() {
+                    ended_at = Some(position);
                 }
                 successor = successor_key
                     .as_deref()
@@ -762,6 +873,17 @@ pub fn verify_segment(
                         next_first: seal.first,
                     });
                 }
+                // ★ The range, against the entries. The hash commits to the
+                // chain at `position` — the last entry before this line — and
+                // that entry's line states its own `seq=`, so a range that
+                // says anything else was edited after the fact.
+                if seal.last != position {
+                    findings.push(Finding::SealRangeMismatch {
+                        first: seal.first,
+                        last: seal.last,
+                        covered: position,
+                    });
+                }
                 if seal.hash != chain.head() {
                     findings.push(Finding::SealMismatch {
                         first: seal.first,
@@ -777,7 +899,10 @@ pub fn verify_segment(
                         }
                     }
                 }
-                sealed_through = seal.last;
+                // What the seal actually covers, not what it says: everything
+                // computed from here on (the unsealed tail, which brackets are
+                // trusted) rests on the entries, never on an editable number.
+                sealed_through = position;
                 head = seal.hash;
             }
             Ok(Line::Blank) | Ok(Line::Comment(_)) => {}
@@ -792,23 +917,33 @@ pub fn verify_segment(
         }
     }
 
-    // An orderly end is a stop or a rotation. A rotation ends a segment exactly
-    // as finally as a process stop does — that is what makes a rotated segment
-    // immutable, and therefore cacheable.
-    let ended = last_class.as_deref().is_some_and(|class| {
-        vocab.is_a(class, PROCESS_STOP_CLASS) || vocab.is_a(class, ROTATION_CLASS)
-    });
-    if !ended {
-        findings.push(Finding::UnmarkedEnd {
-            last_class: last_class.clone(),
-        });
-    }
-    if let Some(last) = last_seq {
-        if last > sealed_through {
-            findings.push(Finding::UnsealedTail {
-                from: sealed_through + 1,
-                to: last,
+    // An orderly end is a stop or a rotation, and it is FINAL: the writer seals
+    // it at once and writes nothing after it. That is what makes an ended
+    // segment immutable, and therefore cacheable — and it is why anything past
+    // the end, or an end no seal covers, is breaking rather than noted.
+    match ended_at {
+        Some(end) if position > end || position > sealed_through => {
+            findings.push(Finding::AfterTheEnd {
+                ended_at: end,
+                // Whichever comes first: the entry after the end marker, or the
+                // first entry no seal covers (which may be the marker itself).
+                from: (end + 1).min(sealed_through + 1),
+                to: position,
             });
+        }
+        Some(_) => {}
+        None => {
+            findings.push(Finding::UnmarkedEnd {
+                last_class: last_class.clone(),
+            });
+            // Entries past the final seal of a segment that never ended: a
+            // crash, and a crash is not tampering. Noted.
+            if position > sealed_through {
+                findings.push(Finding::UnsealedTail {
+                    from: sealed_through + 1,
+                    to: position,
+                });
+            }
         }
     }
 
@@ -836,26 +971,93 @@ pub fn verify_segment(
         seals,
         signed_with,
         successor,
-        records_level_change: level_bracketed,
+        level_changes: brackets
+            .into_iter()
+            .filter(|(at, _, _)| *at <= sealed_through)
+            .map(|(_, from, to)| (from, to))
+            .collect(),
         findings,
     }
 }
 
-/// Whether an entry is the always-land marker that brackets a level change.
-fn brackets_a_level_change(entry: &Entry, vocab: &Vocabulary) -> bool {
-    if vocab.is_a(&entry.class, LEVEL_CHANGE_CLASS) {
-        return true;
+/// The report for bytes that are not a segment at all — no header to read a
+/// name, an instance or a level from. `name` is whatever the caller can call it
+/// by (a file path, when it came from a directory).
+pub(crate) fn unreadable(name: String, detail: String) -> SegmentReport {
+    SegmentReport {
+        name,
+        instance: String::new(),
+        level: String::new(),
+        prev: Prev::Genesis,
+        head: String::new(),
+        entries: 0,
+        seals: 0,
+        signed_with: Vec::new(),
+        successor: None,
+        level_changes: Vec::new(),
+        findings: vec![Finding::Malformed { line: 1, detail }],
     }
-    // A module's own config-change class counts when it names the level column —
-    // the bracket is the RECORDED fact, not one particular class name.
-    vocab.is_a(&entry.class, CONFIG_CHANGE_CLASS) && entry.get("key") == Some("level")
+}
+
+/// Whether a class ends a segment for good: `log:ProcessStop` or `log:Rotation`,
+/// or a module's subclass of either.
+pub(crate) fn is_an_end(class: &str, vocab: &Vocabulary) -> bool {
+    vocab.is_a(class, PROCESS_STOP_CLASS) || vocab.is_a(class, ROTATION_CLASS)
+}
+
+/// An entry's own `seq=`, when it states one that parses.
+fn stated_seq(entry: &Entry) -> Option<u64> {
+    entry.get("seq").and_then(|s| s.parse::<u64>().ok())
+}
+
+/// The level change an entry records, as `(from, to)` absolute IRIs — when it is
+/// the always-land marker that brackets one AND it says which change it was.
+///
+/// A bracket that does not state both ends is not counted: "the level changed"
+/// cannot explain a particular gap, and one that is about a different change is
+/// exactly how a recorded change used to mask an unrecorded one.
+fn level_bracket(entry: &Entry, vocab: &Vocabulary) -> Option<(String, String)> {
+    let records = vocab.is_a(&entry.class, LEVEL_CHANGE_CLASS)
+        // A module's own config-change class counts when it names the level
+        // column — the bracket is the RECORDED fact, not one class name.
+        || (vocab.is_a(&entry.class, CONFIG_CHANGE_CLASS) && entry.get("key") == Some("level"));
+    if !records {
+        return None;
+    }
+    let from = crate::config::level_iri(entry.get("from")?)?;
+    let to = crate::config::level_iri(entry.get("to")?)?;
+    Some((from, to))
+}
+
+/// Whether the recorded changes lead from `from` to `to`, in any number of steps.
+///
+/// A path rather than one matching pair, because a segment can record two
+/// changes before its successor opens (info → debug, then debug → error), and
+/// rather than a replay in order, because the two ends of a boundary record
+/// independently: the earlier segment records what an operator asked for and
+/// the later one records what it opened at.
+fn bracketed(from: &str, to: &str, changes: &[&(String, String)]) -> bool {
+    let mut reached = vec![from.to_string()];
+    let mut frontier = vec![from.to_string()];
+    while let Some(level) = frontier.pop() {
+        for (step_from, step_to) in changes.iter().map(|c| (&c.0, &c.1)) {
+            if step_from == &level && !reached.contains(step_to) {
+                if step_to == to {
+                    return true;
+                }
+                reached.push(step_to.clone());
+                frontier.push(step_to.clone());
+            }
+        }
+    }
+    false
 }
 
 fn check_sequence(entry: &Entry, last_seq: &mut Option<u64>, findings: &mut Vec<Finding>) {
     // Only entries that state a sequence are checked. A hand-assembled segment
     // without `seq=` still transrepts (the transreptor supplies an ordinal), so
     // demanding one here would refuse a file the rest of the crate accepts.
-    let Some(seq) = entry.get("seq").and_then(|s| s.parse::<u64>().ok()) else {
+    let Some(seq) = stated_seq(entry) else {
         return;
     };
     if let Some(previous) = *last_seq {
@@ -893,11 +1095,15 @@ pub fn verify_chain(segments: &[(String, String)], vocab: &Vocabulary) -> ChainR
         );
         // The bracket for a level change may be recorded in EITHER segment: the
         // config write lands its entry in whatever segment was open at the time,
-        // and the change takes effect at the next one.
+        // and the change takes effect at the next one. It must name THIS change.
         if let Some(previous) = reports.last() {
+            let changes: Vec<&(String, String)> = previous
+                .level_changes
+                .iter()
+                .chain(report.level_changes.iter())
+                .collect();
             if previous.level != report.level
-                && !previous.records_level_change
-                && !report.records_level_change
+                && !bracketed(&previous.level, &report.level, &changes)
             {
                 report.findings.push(Finding::UnbracketedLevelChange {
                     from_segment: previous.name.clone(),
