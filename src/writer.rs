@@ -508,6 +508,15 @@ impl Writer {
             prev: options.prev.unwrap_or(Prev::Genesis),
         };
 
+        // The header names the graph and the agent every entry is attributed
+        // to, so RDF must accept all three IRIs in it — the line grammar's
+        // `is_iri` is looser, and a segment whose @name or @instance oxrdf
+        // refuses is a segment with no graph face at all, for its whole life.
+        for iri in [&header.name, &header.instance, &header.level] {
+            if oxrdf::NamedNode::new(iri.as_str()).is_err() {
+                return Err(WriteError::Render(RenderError::NotAnIri(iri.clone())));
+            }
+        }
         let rendered = header.render()?;
         for line in rendered.lines() {
             sink.write_line(line).map_err(|e| io_error(&path, e))?;

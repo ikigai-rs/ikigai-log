@@ -157,7 +157,9 @@ pub use config::{
     instance_iri, level_iri, Bound, ConfigError, Destination, LogConfig, Patch, RotationPatch,
     SealPatch, DEFAULT_INSTANCE_NAME, DEFAULT_LEVEL, INSTANCE_NS, STEM,
 };
-pub use endpoints::{LogHandle, CAP_CONFIG, CAP_READ, CAP_WRITE, CONFIG_IRI, WRITE_IRI};
+pub use endpoints::{
+    LogHandle, CAP_CONFIG, CAP_READ, CAP_WRITE, CONFIG_IRI, RESERVED_COLUMNS, WRITE_IRI,
+};
 pub use graph::{
     to_triples, to_turtle, GraphError, Options, LOG_MEDIA_TYPE, SIG_NS, TURTLE_MEDIA_TYPE,
 };

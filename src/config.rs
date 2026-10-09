@@ -721,7 +721,15 @@ impl Patch {
             }
         }
         if let Some(instance) = &self.instance {
-            if !is_iri(&instance_iri(instance)) {
+            // RDF's test as well as the line grammar's: the name lands in every
+            // segment's @instance and @name, and a header oxrdf refuses is a
+            // segment with no graph face for its whole life.
+            let iri = instance_iri(instance);
+            let name = iri.strip_prefix(INSTANCE_NS).unwrap_or(&iri);
+            if !is_iri(&iri)
+                || oxrdf::NamedNode::new(iri.as_str()).is_err()
+                || oxrdf::NamedNode::new(format!("urn:log:{name}:1970-01-01T00-00-00Z")).is_err()
+            {
                 return Err(ConfigError::BadValue {
                     key: "instance",
                     value: instance.clone(),

@@ -111,6 +111,12 @@ log:undeclaredKey a rdf:Property ;
     rdfs:label "undeclaredKey" ;
     rdfs:comment "A key this entry carried that no property claims via log:keyName. Hygiene signal, counted by the same standing CONSTRUCT that counts log:Message." .
 
+log:unreadableIri a rdf:Property ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "unreadableIri" ;
+    rdfs:comment "A column of this entry's line that the line grammar accepted as an IRI and RDF does not (the grammar's test is deliberately looser), stated as `class=<token>` or `subject=<token>`. The entry still lands: an unreadable class types it log:Entry only, and an unreadable subject is stated as a plain literal on log:subject. One odd line must not take a whole segment's graph down with it, and silently dropping the line would be the hole this log exists to prevent. urn:log:write refuses such tokens at the door, so this flags a segment written by hand or by an older writer." .
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Levels — the threshold is a vocabulary fact, and so is the comparison
 # ═══════════════════════════════════════════════════════════════════════════

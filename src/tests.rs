@@ -1161,10 +1161,9 @@ fn the_typed_write_takes_its_fields_in_the_lines_own_tail_syntax() {
             &[
                 ("class", "log:Resolution"),
                 ("subject", "urn:calendar:today"),
-                (
-                    "fields",
-                    r#"span=7 dur=12 cap=urn:cap:fs cap=urn:cap:net msg="two words""#,
-                ),
+                // `cap=` is the kernel's column and the door refuses it (ledger
+                // #904); a repeated key is shown with one a caller owns.
+                ("fields", r#"span=7 dur=12 tag=fs tag=net msg="two words""#),
             ],
         ),
         &Capability::root(),
@@ -1183,9 +1182,9 @@ fn the_typed_write_takes_its_fields_in_the_lines_own_tail_syntax() {
     assert_eq!(entry.get("span"), Some("7"));
     assert_eq!(entry.get("dur"), Some("12"));
     assert_eq!(
-        entry.all("cap").collect::<Vec<_>>(),
-        vec!["urn:cap:fs", "urn:cap:net"],
-        "a repeated key is a list — one resolution under two capability scopes"
+        entry.all("tag").collect::<Vec<_>>(),
+        vec!["fs", "net"],
+        "a repeated key is a list, in written order"
     );
     assert_eq!(
         entry.get("msg"),
