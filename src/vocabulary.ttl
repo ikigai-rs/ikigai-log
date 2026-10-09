@@ -504,7 +504,7 @@ log:effective a rdf:Property ;
     rdfs:domain log:ConfigChange ;
     rdfs:range xsd:string ;
     rdfs:label "effective" ;
-    rdfs:comment "When the change takes hold — `next-segment`, always, because a segment has exactly one level for its whole life. Written on the entry rather than left implicit so that a reader of the line alone, grepped out of its file, still knows the change did not apply to the entries around it." .
+    rdfs:comment "When the change takes hold, and never inside a segment. `next-segment` for a segment's own properties (the level and the seal and rotation cadences), because a segment has exactly one level and one cadence for its whole life; `next-process-start` for where the log is written and under what name (destination, directory, instance), because a rotation stays with its writer and its instance lock; `this-segment` on the log:LevelChange a writer lands when it opens at a level its predecessor did not run at, recording the change where it took effect. Written on the entry rather than left implicit so that a reader of the line alone, grepped out of its file, still knows the change did not apply to the entries around it." .
 
 log:count a rdf:Property ;
     log:keyName "count" ;

@@ -78,9 +78,13 @@ use crate::segments::{
 use crate::segments::{TransreptEndpoint, TRANSREPT_IRI};
 #[cfg(not(target_family = "wasm"))]
 use crate::vocabulary::CHAIN_BROKEN_CLASS;
+#[cfg(not(target_family = "wasm"))]
+use crate::vocabulary::ERROR_CLASS;
 use crate::vocabulary::{Vocabulary, CAPABILITY_DENIED_CLASS, LOG_NS, MESSAGE_CLASS};
 #[cfg(not(target_family = "wasm"))]
 use crate::vocabulary::{CONFIG_CHANGE_CLASS, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS};
+#[cfg(not(target_family = "wasm"))]
+use crate::writer::Predecessor;
 use crate::writer::{LineSink, WriteError, Writer, WriterOptions};
 
 /// Appending an entry.
@@ -174,6 +178,8 @@ struct State {
     /// rotate into and the whole trigger is `cfg`'d out there.
     #[cfg(not(target_family = "wasm"))]
     rotating: bool,
+    /// Why the last attempted rotation failed, until one succeeds.
+    rotation_error: Option<String>,
 }
 
 impl LogHandle {
@@ -195,6 +201,7 @@ impl LogHandle {
                 signer: None,
                 #[cfg(not(target_family = "wasm"))]
                 rotating: false,
+                rotation_error: None,
             }),
         }
     }
@@ -354,6 +361,24 @@ impl LogHandle {
     /// crate mounts no validator. Said here rather than implied, because
     /// "rotation validates" would otherwise read as more than it is.
     ///
+    /// ★ **Never fatal.** Everything that can make the successor fail to open —
+    /// a level the vocabulary does not define, a name RDF would refuse, a
+    /// directory that will not take a file — is judged BEFORE the predecessor is
+    /// sealed, and a failure there puts the predecessor back, still writing. A
+    /// rotation that sealed its predecessor and then could not open a successor
+    /// would leave the log closed, which is the outcome a tamperer (or a typo)
+    /// wants. The residue is an I/O failure writing the successor's first lines
+    /// into the file that was just created for it: rare, and loud.
+    ///
+    /// **A rotation stays where the writer is.** The successor lands in the
+    /// predecessor's own directory, under its own instance name and lock; a
+    /// `directory`, `instance` or `destination` change waits for the next process
+    /// start, as its documentation says. Moving on a rotation used to leave the
+    /// instance lock behind in the old directory, so a second process could take
+    /// the same name in the new one while this one wrote there (#904 item 8). The
+    /// level and the cadences do take effect at the rotation: they are the
+    /// segment's, and the new segment records the level change itself.
+    ///
     /// `Ok(None)` when nothing is open, or when the destination has no files to
     /// roll — a console segment has no successor to open and rotating it would
     /// mean discarding the chain rather than continuing it.
@@ -365,45 +390,47 @@ impl LogHandle {
         };
         // ★ A successor may not be STAMPED before its predecessor started.
         //
-        // Segment IRIs end in a UTC stamp and half this crate reads IRI order as
-        // chain order — `urn:log:verify`'s walk, `predecessor_of`, the newest
-        // segment a restart chains from. Rotation is triggered from inside a
-        // write and stamped from that entry's own time, and under concurrent
-        // writers an entry's time is NOT monotonic: a thread reads the clock,
-        // then waits for the write lock, and can land its entry — and trigger a
-        // rotation — long after a thread that read the clock later. Measured
-        // 2026-09-13 with eight tracers: segments stamped tens of seconds out of
-        // order, `urn:log:verify` reporting five `PrevMismatch`es on a chain that
-        // was perfectly intact, and a `log:ChainBroken` entry written during
-        // rotation about a predecessor that was not the predecessor.
+        // Segment IRIs end in a UTC stamp and name order is the fallback for
+        // chain order — `urn:log:verify`'s walk and the restart's chain tail
+        // both use it when the links do not form one chain. Rotation is
+        // triggered from inside a write and stamped from that entry's own time,
+        // and under concurrent writers an entry's time is NOT monotonic: a
+        // thread reads the clock, then waits for the write lock, and can land
+        // its entry — and trigger a rotation — long after a thread that read the
+        // clock later. Measured 2026-09-13 with eight tracers: segments stamped
+        // tens of seconds out of order, `urn:log:verify` reporting five
+        // `PrevMismatch`es on a chain that was perfectly intact, and a
+        // `log:ChainBroken` entry written during rotation about a predecessor
+        // that was not the predecessor.
         //
         // Clamping costs the stamp its exactness (it can name the instant the
         // predecessor opened rather than the instant the trigger entry was
         // stamped) and buys back an invariant the whole module rests on. Two
         // rotations inside one second then share a base and `reserve_segment`
-        // disambiguates them in order.
+        // disambiguates them in order. The restart path clamps the same way.
         let now = now.max(writer.header().started);
         // Judged on the WRITER, not on the config: the config can have been
         // repointed since the segment opened, and what decides whether there is
         // something to roll is whether this writer has a file — a console
         // segment has no successor to open, and rotating it would mean
         // discarding the chain rather than continuing it.
-        if writer.path().is_none() {
+        let Some(directory) = writer
+            .path()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+        else {
             state.writer = Some(writer);
             return Ok(None);
-        }
+        };
         let vocabulary = writer.vocabulary().clone();
         let name = crate::writer::instance_name_of(writer.instance()).to_string();
         // Everything that can fail while the predecessor is still WRITABLE runs
-        // first, and puts it back: a rotation that could not reserve a file must
-        // leave the log logging, not closed.
-        let directory = match crate::writer::resolve_directory(&state.config) {
-            Some(directory) => directory,
-            None => {
-                state.writer = Some(writer);
-                return Err(WriteError::NoDirectory);
-            }
-        };
+        // first, and puts it back: a rotation that could not open a successor
+        // must leave the log logging, not closed.
+        if let Err(e) = Writer::check_opens(&state.config, &vocabulary, now, &name) {
+            state.writer = Some(writer);
+            return Err(e);
+        }
         let reserved = match crate::writer::reserve_segment(&directory, &name, now) {
             Ok(reserved) => reserved,
             Err(e) => {
@@ -417,6 +444,11 @@ impl LogHandle {
         // stamp, and a marker naming the undisambiguated IRI would point at a
         // segment that does not exist.
         let successor = reserved.iri.clone();
+        // What the predecessor followed, and what it ran at — read before it is
+        // consumed, for the verify below and the successor's own bracket.
+        let before = writer.predecessor().cloned();
+        let level = writer.level().to_string();
+        let started = writer.header().started;
         let closed = writer.rotate_out(now, Some(&successor))?;
 
         // VERIFY, between sealing and opening: the segment just sealed is final
@@ -427,7 +459,9 @@ impl LogHandle {
         // would be verifying our own arithmetic — it cannot fail. What can fail
         // is the segment BEFORE it, edited on disk while this process ran, and
         // the LINK between the two. `verify_chain` over the pair checks both
-        // chains, the `@prev` link, and the level bracket, in one call.
+        // chains, the `@prev` link, and the level bracket, in one call. The
+        // segment before is the one this writer actually followed, recorded at
+        // open — not whichever file sorts just before it by name.
         //
         // Bounded at two on purpose: walking all of history on every rotation
         // would make rotation cost grow with the log. The full walk is
@@ -438,11 +472,14 @@ impl LogHandle {
             .and_then(|path| std::fs::read_to_string(path).ok());
         let verdict = sealed.map(|sealed| {
             let mut walk = Vec::new();
-            if let Some((name, path)) =
-                crate::segments::predecessor_of(&directory, &closed.instance, &closed.segment)
+            if let Some(Predecessor {
+                name,
+                path: Some(path),
+                ..
+            }) = &before
             {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    walk.push((name, text));
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    walk.push((name.clone(), text));
                 }
             }
             walk.push((closed.segment.clone(), sealed));
@@ -467,6 +504,12 @@ impl LogHandle {
             name,
             lock,
             reserved,
+            Some(Predecessor {
+                name: closed.segment.clone(),
+                level,
+                started,
+                path: closed.path.clone(),
+            }),
         )?;
 
         if let Some(report) = verdict {
@@ -496,7 +539,20 @@ impl LogHandle {
 
         let opened = writer.segment().to_string();
         state.writer = Some(writer);
+        state.rotation_error = None;
         Ok(Some(opened))
+    }
+
+    /// Why the last rotation this handle attempted failed, while the segment it
+    /// was rolling is still being written — `None` once one succeeds.
+    ///
+    /// A write that triggers a failed rotation still returns `Ok` (the entry
+    /// landed; `Err` from a write means it did not), so this is where a host
+    /// that wants the failure without reading the log finds it. The log itself
+    /// records it too: one `log:Error` entry with `reason=rotation-failed` per
+    /// run of failures.
+    pub fn rotation_error(&self) -> Option<String> {
+        self.state.lock().expect("log state").rotation_error.clone()
     }
 
     /// Whether a segment is being written right now.
@@ -532,10 +588,14 @@ impl LogHandle {
     /// that rotated a segment nothing was writing to would replace a quiet file
     /// with a quieter one.
     ///
-    /// If the rotation itself fails, the **entry is already durable** and this
-    /// returns the rotation's error anyway. Loud on purpose: a failed rotation
-    /// usually means the log has stopped being written at all, and swallowing it
-    /// would make the one subsystem whose job is to notice things fail silently.
+    /// **`Err` means the entry did not land**, and nothing else does. If the
+    /// rotation the entry triggered fails, the entry is already durable, so this
+    /// returns `Ok` and the failure goes where it can be found without being
+    /// mistaken for a loss: one `log:Error reason=rotation-failed` entry in the
+    /// segment still being written, and [`rotation_error`](Self::rotation_error)
+    /// on the handle. It used to return the rotation's error, and the tracer
+    /// read that as a dropped entry — counting losses that never happened and
+    /// writing `log:Dropped` markers that said so (#904 item 10).
     pub fn write(&self, entry: Entry) -> std::result::Result<Option<u64>, WriteError> {
         Ok(self.write_landed(entry)?.map(|(_, seq)| seq))
     }
@@ -572,9 +632,38 @@ impl LogHandle {
         // `rotate_if_due`.
         #[cfg(not(target_family = "wasm"))]
         if _rotation_due {
-            self.rotate_if_due(now)?;
+            if let Err(e) = self.rotate_if_due(now) {
+                // ★ The entry LANDED, so this write is not an error: `Err` from
+                // a write means the entry did not land, and a caller (the tracer
+                // above all) that read a rotation failure as a lost entry counted
+                // drops that never happened and wrote `log:Dropped` markers that
+                // lied (#904 item 10). The failure is recorded instead — once per
+                // run of failures, in the log it is about, and on the handle.
+                self.note_rotation_failure(now, &e);
+            }
         }
         Ok(seq)
+    }
+
+    /// Record a rotation that failed: on the handle for
+    /// [`rotation_error`](Self::rotation_error), and as one `log:Error` entry in
+    /// the segment still being written — the first time only, until a rotation
+    /// succeeds, because a failing rotation is retried on every write and one
+    /// entry per write would bury the log in its own complaint.
+    #[cfg(not(target_family = "wasm"))]
+    fn note_rotation_failure(&self, now: Timestamp, error: &WriteError) {
+        let mut state = self.state.lock().expect("log state");
+        let first = state.rotation_error.is_none();
+        state.rotation_error = Some(error.to_string());
+        if !first {
+            return;
+        }
+        if let Some(writer) = state.writer.as_mut() {
+            let entry = Entry::new(now, ERROR_CLASS, writer.segment().to_string())
+                .with("reason", "rotation-failed")
+                .with("msg", error.to_string());
+            let _ = writer.write(entry);
+        }
     }
 
     /// [`rotate`](Self::rotate), but only when the segment that is open **now**
@@ -878,7 +967,7 @@ pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
                  markers (every always-land class: stops, rotations, level changes, seals, \
                  denials) and the columns it writes itself (seq, principal, cap, denied, pid, \
                  configured, next) are refused. The segment's level is fixed for its whole life, \
-                 so a level change takes effect at the next process start.",
+                 so a level change takes effect at the next segment.",
             )
             .verb(Verb::Meta)
             .action(
@@ -1024,20 +1113,40 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
 
     let mut change = Patch::default();
     if let Some(level) = opt(inv, "level") {
-        if level_iri(level).is_none() {
+        // Two refusals, one shape: a spelling that is no level at all, and a
+        // well-formed level the vocabulary does not place on the dial. The
+        // second used to be accepted, persisted, and then fail at the next
+        // rotation — which sealed the open segment, could not open a successor,
+        // and left the log CLOSED for the rest of the process (#904 item 5). A
+        // typo is caught where it is typed.
+        let refusal = match level_iri(level) {
+            None => Some("not a level name, a log: CURIE, or an absolute IRI".to_string()),
+            Some(iri) => {
+                let vocabulary = handle.vocabulary();
+                vocabulary.rank(&iri).is_none().then(|| {
+                    format!(
+                        "not a level this vocabulary defines (it knows: {})",
+                        vocabulary
+                            .levels()
+                            .filter(|(_, rank)| *rank >= 0)
+                            .map(|(iri, _)| iri.strip_prefix(LOG_NS).unwrap_or(iri))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+            }
+        };
+        if let Some(reason) = refusal {
             // Rejected, and the rejection lands: under any future `locked` mode
             // this entry is the evidence that a change did not take.
             let _ = handle.write(
                 Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI)
                     .with("to", level)
-                    .with(
-                        "reason",
-                        "not a level name, a log: CURIE, or an absolute IRI",
-                    ),
+                    .with("reason", reason.clone()),
             );
             return Err(Error::InvalidArgument {
                 name: "level".to_string(),
-                detail: format!("{level:?} is not a level name, a log: CURIE, or an absolute IRI"),
+                detail: format!("{level:?} is {reason}"),
             });
         }
         change.level = Some(level.to_string());
@@ -1108,12 +1217,15 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     // key that actually changed — a write that restates a value is not a change
     // and inventing an entry for it would dilute the ones that are.
     let mut landed = Vec::new();
+    let mut changed = Vec::new();
     let mut record = |class: &str, key: &str, from: String, to: String| {
+        let when = effective(key);
+        changed.push((key.to_string(), when));
         let entry = Entry::new(stamp, class, CONFIG_IRI)
             .with("key", key)
             .with("from", from)
             .with("to", to)
-            .with("effective", "next-segment")
+            .with("effective", when)
             .with("file", target.display().to_string());
         if handle.write(entry).is_ok() {
             landed.push(key.to_string());
@@ -1197,17 +1309,44 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
         }
     }
 
-    // Said in the response, because it is the part an operator gets wrong: T2
-    // has no rotation, and a segment has exactly one level for its whole life,
-    // so this is recorded now and effective when the process next starts.
+    // Said in the response, per key, because it is the part an operator gets
+    // wrong: a segment has exactly one level and one cadence for its whole life,
+    // so those take hold at the next segment (a rotation or a restart), while
+    // where the log is written and under what name wait for the next process
+    // start — a rotation stays with its writer and its instance lock.
     let mut body = format!("wrote {}\n", target.display());
-    body.push_str("effective at next process start (a segment's level is fixed for its life)\n");
+    for (key, when) in &changed {
+        body.push_str(&format!(
+            "{key}: effective at the {}\n",
+            when.replace('-', " ")
+        ));
+    }
+    if changed.is_empty() {
+        body.push_str("nothing changed: every value stated is the value in force\n");
+    }
     if !landed.is_empty() {
         body.push_str(&format!("recorded: {}\n", landed.join(", ")));
     } else if !handle.is_open() {
         body.push_str("no segment is open, so nothing was recorded in the log\n");
     }
     Ok(plain(body))
+}
+
+/// When a change to `key` takes hold, as the `effective=` value it records.
+///
+/// A segment's own properties — its level and its two cadences — change at the
+/// next segment, whether a rotation or a restart opens it. Where the log is
+/// written and who it is attributed to — `destination`, `directory`, `instance`
+/// — change at the next process start: a rotation continues in its writer's
+/// directory under its writer's name and instance lock, because moving the
+/// segments without the lock let a second process take the same name in the
+/// new directory while this one wrote there (#904 item 8).
+#[cfg(not(target_family = "wasm"))]
+fn effective(key: &str) -> &'static str {
+    match key {
+        "destination" | "directory" | "instance" => "next-process-start",
+        _ => "next-segment",
+    }
 }
 
 /// One cadence argument as the [`crate::Bound`] it states, or `None` when the
@@ -1256,10 +1395,13 @@ pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
                  log.toml ⊕ {app}.log.toml, plus whether a segment is open right now. Source \
                  serves the effective config (as=text/turtle for the graph face); Sink changes \
                  it, writes the highest-precedence layer file, and lands an always-land \
-                 log:LevelChange or log:ConfigChange. Every change is RECORDED NOW and \
-                 EFFECTIVE AT NEXT PROCESS START: a segment has exactly one level and one \
-                 cadence for its whole life, which is what lets a verifier reason per sealed \
-                 segment instead of tracking transitions inside sealed content.",
+                 log:LevelChange or log:ConfigChange. Every change is RECORDED NOW and takes \
+                 effect at a boundary, never inside a segment: the level and the seal and \
+                 rotation cadences at the NEXT SEGMENT (a rotation or a process start), \
+                 destination, directory and instance at the NEXT PROCESS START. A segment has \
+                 exactly one level and one cadence for its whole life, which is what lets a \
+                 verifier reason per sealed segment. A level the vocabulary does not define \
+                 is refused, and the refusal lands as log:LevelChangeRejected.",
             )
             .verb(Verb::Meta)
             .action(

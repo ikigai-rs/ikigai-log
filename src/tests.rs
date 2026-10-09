@@ -1312,8 +1312,10 @@ fn a_config_write_lands_its_always_land_entry_at_every_level_and_persists() {
         "the file it touched: {body}"
     );
     assert!(
-        body.contains("effective at next process start"),
-        "T2 has no rotation, and a segment's level is fixed for its life: {body}"
+        body.contains("level: effective at the next segment")
+            && body.contains("destination: effective at the next process start"),
+        "a segment's level is fixed for its life, and a rotation stays where its \
+         writer is: {body}"
     );
 
     // Persisted to the HIGHEST-precedence layer, or the change could be
@@ -2862,15 +2864,20 @@ fn a_bracketed_gap_verifies_and_an_unexplained_one_does_not() {
     // chain is tamper-evident and NOT omission-evident: it proves nothing was
     // ALTERED and cannot prove nothing was LEFT OUT. Lowering the level is
     // sanctioned omission, and the chain would bless the hole as perfectly intact.
-    for bracketed in [true, false] {
-        let dir = Scratch::new(if bracketed {
+    //
+    // A level change through a handle is ALWAYS recorded now, by one of two
+    // brackets: the `urn:log:config` write lands one in the segment open at the
+    // time, and the writer that opens at a different level lands its own in the
+    // new segment and seals it (#904 item 13). Both runs below verify.
+    for recorded_by_the_endpoint in [true, false] {
+        let dir = Scratch::new(if recorded_by_the_endpoint {
             "bracketed"
         } else {
-            "unexplained"
+            "writer-bracketed"
         });
         let handle = chained_handle(dir.path(), "bug:level", "debug", 1_700_000_000_000);
         handle.write(message(1_700_000_001_000, "at debug")).ok();
-        if bracketed {
+        if recorded_by_the_endpoint {
             // What a `urn:log:config` write lands: always-land, in the segment
             // that was open when the change was made, effective at the next one.
             handle
@@ -2895,27 +2902,56 @@ fn a_bracketed_gap_verifies_and_an_unexplained_one_does_not() {
             .expect("a file destination rotates");
         handle.close(at(1_700_000_061_000)).expect("closes");
 
-        let report = verify_chain(&segments_on_disk(dir.path()), Vocabulary::builtin());
-        let unbracketed = report.segments.iter().any(|s| {
-            s.findings
-                .iter()
-                .any(|f| matches!(f, Finding::UnbracketedLevelChange { .. }))
-        });
-        if bracketed {
-            assert!(
-                report.ok() && !unbracketed,
-                "a level change that left a marker is EXPLAINED absence:\n{}",
-                report.render()
-            );
-        } else {
-            assert!(
-                unbracketed && !report.ok(),
-                "★ the level dropped from debug to info and nothing recorded it — \
-                 the hashes all agree, and that is exactly the point:\n{}",
-                report.render()
-            );
-        }
+        let segments = segments_on_disk(dir.path());
+        let report = verify_chain(&segments, Vocabulary::builtin());
+        assert!(
+            report.ok(),
+            "a level change that left a marker is EXPLAINED absence:\n{}",
+            report.render()
+        );
+        assert!(
+            segments[1].1.contains("effective=this-segment"),
+            "the successor records the change it opened with, whoever asked for it:\n{}",
+            segments[1].1
+        );
     }
+
+    // The unexplained case needs a writer that does not know its predecessor —
+    // the sink path, chained by hand — because every handle-driven change is
+    // now recorded by one bracket or the other.
+    let (mut debug, debug_lines) = writer_at("debug");
+    debug.write(message(1, "at debug")).expect("writes");
+    let closed = debug.close(at(2)).expect("closes");
+    let info_lines = Captured::default();
+    let info = Writer::open_with_sink_and(
+        &config_at("info"),
+        Vocabulary::shared_builtin(),
+        at(60_000),
+        info_lines.sink(),
+        crate::WriterOptions {
+            prev: Some(Prev::Seal(closed.head)),
+            ..crate::WriterOptions::default()
+        },
+    )
+    .expect("opens");
+    info.close(at(61_000)).expect("closes");
+    let report = verify_chain(
+        &[
+            (String::from("a"), debug_lines.text()),
+            (String::from("b"), info_lines.text()),
+        ],
+        Vocabulary::builtin(),
+    );
+    assert!(
+        !report.ok()
+            && report.segments.iter().any(|s| s
+                .findings
+                .iter()
+                .any(|f| matches!(f, Finding::UnbracketedLevelChange { .. }))),
+        "★ the level dropped from debug to info and nothing recorded it — the hashes \
+         all agree, and that is exactly the point:\n{}",
+        report.render()
+    );
 }
 
 #[test]
@@ -5129,8 +5165,8 @@ fn a_rotation_never_stamps_a_successor_before_its_predecessor_started() {
     // entry's own time; under concurrent writers an entry's time is not
     // monotonic, because a thread reads the clock and THEN waits for the write
     // lock. Segments came out stamped tens of seconds out of order, and since
-    // IRI order is what `urn:log:verify`, `predecessor_of` and the restart chain
-    // all read as chain order, an intact chain verified as five broken links.
+    // IRI order is what `urn:log:verify` and the restart chain fall back to
+    // as chain order, an intact chain verified as five broken links.
     let dir = Scratch::new("rotate-clamp");
     let handle = chained_handle(dir.path(), "bug:clamp", "info", 1_700_000_060_000);
     let first = handle.open_segment().expect("open").0;
