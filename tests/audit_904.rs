@@ -1318,3 +1318,104 @@ fn r11_an_operator_level_edit_does_not_break_verification() {
         "and sealed it at once:\n{newest}"
     );
 }
+
+// =====================================================================================
+// #904 item 11 — config serialization through real writers
+// =====================================================================================
+
+/// [C-R6] A value that is not printable ASCII round-trips through the layer file
+/// urn:log:config writes.
+#[test]
+fn r6_a_config_write_leaves_a_file_that_parses() {
+    let dir = Scratch::new("r6");
+    let home = Scratch::new("r6home");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        file_config(dir.path(), "info"),
+    ));
+    let odd = format!(
+        "{}/logs\u{200b}\"quoted\" and \\ back",
+        dir.path().display()
+    );
+    issue(
+        &kernel(handle.clone()),
+        req(
+            Verb::Sink,
+            ikigai_log::CONFIG_IRI,
+            &[("directory", odd.as_str())],
+        ),
+        &Capability::scoped([ikigai_log::CAP_CONFIG]),
+    )
+    .expect("the write is accepted");
+    let reread = ikigai_log::load::complete_in(home.path(), None, LogConfig::default())
+        .expect("urn:log:config wrote a log.toml it can read back");
+    assert_eq!(reread.directory, Some(PathBuf::from(&odd)));
+
+    // And the plain face, which is meant to paste back as a config file.
+    let face = issue(
+        &kernel(handle),
+        req(Verb::Source, ikigai_log::CONFIG_IRI, &[]),
+        &Capability::scoped([ikigai_log::CAP_READ]),
+    )
+    .unwrap();
+    let pasted = ikigai_log::config::Patch::parse(&face, None).expect("the face parses as TOML");
+    assert_eq!(pasted.directory.as_deref(), Some(odd.as_str()));
+}
+
+/// [C-R6b] The config's graph face is Turtle, whatever the directory holds.
+#[test]
+fn r6b_the_config_graph_face_is_turtle() {
+    let dir = Scratch::new("r6b");
+    let odd = dir.path().join("logs\u{200b} \"and\" \\ more\nlines");
+    let config = file_config(dir.path(), "info").with_directory(&odd);
+    let handle = Arc::new(LogHandle::new(None, None, config));
+    let body = issue(
+        &kernel(handle),
+        req(
+            Verb::Source,
+            ikigai_log::CONFIG_IRI,
+            &[("as", "text/turtle")],
+        ),
+        &Capability::scoped([ikigai_log::CAP_READ]),
+    )
+    .unwrap();
+    let parsed: Vec<oxrdf::Triple> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(body.as_bytes())
+        .map(|q| q.map(oxrdf::Triple::from))
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| panic!("urn:log:config as=text/turtle is not Turtle: {e}\n{body}"));
+    assert!(
+        parsed.iter().any(|t| t.predicate.as_str() == log("directory")
+            && matches!(&t.object, oxrdf::Term::Literal(l) if l.value() == odd.display().to_string())),
+        "the directory survives exactly:\n{body}"
+    );
+}
+
+// =====================================================================================
+// #904 item 15 — segment and lock files are the owner's
+// =====================================================================================
+
+/// [H-8] Segment and lock files are created 0600: entries carry principals and
+/// capability scopes.
+#[cfg(unix)]
+#[test]
+fn h8_segment_and_lock_files_are_created_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("h8");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    handle.rotate(at(T0 + 1_000)).unwrap().expect("rotated");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+        let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{} is mode {mode:o}",
+            entry.path().display()
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "two segments and the lock");
+}

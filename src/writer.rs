@@ -969,11 +969,7 @@ pub(crate) fn reserve_segment(
             format!("{base}-{attempt}")
         };
         let path = directory.join(format!("{}-{stamp}.log", slug(name)));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        match owner_only(std::fs::OpenOptions::new().write(true).create_new(true)).open(&path) {
             Ok(file) => {
                 let iri = segment_iri(&crate::config::instance_iri(name), stamp.clone());
                 return Ok(Reserved {
@@ -995,6 +991,25 @@ pub(crate) fn reserve_segment(
     Err(WriteError::SegmentExists(
         directory.join(format!("{}-{base}.log", slug(name))),
     ))
+}
+
+/// Create files readable and writable by their owner only (0600), where the
+/// platform has modes.
+///
+/// A segment carries principals, capability scopes and whatever prose a caller
+/// wrote, and the lock names the process holding an instance; neither is anyone
+/// else's to read. Created that way rather than chmod-ed after, so there is no
+/// window in which the file exists world-readable. Applies to files this writer
+/// CREATES — a lock file left by an older version keeps its mode — and the
+/// directory is the operator's: a host that wants it closed says so.
+#[cfg(not(target_family = "wasm"))]
+fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
 }
 
 /// The bare instance NAME behind an instance IRI — what a file is named after.
@@ -1108,15 +1123,17 @@ fn try_claim(directory: &std::path::Path, name: &str) -> Result<Option<std::fs::
     use io::Write;
 
     let path = directory.join(format!("{}.lock", slug(name)));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| WriteError::Io {
-            path: Some(path.clone()),
-            message: e.to_string(),
-        })?;
+    let file = owner_only(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false),
+    )
+    .open(&path)
+    .map_err(|e| WriteError::Io {
+        path: Some(path.clone()),
+        message: e.to_string(),
+    })?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
