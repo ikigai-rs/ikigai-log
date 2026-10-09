@@ -787,7 +787,7 @@ fn triple(subject: &NamedNode, predicate: &str, object: Term) -> Triple {
 /// Only the prefixes the output uses are bound. `rdf:` and `rdfs:` are not among
 /// them: `a` is the only rdf: term emitted and Turtle spells it `a`, and an
 /// unused `@prefix` line is noise in an artifact whose value is being diffable.
-fn serialize(triples: &[Triple]) -> Result<String, GraphError> {
+pub(crate) fn serialize(triples: &[Triple]) -> Result<String, GraphError> {
     let mut serializer = RdfSerializer::from_format(RdfFormat::Turtle)
         .with_prefix("log", LOG_NS)
         .and_then(|s| s.with_prefix("prov", PROV_NS))

@@ -345,15 +345,59 @@ gap is bracketed by an always-land marker**:
   truncating a chain at its head would otherwise be free, and the head is the
   recent past.
 
-And two things it does **not** establish, said plainly rather than implied:
+### What `urn:log:verify` proves, and what it cannot
 
-* **Seal signatures are stated, not checked.** Checking one is `urn:sign:verify`
-  with the public key, and this crate resolves no key.
+Said plainly, because a verifier that implies more than it checks is worse than
+none. Against an **unkeyed** reader of the files, an `OK` means:
+
+* every entry line under a seal hashes to that seal's stated chain head, and the
+  seal's range is the run of entries that hash covers;
+* sequence numbers are dense and seal coverage is contiguous, so no line or seal
+  was removed from the middle of a sealed run;
+* each segment's `@prev` names the stated head of the segment before it, so a
+  segment was not replaced or removed from the middle of a chain, and a
+  rotation's `next=` names the segment after it, so a chain was not cut at a
+  rotated head;
+* nothing follows an orderly end, and every change of level between adjacent
+  segments is recorded by a sealed bracket naming that change;
+* every segment file in the directory was read — one it could not read is
+  reported, not skipped.
+
+What it does **not** establish:
+
+* **The chain is unkeyed SHA-256.** Anyone who can write the files and knows the
+  format can recompute every hash from an edit to the head and write matching
+  seals — including `@prev` of every later segment. Tamper-evidence against that
+  writer comes only from **signatures**, and seal signatures are **stated, not
+  checked** here: `signed=` lists the algorithms the seals name, and checking one
+  is `urn:sign:verify` with the public key, which this crate never resolves. An
+  external anchor of the head (a signed or published seal) is the other answer,
+  and nothing here makes one.
 * **The level is verified as *recorded*, not as *authentic*.** A `log:LevelChange`
   brackets the gap and the chain proves that entry was not altered afterwards,
   but nothing stops whoever holds the writer from lowering the level and honestly
   recording that they did. A level MAC (`locked` mode) needs a key the
   application itself cannot hold, and that key does not exist yet.
+* **A crashed tail cannot be told from an appended one.** Entries past the final
+  seal of a segment that never ended are `noted`, because that is what a crash
+  leaves — so the newest segment, or any segment whose process died, can be
+  extended, or rewritten back to its last seal, without a `BROKEN`. The seal
+  cadence (1,000 entries or 60 s by default) bounds how much.
+* **Deleting the oldest segments looks like retention.** The first segment
+  listed is not checked against a predecessor that is not there, so removing
+  history from the old end is invisible to the walk. (There is no retention or
+  `log:Tombstone` yet to make it distinguishable.)
+* **Comment lines are not chained.** A `#` line that is not a seal carries
+  nothing into the graph and nothing into the hash, so one can be added or
+  removed freely. A repeated header directive is not refused either; the header
+  enters the chain as its parsed, canonical form, so a second `@level` that
+  changes what the header SAYS breaks every seal, and one that restates it is
+  noise.
+* **A partial line is possible on a full disk.** Each entry is one `writeln` and
+  one flush, not an atomic append, so ENOSPC mid-line can leave a fragment that
+  the next line continues; verify then reports the damaged line.
+* **`urn:log:transrept` has no capability gate.** It is a pure function of the
+  bytes a caller already holds, and that is deliberate.
 
 An unmarked end or an unsealed tail is reported as `noted`, not `BROKEN`. A
 crashed process is not a tamperer, a file alone cannot tell the two apart, and a
@@ -368,6 +412,15 @@ A segment file whose header will not parse is reported as
 `segment <path> BROKEN unreadable` in every walk. It belongs to no chain anyone
 can name, and leaving it out would be the verifier vouching for what it could not
 read.
+
+## Files are the owner's
+
+Segment and lock files are created **0600**: a segment carries principals,
+capability scopes and whatever prose a caller wrote, and none of it is any other
+local user's to read. They are created that way rather than chmod-ed afterwards,
+so no window exists in which one is world-readable. Files an older version
+created keep their mode, and the directory is the operator's — a host that wants
+it closed says so.
 
 ## Attributed per process, not per machine
 
@@ -527,7 +580,11 @@ environment variables anywhere (that channel is banned here: an environment
 variable is a setting no config file records and no read reports). Every change
 lands an always-land `log:LevelChange` or `log:ConfigChange` — a destination
 change more urgently than a level change, since lowering the level makes a hole
-while repointing the destination silences the log entirely.
+while repointing the destination silences the log entirely. Both faces, and the
+layer file a change writes, go through real writers — the `toml` crate's string
+encoding and the RDF serializer — so a directory holding any character a path may
+hold still reads back: Rust's `{:?}` looks like a TOML string and is not one, and
+it once wrote a `log.toml` the log could not read.
 
 A change is **recorded now and takes effect at a boundary, never inside a
 segment**. A segment has exactly one level for its whole life, which is what lets
@@ -653,10 +710,12 @@ entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
 **Not built, and the pitch must not outrun it**:
 
 * **Seal signatures are not checked here, and the level is not authenticated.**
-  Verification proves entries were not altered and that gaps are *recorded*; it
-  does not prove a signature is good (that is `urn:sign:verify` with a key this
-  crate never holds) and it does not prove a level change was involuntary (that
-  needs a MAC over a key the application cannot hold — the helper-app work).
+  Verification proves entries were not altered by anyone who did not recompute
+  the unkeyed chain, and that gaps are *recorded*; it does not prove a signature
+  is good (that is `urn:sign:verify` with a key this crate never holds) and it
+  does not prove a level change was involuntary (that needs a MAC over a key the
+  application cannot hold — the helper-app work). The full list is under "What
+  `urn:log:verify` proves, and what it cannot" above.
 * **A segment is only greppable at the granularity it is queryable.**
   Transreption is O(segment); there is no index, and `urn:log:segments` is a
   directory listing rather than a catalog.

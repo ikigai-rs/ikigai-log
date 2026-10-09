@@ -101,6 +101,12 @@
 //! that does not exist yet. Verify says the gap is explained; it does not say the
 //! explanation was involuntary.
 //!
+//! **The chain is unkeyed.** Anyone who can write the files and knows this
+//! construction can recompute every hash from an edit forward and write seals
+//! that match; what stops that writer is a SIGNATURE, checked somewhere that
+//! holds the public key, or an external anchor of the head. Without either, an
+//! `OK` means "not altered by anyone who did not recompute the chain".
+//!
 //! **Signatures are stated, not checked.** A seal's `<alg>:<base64>` token is
 //! reported and carried into the graph as `sig:algorithm` + `sig:value`, and
 //! checking it is `urn:sign:verify`'s job with the public key — this crate holds

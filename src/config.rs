@@ -78,6 +78,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use oxrdf::{Literal, NamedNode, Term, Triple};
 use serde::Deserialize;
 
 use crate::chain::{RotationPolicy, SealPolicy};
@@ -207,9 +208,30 @@ impl Bound {
     fn render(&self) -> String {
         match self {
             Bound::Count(n) => n.to_string(),
-            Bound::Word(w) => format!("{w:?}"),
+            Bound::Word(w) => toml_string(w),
         }
     }
+}
+
+/// A string as the TOML basic string that says it — through the `toml` crate's
+/// own encoder, never Rust's `{:?}`.
+///
+/// `{:?}` LOOKS like a TOML string and is not one: it writes U+200B as
+/// `\u{200b}`, which TOML does not read, so a layer file `urn:log:config` wrote
+/// could not be read back and took the log's configuration with it (#904
+/// item 11).
+///
+/// ```
+/// # use ikigai_log::config::Patch;
+/// let patch = Patch {
+///     directory: Some("/var/log/odd\u{200b} \"name\"".to_string()),
+///     ..Patch::default()
+/// };
+/// let back = Patch::parse(&patch.to_toml(), None).unwrap();
+/// assert_eq!(back.directory, patch.directory);
+/// ```
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
 }
 
 /// The `[seal]` table of one layer.
@@ -534,15 +556,24 @@ impl LogConfig {
     /// configuration, and a face that round-trips must not carry it.
     pub fn to_toml(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("level = {:?}\n", short_level(&self.level)));
-        out.push_str(&format!("destination = {:?}\n", self.destination.as_str()));
+        out.push_str(&format!(
+            "level = {}\n",
+            toml_string(short_level(&self.level))
+        ));
+        out.push_str(&format!(
+            "destination = {}\n",
+            toml_string(self.destination.as_str())
+        ));
         if let Some(directory) = &self.directory {
             out.push_str(&format!(
-                "directory = {:?}\n",
-                directory.display().to_string()
+                "directory = {}\n",
+                toml_string(&directory.display().to_string())
             ));
         }
-        out.push_str(&format!("instance = {:?}\n", self.instance_name()));
+        out.push_str(&format!(
+            "instance = {}\n",
+            toml_string(self.instance_name())
+        ));
         // The tables come last and the scalars first — in TOML a bare key after
         // a table header belongs to that table, so this ordering is what makes
         // the face round-trip rather than a matter of taste.
@@ -577,69 +608,157 @@ impl LogConfig {
     /// from the configured one, since a name already held gets disambiguated
     /// rather than refused.
     pub fn to_turtle(&self, subject: &str, open_segment: Option<(&str, &str)>) -> String {
-        let mut out = String::new();
-        out.push_str("@prefix log:  <https://ikigai-rs.dev/ns/log#> .\n");
-        out.push_str("@prefix prov: <http://www.w3.org/ns/prov#> .\n");
-        out.push_str("@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .\n\n");
-        out.push_str(&format!("<{subject}> a log:Config ;\n"));
-        out.push_str(&format!("    log:level <{}> ;\n", self.level));
-        out.push_str(&format!(
-            "    log:destination <{}> ;\n",
-            self.destination.iri()
-        ));
+        // ★ Triples, serialized by the RDF writer — never format strings. A
+        // directory is an operator's path and may hold anything a path may,
+        // and `{:?}` is Rust escaping, not Turtle's: a U+200B wrote a face no
+        // Turtle parser would read (#904 item 11). An IRI that RDF refuses is
+        // stated as the literal it is rather than bracketed into broken syntax.
+        let Ok(config) = NamedNode::new(subject) else {
+            return format!("# not an IRI: {}\n", subject.escape_debug());
+        };
+        let mut out: Vec<Triple> = Vec::new();
+        let mut say = |s: &NamedNode, p: &str, o: Term| {
+            out.push(Triple::new(s.clone(), log_term(p), o));
+        };
+        let typed = |s: &NamedNode, class: &str| {
+            Triple::new(
+                s.clone(),
+                NamedNode::new_unchecked(RDF_TYPE),
+                log_term(class),
+            )
+        };
+
+        let seal = node(&format!("{subject}#seal"));
+        let rotation = node(&format!("{subject}#rotation"));
+        say(&config, "level", resource(&self.level));
+        say(&config, "destination", resource(&self.destination.iri()));
         if let Some(directory) = &self.directory {
-            out.push_str(&format!(
-                "    log:directory {:?} ;\n",
-                directory.display().to_string()
-            ));
+            say(
+                &config,
+                "directory",
+                Literal::new_simple_literal(directory.display().to_string()).into(),
+            );
         }
-        out.push_str(&format!("    log:instance <{}> ;\n", self.instance));
-        out.push_str(&format!("    log:sealCadence <{subject}#seal> ;\n"));
-        out.push_str(&format!("    log:rotationCadence <{subject}#rotation> ;\n"));
+        say(&config, "instance", resource(&self.instance));
+        if let Some(seal) = &seal {
+            say(&config, "sealCadence", seal.clone().into());
+        }
+        if let Some(rotation) = &rotation {
+            say(&config, "rotationCadence", rotation.clone().into());
+        }
         for layer in &self.layers {
-            out.push_str(&format!(
-                "    log:configLayer {:?} ;\n",
-                layer.display().to_string()
-            ));
+            say(
+                &config,
+                "configLayer",
+                Literal::new_simple_literal(layer.display().to_string()).into(),
+            );
         }
         match open_segment {
-            Some((name, _)) => out.push_str(&format!("    log:currentSegment <{name}> .\n\n")),
-            None => out.push_str("    log:currentSegment log:none .\n\n"),
+            Some((name, _)) => say(&config, "currentSegment", resource(name)),
+            None => say(&config, "currentSegment", log_term("none").into()),
         }
-        out.push_str(&cadence_turtle(
-            &format!("{subject}#seal"),
-            [
-                (
-                    "everyEntries",
-                    (self.seals.every_entries != u64::MAX).then_some(self.seals.every_entries),
-                ),
-                (
-                    "everyMillis",
-                    (self.seals.every_millis != u64::MAX).then_some(self.seals.every_millis),
-                ),
-            ],
-        ));
-        out.push_str(&cadence_turtle(
-            &format!("{subject}#rotation"),
-            [
-                ("everyEntries", self.rotation.max_entries),
-                ("everyMillis", self.rotation.max_age_millis),
-            ],
-        ));
-        out.push_str(&format!("<{}> a log:Instance .\n", self.instance));
-        if let Some((name, instance)) = open_segment {
-            out.push_str(&format!(
-                "<{name}> a log:Segment ;\n    log:level <{}> ;\n    prov:wasAttributedTo <{instance}> .\n",
-                self.level
-            ));
-            if instance != self.instance {
-                out.push_str(&format!(
-                    "<{instance}> a log:Instance ;\n    log:configuredInstance <{}> .\n",
-                    self.instance
+        let mut triples = vec![typed(&config, "Config")];
+        triples.append(&mut out);
+
+        let cadences = [
+            (
+                seal,
+                [
+                    (
+                        "everyEntries",
+                        (self.seals.every_entries != u64::MAX).then_some(self.seals.every_entries),
+                    ),
+                    (
+                        "everyMillis",
+                        (self.seals.every_millis != u64::MAX).then_some(self.seals.every_millis),
+                    ),
+                ],
+            ),
+            (
+                rotation,
+                [
+                    ("everyEntries", self.rotation.max_entries),
+                    ("everyMillis", self.rotation.max_age_millis),
+                ],
+            ),
+        ];
+        for (cadence, bounds) in cadences {
+            let Some(cadence) = cadence else { continue };
+            triples.push(typed(&cadence, "Cadence"));
+            for (property, value) in bounds {
+                triples.push(Triple::new(
+                    cadence.clone(),
+                    match value {
+                        Some(_) => log_term(property),
+                        // Explicitly off, stated positively: an omitted property
+                        // and a disabled trigger must not read alike.
+                        None => log_term("unbounded"),
+                    },
+                    match value {
+                        Some(value) => Term::Literal(Literal::new_typed_literal(
+                            value.to_string(),
+                            NamedNode::new_unchecked(XSD_INTEGER),
+                        )),
+                        None => Term::NamedNode(log_term(property)),
+                    },
                 ));
             }
         }
-        out
+
+        if let Some(instance) = node(&self.instance) {
+            triples.push(typed(&instance, "Instance"));
+        }
+        if let Some((name, instance)) = open_segment {
+            if let Some(segment) = node(name) {
+                triples.push(typed(&segment, "Segment"));
+                triples.push(Triple::new(
+                    segment.clone(),
+                    log_term("level"),
+                    resource(&self.level),
+                ));
+                triples.push(Triple::new(
+                    segment,
+                    NamedNode::new_unchecked(PROV_WAS_ATTRIBUTED_TO),
+                    resource(instance),
+                ));
+            }
+            if instance != self.instance {
+                if let Some(effective) = node(instance) {
+                    triples.push(typed(&effective, "Instance"));
+                    triples.push(Triple::new(
+                        effective,
+                        log_term("configuredInstance"),
+                        resource(&self.instance),
+                    ));
+                }
+            }
+        }
+        crate::graph::serialize(&triples)
+            .unwrap_or_else(|e| format!("# the graph would not serialize: {e}\n"))
+    }
+}
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const PROV_WAS_ATTRIBUTED_TO: &str = "http://www.w3.org/ns/prov#wasAttributedTo";
+
+/// A `log:` term. The local names are this module's constants, so they are
+/// always valid IRIs.
+fn log_term(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{LOG_NS}{local}"))
+}
+
+/// A node, when RDF accepts the IRI.
+fn node(iri: &str) -> Option<NamedNode> {
+    NamedNode::new(iri).ok()
+}
+
+/// An object that names a resource: the IRI when RDF accepts it, otherwise the
+/// literal it is — never a bracketed string a Turtle parser would refuse.
+fn resource(iri: &str) -> Term {
+    match NamedNode::new(iri) {
+        Ok(node) => node.into(),
+        Err(_) => Literal::new_simple_literal(iri).into(),
     }
 }
 
@@ -649,22 +768,6 @@ impl LogConfig {
 /// trigger into a number no operator would recognize as one.
 fn seal_bound(value: u64) -> Bound {
     Bound::from_optional((value != u64::MAX).then_some(value))
-}
-
-/// One cadence, as the graph face states it: a skolemized node under the
-/// config's own IRI, its live bounds as integers and its disabled ones named by
-/// `log:unbounded`.
-fn cadence_turtle(node: &str, bounds: [(&str, Option<u64>); 2]) -> String {
-    let statements: Vec<String> = bounds
-        .into_iter()
-        .map(|(property, value)| match value {
-            Some(value) => format!("    log:{property} {value}"),
-            // Explicitly off, stated positively: an omitted property and a
-            // disabled trigger must not read alike.
-            None => format!("    log:unbounded log:{property}"),
-        })
-        .collect();
-    format!("<{node}> a log:Cadence ;\n{} .\n", statements.join(" ;\n"))
 }
 
 /// The short spelling of a level IRI — `info` for a `log:` level, the IRI
@@ -776,16 +879,19 @@ impl Patch {
     pub fn to_toml(&self) -> String {
         let mut out = String::new();
         if let Some(level) = &self.level {
-            out.push_str(&format!("level = {level:?}\n"));
+            out.push_str(&format!("level = {}\n", toml_string(level)));
         }
         if let Some(destination) = self.destination {
-            out.push_str(&format!("destination = {:?}\n", destination.as_str()));
+            out.push_str(&format!(
+                "destination = {}\n",
+                toml_string(destination.as_str())
+            ));
         }
         if let Some(directory) = &self.directory {
-            out.push_str(&format!("directory = {directory:?}\n"));
+            out.push_str(&format!("directory = {}\n", toml_string(directory)));
         }
         if let Some(instance) = &self.instance {
-            out.push_str(&format!("instance = {instance:?}\n"));
+            out.push_str(&format!("instance = {}\n", toml_string(instance)));
         }
         // Tables after scalars — see `LogConfig::to_toml`. A table this layer
         // does not state is omitted entirely rather than written empty: an
