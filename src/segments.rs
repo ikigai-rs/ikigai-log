@@ -29,8 +29,9 @@
 //! elsewhere in this system, with every test still passing. There is no test
 //! signal for it, so the rule is stated rather than discovered:
 //!
-//! * a segment whose last entry is `log:ProcessStop` **or `log:Rotation`** is
-//!   **finished** — nothing will ever append to it — so it is `.cacheable()`,
+//! * a segment whose last entry is `log:ProcessStop` **or `log:Rotation`**,
+//!   sealed and with nothing after it, is **finished** — nothing will ever
+//!   append to it — so it is `.cacheable()`,
 //!   under a golden thread on its file. ★ Both markers, and the second one is
 //!   the one that pays: a daemon writes one stop marker in its life and a
 //!   rotation every day, so a verifier that knew only about `ProcessStop` would
@@ -84,8 +85,6 @@ use crate::graph::{to_turtle, Options, LOG_MEDIA_TYPE, TURTLE_MEDIA_TYPE};
 #[cfg(not(target_family = "wasm"))]
 use crate::line::{Header, Line, Prev, Timestamp};
 use crate::vocabulary::Vocabulary;
-#[cfg(not(target_family = "wasm"))]
-use crate::vocabulary::{PROCESS_STOP_CLASS, ROTATION_CLASS};
 
 /// The transreptor: `text/x-ikigai-log` → `text/turtle`.
 pub const TRANSREPT_IRI: &str = "urn:log:transrept";
@@ -357,9 +356,9 @@ impl Endpoint for SegmentEndpoint {
                  graph named by that IRI — which is the whole of the named-graph story, and \
                  makes cross-segment analysis a matter of listing two graphs. as=\
                  text/x-ikigai-log serves the segment file itself. A FINISHED segment (its \
-                 last entry is log:ProcessStop or log:Rotation — a rotated segment is as \
-                 immutable as a stopped one, and it is the common case) is cacheable under a \
-                 golden thread on its file; a live one is not, and no watcher pretends \
+                 last entry is log:ProcessStop or log:Rotation, sealed, with nothing after it \
+                 — a rotated segment is as immutable as a stopped one, and it is the common \
+                 case) is cacheable under a golden thread on its file; a live one is not, and no watcher pretends \
                  otherwise. Transreption is \
                  O(segment) — narrow it with since/until/from_seq/to_seq rather than \
                  filtering a year of entries in SPARQL.",
@@ -536,47 +535,63 @@ fn window(inv: &Invocation<'_>) -> Result<Options> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Whether the last entry in `text` ends the segment for good — a
-/// `log:ProcessStop` or a `log:Rotation`.
+/// Whether `text` ended for good: its first `log:ProcessStop` or `log:Rotation`
+/// is its last entry, and a seal follows it.
 ///
 /// Reads the classes, not the bytes: a module's own stop or rotation subclass
 /// counts, because `log:ProcessStop` means "this process ended in an orderly
 /// way" and `log:Rotation` means "this segment rolled over", and a subclass of
 /// either means the same thing more precisely.
 ///
-/// The LAST entry, not "contains one": a rotation marker is followed by a
-/// `#seal` line and nothing else, and a stop marker likewise, so a segment whose
-/// last entry is anything else still has a live tail.
+/// ★ **Both halves, not "the last entry is a marker".** The writer ends a
+/// segment by writing the marker, sealing it at once, and writing nothing after
+/// it — so a segment whose end marker is followed by entries, or by no seal,
+/// did not end that way, whatever its last line says. A forged `log:ProcessStop`
+/// appended after the real final seal is the shape this refuses: served as
+/// finished it would be CACHED, which is the one thing a reader cannot later
+/// take back. Verification reports the same shape as
+/// [`Finding::AfterTheEnd`](crate::Finding::AfterTheEnd).
 fn ends_finally(text: &str, vocabulary: &Vocabulary) -> bool {
     let Ok((header, offset)) = Header::parse(text) else {
         return false;
     };
-    let mut last = None;
+    let mut ended = false;
+    let mut sealed_after = false;
     for raw in text[offset..].lines() {
-        if let Ok(Line::Entry(entry)) = Line::parse(raw, &header.prefixes) {
-            last = Some(entry.class);
+        match Line::parse(raw, &header.prefixes) {
+            Ok(Line::Entry(entry)) => {
+                if ended {
+                    // Something follows the end: not an orderly one.
+                    return false;
+                }
+                ended = crate::chain::is_an_end(&entry.class, vocabulary);
+            }
+            Ok(Line::Seal(_)) if ended => sealed_after = true,
+            _ => {}
         }
     }
-    last.is_some_and(|class| {
-        vocabulary.is_a(&class, PROCESS_STOP_CLASS) || vocabulary.is_a(&class, ROTATION_CLASS)
-    })
+    ended && sealed_after
 }
 
 #[cfg(not(target_family = "wasm"))]
 /// The file a segment IRI names.
 ///
 /// The fast path derives the name the writer would have used
-/// (`{slug(instance)}-{stamp}.log` from a `{instance}:{stamp}` tail). The slow
-/// path reads headers, which is what makes a hand-placed or hand-renamed
-/// segment still resolvable — the `@name` in the file is the authority, and the
-/// filename is a convenience.
+/// (`{slug(instance)}-{stamp}.log` from a `{instance}:{stamp}` tail) and then
+/// READS THAT FILE'S `@name`: the header is the authority and the filename a
+/// convenience, so a candidate whose header names some other segment is not
+/// this one. That matters twice over. `slug` is lossy — `bug:seg` and `bug-seg`
+/// share a file name, so an IRI that names no segment at all would otherwise
+/// resolve to one that exists — and a renamed or planted file would answer for
+/// whatever IRI its file name suggests. The slow path reads headers, which is
+/// what keeps a hand-placed or hand-renamed segment resolvable by what it says.
 fn locate(directory: &Path, tail: &str, iri: &str) -> Option<PathBuf> {
     if let Some((instance, stamp)) = tail.rsplit_once(':') {
         let candidate = directory.join(format!(
             "{}-{stamp}.{SEGMENT_EXTENSION}",
             crate::writer::slug(instance)
         ));
-        if candidate.is_file() {
+        if candidate.is_file() && header_name(&candidate).as_deref() == Some(iri) {
             return Some(candidate);
         }
     }
@@ -658,9 +673,16 @@ fn header_name(path: &Path) -> Option<String> {
 #[cfg(not(target_family = "wasm"))]
 /// A segment's header, read from the head of the file.
 fn header_of(path: &Path) -> Option<Header> {
-    let mut file = std::fs::File::open(path).ok()?;
+    read_header(path).ok()
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// [`header_of`], saying why when there is none — what verify reports for a file
+/// it cannot read rather than skipping it.
+fn read_header(path: &Path) -> std::result::Result<Header, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut buffer = vec![0u8; HEADER_PROBE_BYTES];
-    let read = file.read(&mut buffer).ok()?;
+    let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
     buffer.truncate(read);
     // The header is ASCII; lossy conversion cannot corrupt it, and a truncated
     // multi-byte entry beyond it is irrelevant to `Header::parse`.
@@ -669,7 +691,9 @@ fn header_of(path: &Path) -> Option<Header> {
     // on, so give the parser one rather than reporting a missing directive.
     let mut owned = text.into_owned();
     owned.push_str("\n\n");
-    Header::parse(&owned).ok().map(|(header, _)| header)
+    Header::parse(&owned)
+        .map(|(header, _)| header)
+        .map_err(|e| e.to_string())
 }
 
 // =====================================================================================
@@ -738,7 +762,8 @@ impl Endpoint for VerifyEndpoint {
 
         let mut body = String::new();
         let mut chains = 0usize;
-        for (instance, chain) in chains_in(&directory) {
+        let (walks, damaged) = chains_in(&directory);
+        for (instance, chain) in walks {
             if wanted_instance
                 .as_ref()
                 .is_some_and(|want| want != &instance)
@@ -754,7 +779,23 @@ impl Endpoint for VerifyEndpoint {
             chains += 1;
             body.push_str(&crate::chain::verify_chain(&chain, &self.vocabulary).render());
         }
-        if chains == 0 {
+        // Every walk, whatever it was filtered to: a file with no readable
+        // header belongs to no chain anyone can name, so no filter can say it
+        // is someone else's — and leaving it out is the verifier vouching for
+        // what it could not read.
+        if !damaged.is_empty() {
+            body.push_str(
+                &crate::chain::ChainReport {
+                    segments: damaged
+                        .into_iter()
+                        .map(|(path, why)| {
+                            crate::chain::unreadable(path.display().to_string(), why)
+                        })
+                        .collect(),
+                }
+                .render(),
+            );
+        } else if chains == 0 {
             // Named rather than answered with an empty report: "nothing to
             // verify" and "verified nothing, all fine" are opposite facts and a
             // blank body would read as the second.
@@ -787,8 +828,10 @@ impl Endpoint for VerifyEndpoint {
                  segment fails exactly here and nowhere else; that seal coverage and entry \
                  sequences are contiguous, since emission advances the counter only for \
                  entries actually written, so a jump means lines were REMOVED and not \
-                 filtered; and that every gap is BRACKETED — two adjacent segments at \
-                 different levels need a log:LevelChange, because a chain is tamper-evident \
+                 filtered, and that each seal's range is the run its hash covers; that \
+                 nothing follows an orderly end (log:ProcessStop or log:Rotation is sealed at \
+                 once, so anything after it was appended); and that every gap is BRACKETED — two adjacent segments at \
+                 different levels need a SEALED log:LevelChange recording that change, because a chain is tamper-evident \
                  and NOT omission-evident, and a lowered level is sanctioned omission the \
                  chain would otherwise bless as intact. What it does NOT establish: seal \
                  SIGNATURES are stated, not checked (that is `urn:sign:verify` with the \
@@ -796,7 +839,8 @@ impl Endpoint for VerifyEndpoint {
                  RECORDED, not as authentic (a level MAC needs a key the application cannot \
                  hold). An unmarked end or an unsealed tail is reported as `noted`, not \
                  `BROKEN`: a crashed process is not a tamperer, and a verifier that cried \
-                 wolf on every daemon restart would be a verifier nobody read. Uncacheable.",
+                 wolf on every daemon restart would be a verifier nobody read. A segment file \
+                 whose header will not parse is reported BROKEN in every walk. Uncacheable.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -834,19 +878,30 @@ impl Endpoint for VerifyEndpoint {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// One instance's chain: its IRI, and its segments as `(segment IRI, bytes)`.
+type InstanceChain = (String, Vec<(String, String)>);
+
+#[cfg(not(target_family = "wasm"))]
 /// Every chain in `directory`, as `(instance IRI, [(segment IRI, bytes)])`,
-/// each chain oldest-first.
+/// each chain oldest-first — and every segment file that could not be read as
+/// one, as `(path, why)`.
 ///
 /// **One chain per INSTANCE**, because the instance is the attribution key: a
 /// machine's log directory holds as many chains as it has instances, and a
 /// disambiguated name is a chain of its own — which is right, since it is a
 /// different process that never claimed to continue anyone.
-fn chains_in(directory: &Path) -> Vec<(String, Vec<(String, String)>)> {
+///
+/// ★ **A file that cannot be read is RETURNED, not skipped.** Its header names
+/// the instance, so a damaged header leaves it in no chain — and a walk that
+/// dropped it would report "0 broken" over a directory holding a damaged
+/// segment, which is the verifier vouching for exactly what it could not check.
+fn chains_in(directory: &Path) -> (Vec<InstanceChain>, Vec<(PathBuf, String)>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut by_instance: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
+    let mut damaged = Vec::new();
     let mut found: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
@@ -854,11 +909,19 @@ fn chains_in(directory: &Path) -> Vec<(String, Vec<(String, String)>)> {
         .collect();
     found.sort();
     for path in found {
-        let Some(header) = header_of(&path) else {
-            continue;
+        let header = match read_header(&path) {
+            Ok(header) => header,
+            Err(why) => {
+                damaged.push((path, why));
+                continue;
+            }
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                damaged.push((path, e.to_string()));
+                continue;
+            }
         };
         by_instance
             .entry(header.instance)
@@ -869,7 +932,7 @@ fn chains_in(directory: &Path) -> Vec<(String, Vec<(String, String)>)> {
         let ordered = std::mem::take(chain);
         *chain = in_chain_order(ordered);
     }
-    by_instance.into_iter().collect()
+    (by_instance.into_iter().collect(), damaged)
 }
 
 #[cfg(not(target_family = "wasm"))]
