@@ -280,8 +280,14 @@ This is the layer that is easy to skip and expensive to skip: if each file chain
 from scratch, rotation is a **seam at which a whole segment can be deleted and a
 replacement forged**, and every other check still passes. Segment ordering falls
 out of it for free — the chain is a linked list, not a sorted directory. It spans
-process restarts too: a writer opening on a file destination reads the newest
-segment of its own instance and chains from its head.
+process restarts too: a writer opening on a file destination finds the **tail of
+its own instance's chain** — the segment no other segment's `@prev` names — and
+chains from its head. By the links, not by the newest name: a clock stepped back
+across a restart (NTP, a VM restore) used to name the new segment before its
+predecessor, the next restart chained from the wrong one, and an untouched log
+verified `BROKEN`. Name order is the fallback only where the links do not form one
+chain, and a restart now clamps its stamp the way a rotation does, so a successor
+never sorts before the segment it follows.
 
 **4. Rotation is verify + seal + validate, one operation.** The open segment gets
 a `log:Rotation` entry naming its successor and a final seal; the successor opens
@@ -290,7 +296,14 @@ chained to that seal; and the pair is verified. Where it does not verify, a
 exception would be caught by whatever was rotating and the fact would leave no
 trace. Rotation is never fatal: a rotation that refused to complete because a
 predecessor was tampered with would stop the log, which is exactly what a
-tamperer wants.
+tamperer wants. The same goes for a rotation that cannot open its successor:
+everything that can make the successor fail (a level the vocabulary does not
+define, a name RDF refuses, a directory that will not take a file) is checked
+**before** the open segment is sealed, and a failure leaves it writing. The write
+that triggered it still returns `Ok`, because the entry landed; the failure lands
+once as `log:Error reason=rotation-failed` and is readable from
+`LogHandle::rotation_error`. The residue is an I/O failure writing the first lines
+of the file just created for the successor, which still closes the log, loudly.
 
 ```
 $ ikigai 'urn:log:verify'
@@ -478,8 +491,12 @@ been fixed:
 design. Nothing propagates, nothing panics, and everything lost is counted and
 lands as an always-land `log:Dropped count=N reason=…` — a drop that leaves no
 marker is the one thing the design forbids outright, since a chain is
-tamper-evident and not omission-evident. **There is no sampling**, for the same
-reason: sampling is holes everywhere with no brackets.
+tamper-evident and not omission-evident. Only real losses count: `Err` from a
+write means the entry did not land, so a rotation that fails after its entry
+landed, or a periodic seal that fails after its line was written (the seal is
+retried at the next write, and an orderly close reports it), is not a drop.
+**There is no sampling**, for the same reason: sampling is holes everywhere with
+no brackets.
 
 ## One dial, and a floor it cannot reach
 
@@ -512,10 +529,34 @@ lands an always-land `log:LevelChange` or `log:ConfigChange` — a destination
 change more urgently than a level change, since lowering the level makes a hole
 while repointing the destination silences the log entirely.
 
-A level change is **recorded now and effective at the next process start**. A
-segment has exactly one level for its whole life, which is what lets a verifier
-reason per sealed segment — "this ran at `info`, so absent resolutions are
-explained" — instead of tracking transitions inside sealed content.
+A change is **recorded now and takes effect at a boundary, never inside a
+segment**. A segment has exactly one level for its whole life, which is what lets
+a verifier reason per sealed segment — "this ran at `info`, so absent resolutions
+are explained" — instead of tracking transitions inside sealed content. Which
+boundary depends on the key, and the response and the entry's `effective=` both
+say it:
+
+| key | takes effect at |
+|---|---|
+| `level`, `[seal]`, `[rotation]` | the next segment — a rotation or a process start |
+| `destination`, `directory`, `instance` | the next process start |
+
+A rotation stays where its writer is: same directory, same instance name, same
+instance lock. Letting a `directory` change move the next rotated segment left the
+lock behind, so a second process could take the same name in the new directory
+while this one wrote there.
+
+A level a vocabulary does not define (`level=infoo`) is refused where it is typed,
+and the refusal lands as `log:LevelChangeRejected`. It used to be accepted, and the
+next rotation sealed the open segment, failed to open a successor, and left the log
+closed for the rest of the process.
+
+**The writer brackets the level it opens at.** A segment that opens at a level its
+predecessor did not run at — whether an operator asked through `urn:log:config`,
+edited `level =` in `log.toml` between runs, or a host called `set_config` — lands
+`log:LevelChange key=level from=… to=… effective=this-segment` right after its
+`log:ProcessStart` and seals it at once, so `urn:log:verify` finds the change
+recorded where it took effect. It records the change; it does not authenticate it.
 
 The seal and rotation cadences are operator dials on the same terms:
 

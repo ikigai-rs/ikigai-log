@@ -902,3 +902,419 @@ fn h7_a_write_returns_the_iri_of_the_segment_the_entry_landed_in() {
         "{landed}"
     );
 }
+
+// =====================================================================================
+// #904 items 5, 9, 10 — the log keeps logging
+// =====================================================================================
+
+/// [C-R2] A level the vocabulary does not define is refused at urn:log:config
+/// (and the refusal lands), instead of closing the log at the next rotation.
+#[test]
+fn r2_a_typoed_level_is_refused_where_it_is_typed() {
+    let dir = Scratch::new("r2");
+    let home = Scratch::new("r2home");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        file_config(dir.path(), "info"),
+    ));
+    handle.set_policies(
+        SealPolicy::default(),
+        ikigai_log::RotationPolicy {
+            max_entries: Some(4),
+            max_age_millis: None,
+        },
+    );
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let said = issue(
+        &kernel(handle.clone()),
+        req(Verb::Sink, ikigai_log::CONFIG_IRI, &[("level", "infoo")]),
+        &Capability::scoped([ikigai_log::CAP_CONFIG]),
+    );
+    assert!(
+        matches!(&said, Err(ikigai_core::Error::InvalidArgument { name, .. }) if name == "level"),
+        "{said:?}"
+    );
+    assert!(
+        !home.path().join("log.toml").exists()
+            || !std::fs::read_to_string(home.path().join("log.toml"))
+                .unwrap()
+                .contains("infoo"),
+        "nothing was persisted"
+    );
+    for i in 0..6 {
+        handle.write(msg(T0 + 100 + i, "after the typo")).unwrap();
+    }
+    assert!(handle.is_open());
+    let all: String = segment_files(dir.path())
+        .into_iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect();
+    assert!(
+        all.contains("log:LevelChangeRejected") && all.contains("to=infoo"),
+        "the rejection is in the record:\n{all}"
+    );
+}
+
+/// [C-R2, the other half] A rotation that cannot open its successor leaves the
+/// predecessor writing: a level set behind the endpoint's back (the host API)
+/// fails the rotation BEFORE the predecessor is sealed.
+#[test]
+fn r2b_a_rotation_that_cannot_open_its_successor_leaves_the_predecessor_writing() {
+    let dir = Scratch::new("r2b");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    handle.set_policies(
+        SealPolicy::default(),
+        ikigai_log::RotationPolicy {
+            max_entries: Some(3),
+            max_age_millis: None,
+        },
+    );
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let (segment, _) = handle.open_segment().unwrap();
+    let mut config = handle.config();
+    config.level = log("infoo");
+    handle.set_config(config);
+
+    for i in 0..5 {
+        let landed = handle.write(msg(T0 + 100 + i, "keeps landing"));
+        assert!(
+            matches!(landed, Ok(Some(_))),
+            "an entry that landed is Ok: {landed:?}"
+        );
+    }
+    assert!(handle.is_open(), "the log is still logging");
+    assert_eq!(
+        handle.open_segment().unwrap().0,
+        segment,
+        "into the predecessor"
+    );
+    assert!(
+        handle.rotation_error().is_some_and(|e| e.contains("infoo")),
+        "{:?}",
+        handle.rotation_error()
+    );
+    let files = segment_files(dir.path());
+    assert_eq!(files.len(), 1, "no orphaned successor file: {files:?}");
+    let text = std::fs::read_to_string(&files[0]).unwrap();
+    assert_eq!(
+        text.matches(r#"msg="keeps landing""#).count(),
+        5,
+        "every entry landed once:\n{text}"
+    );
+    assert_eq!(
+        text.matches("reason=rotation-failed").count(),
+        1,
+        "the failure is recorded once, not once per write:\n{text}"
+    );
+    assert!(
+        ikigai_log::verify_segment(&text, Vocabulary::builtin(), None).ok(),
+        "the predecessor was never sealed off, so nothing after it is out of place"
+    );
+}
+
+/// [C-R5a] `Err` from `Writer::write` means the entry did not land: a seal that
+/// fails after the line is written does not turn a landed entry into an error.
+#[test]
+fn r5a_an_err_from_write_means_the_entry_was_not_written() {
+    #[derive(Clone, Default)]
+    struct FailSeals(Arc<Mutex<Vec<String>>>);
+    impl ikigai_log::LineSink for FailSeals {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            if line.starts_with("#seal") {
+                return Err(std::io::Error::other("no space left on device"));
+            }
+            self.0.lock().unwrap().push(line.to_string());
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = FailSeals::default();
+    let lines = sink.0.clone();
+    let config = LogConfig::default()
+        .with_instance("bug:seg")
+        .with_level("info")
+        .unwrap();
+    let mut writer = Writer::open_with_sink_and(
+        &config,
+        Vocabulary::shared_builtin(),
+        at(T0),
+        Box::new(sink),
+        WriterOptions {
+            seals: SealPolicy {
+                every_entries: 2,
+                every_millis: u64::MAX,
+            },
+            ..WriterOptions::default()
+        },
+    )
+    .unwrap();
+    let result = writer.write(msg(T0 + 1, "payment 42"));
+    let landed = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("payment"))
+        .count();
+    assert_eq!(landed, 1);
+    assert!(
+        matches!(result, Ok(Some(2))),
+        "the entry landed, so the write is not an error: {result:?}"
+    );
+    assert_eq!(writer.sequence(), 2);
+    // The seal is owed, not forgotten: closing still tries it, and says so.
+    assert!(writer.close(at(T0 + 2)).is_err());
+}
+
+/// [C-R5b] A failing ROTATION does not make landed entries count as drops.
+#[cfg(unix)]
+#[test]
+fn r5b_a_landed_entry_is_not_counted_as_dropped() {
+    use ikigai_core::{TraceEvent, Tracer};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("r5b");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "debug")));
+    handle.set_policies(
+        SealPolicy::default(),
+        ikigai_log::RotationPolicy {
+            max_entries: Some(2),
+            max_age_millis: None,
+        },
+    );
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let file = segment_files(dir.path())[0].clone();
+    let tracer = ikigai_log::LogTracer::new(handle.clone(), Arc::new(Fixed(T0)));
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+        // Running as a user the mode does not bind (root, in some CI
+        // containers): there is no failing rotation to observe here.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: the directory stayed writable at mode 0555");
+        return;
+    }
+    for span in 0..3u64 {
+        tracer.record(TraceEvent {
+            target: format!("urn:traced:{span}"),
+            thread: "w".to_string(),
+            started: Some(Time::from_millis(T0 + span)),
+            ended: Some(Time::from_millis(T0 + span + 1)),
+            cache_hit: false,
+            span,
+            parent: None,
+            capability: None,
+            notes: Vec::new(),
+        });
+    }
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    let landed = (0..3)
+        .filter(|s| text.contains(&format!(" urn:traced:{s} ")))
+        .count();
+    assert_eq!(landed, 3, "precondition: every entry landed:\n{text}");
+    assert_eq!(tracer.pending_drops(), [0; 4]);
+    assert!(!text.contains("log:Dropped"), "{text}");
+    assert!(handle.rotation_error().is_some());
+}
+
+// =====================================================================================
+// #904 items 7 and 8, ledger #159 — time and instances
+// =====================================================================================
+
+fn verify_dir(dir: &Path) -> String {
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir, "info")));
+    issue(
+        &kernel(handle),
+        req(Verb::Source, VERIFY_IRI, &[]),
+        &Capability::root(),
+    )
+    .unwrap()
+}
+
+/// [C-R9] A clock step back across restarts (NTP, a VM restore) cannot fork the
+/// chain: the predecessor is chosen by the chain, and the stamp is clamped so the
+/// names still sort the way the chain runs.
+#[test]
+fn r9_an_honest_log_across_a_clock_step_back_verifies() {
+    let dir = Scratch::new("r9");
+    let hour = 3_600_000;
+    for start in [T0 + hour, T0, T0 + hour / 2] {
+        let h = LogHandle::new(None, None, file_config(dir.path(), "info"));
+        h.open(Vocabulary::shared_builtin(), at(start)).unwrap();
+        h.write(msg(start + 1, "work")).unwrap();
+        h.close(at(start + 2)).unwrap();
+    }
+    let body = verify_dir(dir.path());
+    assert!(
+        !body.contains("BROKEN"),
+        "nothing was tampered with:\n{body}"
+    );
+    let names: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("segment "))
+        .map(|l| l.split_whitespace().next().unwrap().to_string())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "chain order is name order again:\n{body}");
+}
+
+/// [ledger #159] A restart chains from the TAIL of the chain, even where a
+/// segment written before the clamp sorts out of order by name.
+#[test]
+fn a_restart_chains_from_the_chain_tail_not_the_largest_name() {
+    let dir = Scratch::new("tail");
+    let hour = 3_600_000;
+    // S1, an ordinary segment.
+    let h = LogHandle::new(None, None, file_config(dir.path(), "info"));
+    h.open(Vocabulary::shared_builtin(), at(T0 + hour)).unwrap();
+    h.close(at(T0 + hour + 1)).unwrap();
+    let s1 = std::fs::read_to_string(&segment_files(dir.path())[0]).unwrap();
+    // S2 follows S1 but is stamped an hour EARLIER — what an unclamped writer
+    // left on disk before this fix.
+    let s2 = Captured::default();
+    let writer = s2.writer(
+        "info",
+        T0,
+        Prev::Seal(head_of(&s1).unwrap()),
+        SealPolicy::default(),
+    );
+    writer.close(at(T0 + 1)).unwrap();
+    let s2_text = s2.text();
+    std::fs::write(
+        dir.path().join("bug-seg-2023-11-14T22-13-20Z.log"),
+        &s2_text,
+    )
+    .unwrap();
+    assert!(
+        name_of(&s2_text) < name_of(&s1),
+        "precondition: S2 sorts first"
+    );
+
+    let h = LogHandle::new(None, None, file_config(dir.path(), "info"));
+    h.open(Vocabulary::shared_builtin(), at(T0 + 2 * hour))
+        .unwrap();
+    let (s3, _) = h.open_segment().unwrap();
+    h.close(at(T0 + 2 * hour + 1)).unwrap();
+    let s3_text = segment_files(dir.path())
+        .into_iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .find(|t| name_of(t) == s3)
+        .unwrap();
+    let prev = s3_text
+        .lines()
+        .find_map(|l| l.strip_prefix("@prev"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        prev,
+        head_of(&s2_text).unwrap(),
+        "S3 follows S2, the chain's tail"
+    );
+    let body = verify_dir(dir.path());
+    assert!(!body.contains("BROKEN"), "{body}");
+}
+
+/// [C-R10] A `directory` change takes effect at the next process start, as its
+/// documentation says: a rotation stays where the writer and its instance lock
+/// are, so no second writer can take the same name in the new directory while
+/// this one is writing there.
+#[test]
+fn r10_a_directory_change_waits_for_the_next_process_start() {
+    let old = Scratch::new("r10old");
+    let new = Scratch::new("r10new");
+    let home = Scratch::new("r10home");
+    let h1 = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        file_config(old.path(), "info"),
+    ));
+    h1.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let new_dir = new.path().display().to_string();
+    let said = issue(
+        &kernel(h1.clone()),
+        req(
+            Verb::Sink,
+            ikigai_log::CONFIG_IRI,
+            &[("directory", new_dir.as_str())],
+        ),
+        &Capability::scoped([ikigai_log::CAP_CONFIG]),
+    )
+    .unwrap();
+    assert!(
+        said.contains("directory: effective at the next process start"),
+        "{said}"
+    );
+    h1.rotate(at(T0 + 1_000)).unwrap().expect("rotated");
+    h1.write(msg(T0 + 1_001, "still here")).unwrap();
+    assert!(
+        segment_files(new.path()).is_empty(),
+        "the running writer did not move"
+    );
+    assert_eq!(segment_files(old.path()).len(), 2);
+    let all: String = segment_files(old.path())
+        .into_iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect();
+    assert!(
+        all.contains("key=directory") && all.contains("effective=next-process-start"),
+        "{all}"
+    );
+
+    // A second process in the new directory has it to itself.
+    let h2 = Arc::new(LogHandle::new(None, None, file_config(new.path(), "info")));
+    h2.open(Vocabulary::shared_builtin(), at(T0 + 2_000))
+        .unwrap();
+    assert_eq!(segment_files(new.path()).len(), 1);
+}
+
+// =====================================================================================
+// #904 item 13 — an operator's level edit is bracketed where it takes effect
+// =====================================================================================
+
+/// [C-R11] A level changed in log.toml between runs (raised, here) verifies: the
+/// writer that opens at a level its predecessor did not run at records the
+/// change itself, and seals it at once.
+#[test]
+fn r11_an_operator_level_edit_does_not_break_verification() {
+    let dir = Scratch::new("r11");
+    let home = Scratch::new("r11home");
+    for (start, level) in [(T0, "info"), (T0 + 5_000, "debug")] {
+        std::fs::write(
+            home.path().join("log.toml"),
+            format!("level = \"{level}\"\n"),
+        )
+        .unwrap();
+        let base = LogConfig::default()
+            .with_instance("bug:seg")
+            .with_destination(Destination::File)
+            .with_directory(dir.path());
+        let config = ikigai_log::load::complete_in(home.path(), None, base).unwrap();
+        let h = LogHandle::new(Some(home.path().to_path_buf()), None, config);
+        h.open(Vocabulary::shared_builtin(), at(start)).unwrap();
+        h.write(msg(start + 1, "work")).unwrap();
+        // A crash, not a close: the bracket must not wait for an orderly end.
+        drop(h);
+    }
+    let body = verify_dir(dir.path());
+    assert!(
+        !body.contains("BROKEN"),
+        "an operator raised the level:\n{body}"
+    );
+    let newest = std::fs::read_to_string(&segment_files(dir.path())[1]).unwrap();
+    let bracket = newest
+        .lines()
+        .position(|l| l.contains("log:LevelChange") && l.contains("effective=this-segment"))
+        .unwrap_or_else(|| panic!("the writer recorded the change:\n{newest}"));
+    assert!(
+        newest
+            .lines()
+            .skip(bracket)
+            .any(|l| l.starts_with("#seal ")),
+        "and sealed it at once:\n{newest}"
+    );
+}

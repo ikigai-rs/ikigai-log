@@ -619,49 +619,86 @@ fn segment_files(directory: &Path) -> Vec<(String, PathBuf)> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// The newest segment file written by `instance` in `directory`, if any.
+/// How much of a segment's END [`chain_tail`] reads to find its last `#seal`.
+/// A seal lands at least every 1,000 entries by default, so the last one is
+/// almost always within this; a segment whose tail holds none is read whole.
+const TAIL_PROBE_BYTES: u64 = 256 * 1024;
+
+#[cfg(not(target_family = "wasm"))]
+/// The TAIL of `instance`'s chain in `directory`: the segment nothing else
+/// follows, with its header and the chain head it states — what a restarting
+/// writer chains from.
 ///
-/// "Newest" is the largest `@name` — the segment IRI ends in a fixed-width UTC
-/// stamp, so IRI order IS chronological order within an instance. Read from each
-/// file's own header rather than from its name, so a renamed file is still found
-/// by what it says it is.
-pub(crate) fn newest_for_instance(directory: &Path, instance: &str) -> Option<PathBuf> {
-    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(directory)
+/// ★ **By the chain, not by the name** (ledger #159). Each segment's `@prev`
+/// names the head of the one before it, so the segments form a linked list, and
+/// the tail is the one no `@prev` points at. The largest `@name` is only a proxy
+/// for that: a clock stepped back across a restart, or a log written before the
+/// stamp clamp, names a successor BEFORE its predecessor, and a restart that
+/// chained from the largest name forked the chain (#904 item 7). Name order is
+/// the fallback only where the links do not form one chain over the instance's
+/// segments — a fork, a gap, a damaged file — and then the newest name is the
+/// best guess left, and verify reports whatever broke the links.
+///
+/// Reads every candidate's header and the END of its file (where the last seal
+/// is), not the whole file: this runs at every process start, over every segment
+/// the instance has ever left in the directory.
+pub(crate) fn chain_tail(directory: &Path, instance: &str) -> Option<(PathBuf, Header, String)> {
+    let mut found: Vec<(Header, PathBuf, String)> = std::fs::read_dir(directory)
         .ok()?
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == SEGMENT_EXTENSION))
         .filter_map(|path| header_of(&path).map(|header| (header, path)))
         .filter(|(header, _)| header.instance == instance)
-        .map(|(header, path)| (header.name, path))
+        .filter_map(|(header, path)| {
+            let head = stated_head_of_file(&path, &header)?;
+            Some((header, path, head))
+        })
         .collect();
-    found.sort();
-    found.pop().map(|(_, path)| path)
+    found.sort_by(|(a, _, _), (b, _, _)| a.name.cmp(&b.name));
+    let links: Vec<(Prev, String)> = found
+        .iter()
+        .map(|(header, _, head)| (header.prev.clone(), head.clone()))
+        .collect();
+    let tail = match link_order(&links) {
+        Some(order) => *order.last()?,
+        None => found.len().checked_sub(1)?,
+    };
+    let (header, path, head) = found.swap_remove(tail);
+    Some((path, header, head))
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// The segment this instance wrote immediately BEFORE `segment` — the largest
-/// `@name` strictly less than it.
-///
-/// What a rotation checks its newly sealed segment against. The link only means
-/// something against the segment it actually claims to follow, and the newest
-/// file is the one just sealed.
-pub(crate) fn predecessor_of(
-    directory: &Path,
-    instance: &str,
-    segment: &str,
-) -> Option<(String, PathBuf)> {
-    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(directory)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == SEGMENT_EXTENSION))
-        .filter_map(|path| header_of(&path).map(|header| (header, path)))
-        .filter(|(header, _)| header.instance == instance && header.name.as_str() < segment)
-        .map(|(header, path)| (header.name, path))
-        .collect();
-    found.sort();
-    found.pop()
+/// The chain head a segment FILE states — its last `#seal`, or h₀ over its
+/// header when it has none — reading the end of the file first.
+fn stated_head_of_file(path: &Path, header: &Header) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(TAIL_PROBE_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let text = String::from_utf8_lossy(&tail);
+    // The first line of a probe that started mid-file may be a fragment; a
+    // fragment that happens to start `#seal` is still parsed in full, so it is
+    // skipped unless the probe began at the start of the file.
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    for line in lines.iter().rev() {
+        if let Ok(Line::Seal(seal)) = Line::parse(line, &header.prefixes) {
+            return Some(seal.hash);
+        }
+    }
+    if start == 0 {
+        // The whole file was read and holds no seal: it committed nothing past
+        // its header, which is exactly what h0 says.
+        return Some(crate::chain::Chain::open(header).head().to_string());
+    }
+    // A long tail with no seal in it: read the rest rather than guess.
+    crate::chain::head_of(&std::fs::read_to_string(path).ok()?)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -974,26 +1011,33 @@ fn in_chain_order(mut chain: Vec<(String, String)>) -> Vec<(String, String)> {
 
 #[cfg(not(target_family = "wasm"))]
 /// The indices of `chain` in link order, or `None` when the links do not form a
-/// single chain over exactly this set — a fork, a cycle, a missing middle, two
-/// segments ending at one head, or no unique start.
+/// single chain over exactly this set — see [`link_order`].
 fn chain_order(chain: &[(String, String)]) -> Option<Vec<usize>> {
+    let mut links = Vec::with_capacity(chain.len());
+    for (_, text) in chain {
+        let (header, _) = Header::parse(text).ok()?;
+        let head = stated_head_in(text, &header)?;
+        links.push((header.prev, head));
+    }
+    link_order(&links)
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// The indices of `links` — each segment's `(@prev, stated head)` — in chain
+/// order, or `None` when they do not form a single chain over exactly this set:
+/// a fork, a cycle, a missing middle, two segments ending at one head, or no
+/// unique start.
+fn link_order(links: &[(Prev, String)]) -> Option<Vec<usize>> {
     use std::collections::HashMap;
 
-    let mut heads: Vec<String> = Vec::with_capacity(chain.len());
-    let mut prevs: Vec<Prev> = Vec::with_capacity(chain.len());
     let mut ends_at: HashMap<&str, usize> = HashMap::new();
-    for (_, text) in chain.iter() {
-        let (header, _) = Header::parse(text).ok()?;
-        heads.push(stated_head_in(text, &header)?);
-        prevs.push(header.prev);
-    }
-    for (index, head) in heads.iter().enumerate() {
+    for (index, (_, head)) in links.iter().enumerate() {
         if ends_at.insert(head.as_str(), index).is_some() {
             return None;
         }
     }
     let mut follows: HashMap<&str, usize> = HashMap::new();
-    for (index, prev) in prevs.iter().enumerate() {
+    for (index, (prev, _)) in links.iter().enumerate() {
         if let Prev::Seal(hash) = prev {
             if follows.insert(hash.as_str(), index).is_some() {
                 return None;
@@ -1003,7 +1047,7 @@ fn chain_order(chain: &[(String, String)]) -> Option<Vec<usize>> {
     // The start is the one segment nothing in this set precedes: genesis, or a
     // `@prev` naming a seal that is not here (the chain continues off the end of
     // what was listed, which is ordinary — retention removes the oldest).
-    let mut starts = (0..chain.len()).filter(|&index| match &prevs[index] {
+    let mut starts = (0..links.len()).filter(|&index| match &links[index].0 {
         Prev::Genesis => true,
         Prev::Seal(hash) => !ends_at.contains_key(hash.as_str()),
     });
@@ -1011,8 +1055,8 @@ fn chain_order(chain: &[(String, String)]) -> Option<Vec<usize>> {
     if starts.next().is_some() {
         return None;
     }
-    let mut order = Vec::with_capacity(chain.len());
-    let mut seen = vec![false; chain.len()];
+    let mut order = Vec::with_capacity(links.len());
+    let mut seen = vec![false; links.len()];
     let mut current = start;
     loop {
         if seen[current] {
@@ -1020,12 +1064,12 @@ fn chain_order(chain: &[(String, String)]) -> Option<Vec<usize>> {
         }
         seen[current] = true;
         order.push(current);
-        match follows.get(heads[current].as_str()) {
+        match follows.get(links[current].1.as_str()) {
             Some(&next) => current = next,
             None => break,
         }
     }
-    (order.len() == chain.len()).then_some(order)
+    (order.len() == links.len()).then_some(order)
 }
 
 #[cfg(not(target_family = "wasm"))]

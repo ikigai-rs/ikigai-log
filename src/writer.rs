@@ -42,9 +42,12 @@
 //! Periodically ([`SealPolicy`], N entries **or** T milliseconds) a `#seal` line
 //! commits the head, so tampering localizes to "between seal K and seal K+1".
 //!
-//! A writer opening on a file destination reads the **newest segment of its own
-//! instance** and takes that segment's chain head as its `@prev`, so the chain
-//! spans process restarts as well as rotations. A different instance name is a
+//! A writer opening on a file destination finds the **tail of its own
+//! instance's chain** — by the `@prev` links, not by the newest name — and takes
+//! that segment's chain head as its `@prev`, so the chain spans process restarts
+//! as well as rotations. Its stamp is clamped so it never sorts before the
+//! segment it follows, and when it opens at a level that segment did not run at
+//! it records the change itself, sealed at once. A different instance name is a
 //! different chain and starts at `genesis`, which is the right reading: the
 //! instance IS the attribution key.
 //!
@@ -74,7 +77,8 @@ use crate::config::Destination;
 use crate::config::LogConfig;
 use crate::line::{Entry, Header, Prev, RenderError, Timestamp, FORMAT_VERSION};
 use crate::vocabulary::{
-    Vocabulary, LOG_NS, PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS, ROTATION_CLASS,
+    Vocabulary, LEVEL_CHANGE_CLASS, LOG_NS, PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS,
+    ROTATION_CLASS,
 };
 
 /// Why a segment could not be opened, or an entry could not be written.
@@ -262,6 +266,29 @@ pub struct Writer {
     /// lifetime and released by the OS when the process ends.
     #[cfg(not(target_family = "wasm"))]
     _lock: Option<std::fs::File>,
+    /// The segment this one chains from, when it is a file this writer knows:
+    /// discovered at a restart, or handed over by a rotation. What a rotation
+    /// verifies its newly sealed segment against — the segment it ACTUALLY
+    /// followed, rather than whichever file sorts just before it by name.
+    predecessor: Option<Predecessor>,
+}
+
+/// The segment a new one follows, as far as opening it needs to know.
+#[derive(Clone, Debug)]
+// On wasm only `level` is read: a browser has no segment files, so nothing
+// restarts onto a predecessor or rotates away from one, and the name, start and
+// path a restart clamps and a rotation verifies against go unused there.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(crate) struct Predecessor {
+    /// Its IRI.
+    pub(crate) name: String,
+    /// The level it ran at — so a segment opening at a different one records
+    /// the change itself.
+    pub(crate) level: String,
+    /// When it started — the floor a successor's stamp is clamped to.
+    pub(crate) started: Timestamp,
+    /// Its file, when it has one.
+    pub(crate) path: Option<PathBuf>,
 }
 
 /// What a segment is opened WITH, beyond its configuration.
@@ -342,6 +369,7 @@ impl Writer {
                 None,
                 options,
                 None,
+                None,
             )
             .map(Some),
             Destination::File => Writer::open_file(config, vocabulary, now, options).map(Some),
@@ -372,7 +400,9 @@ impl Writer {
         sink: Box<dyn LineSink>,
         options: WriterOptions,
     ) -> Result<Writer, WriteError> {
-        Writer::start(config, vocabulary, now, sink, None, None, options, None)
+        Writer::start(
+            config, vocabulary, now, sink, None, None, options, None, None,
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -405,17 +435,36 @@ impl Writer {
         };
 
         // ★ The chain spans rotations AND restarts. Read before the new file is
-        // created, so the newest segment found is genuinely a predecessor: a
-        // process that opens, then looks, would find itself.
+        // created, so the tail found is genuinely a predecessor: a process that
+        // opens, then looks, would find itself.
+        let mut predecessor = None;
         if options.prev.is_none() {
-            options.prev = Some(discover_prev(
-                &directory,
-                &crate::config::instance_iri(&name),
-            ));
+            let (prev, found) = discover_prev(&directory, &crate::config::instance_iri(&name));
+            options.prev = Some(prev);
+            predecessor = found;
         }
+        // ★ The RESTART clamp, the twin of the rotation one: a successor is never
+        // stamped before its predecessor started. A clock stepped back across a
+        // restart (NTP, a VM restore) would otherwise name the new segment
+        // BEFORE the one it follows, and a name order that disagrees with the
+        // chain is what forked it (#904 item 7). Like the rotation clamp, this
+        // costs the stamp its exactness and buys back name order.
+        let now = match &predecessor {
+            Some(found) => now.max(found.started),
+            None => now,
+        };
 
         let reserved = reserve_segment(&directory, &name, now)?;
-        Writer::open_file_on(config, vocabulary, now, options, name, lock, reserved)
+        Writer::open_file_on(
+            config,
+            vocabulary,
+            now,
+            options,
+            name,
+            lock,
+            reserved,
+            predecessor,
+        )
     }
 
     /// Open a segment onto a file that has already been reserved.
@@ -430,6 +479,8 @@ impl Writer {
     /// the instance name, and the rotated log would silently continue under a
     /// disambiguated one.
     #[cfg(not(target_family = "wasm"))]
+    #[allow(clippy::too_many_arguments)] // the file half of `start`, whose list it
+                                         // mirrors; a struct would only rename it
     pub(crate) fn open_file_on(
         config: &LogConfig,
         vocabulary: Arc<Vocabulary>,
@@ -438,6 +489,7 @@ impl Writer {
         name: String,
         lock: std::fs::File,
         reserved: Reserved,
+        predecessor: Option<Predecessor>,
     ) -> Result<Writer, WriteError> {
         let mut writer = Writer::start(
             config,
@@ -448,6 +500,7 @@ impl Writer {
             Some(name),
             options,
             Some(reserved.stamp),
+            predecessor,
         )?;
         // Attached after the header, not before: the lock was already taken
         // (it is what decided the name), and this only parks it where the
@@ -456,20 +509,23 @@ impl Writer {
         Ok(writer)
     }
 
-    #[allow(clippy::too_many_arguments)] // the private constructor every public
-                                         // `open*` funnels into; splitting it
-                                         // would move the argument list, not
-                                         // shorten it
-    fn start(
+    /// Everything about opening a segment that can be judged BEFORE a line is
+    /// written: the level is one the vocabulary places on the dial, and the
+    /// header renders with IRIs RDF accepts. Returns the header, the level's
+    /// rank and the configured instance when it differs from the effective one.
+    ///
+    /// Split out of [`start`](Self::start) so that a rotation can ask the same
+    /// question before it seals its predecessor: a successor that cannot open
+    /// must fail while the predecessor is still writable, or the log closes —
+    /// and a closed log is exactly what a failed rotation must never leave.
+    fn plan(
         config: &LogConfig,
-        vocabulary: Arc<Vocabulary>,
+        vocabulary: &Vocabulary,
         now: Timestamp,
-        mut sink: Box<dyn LineSink>,
-        path: Option<PathBuf>,
-        effective_name: Option<String>,
-        options: WriterOptions,
+        effective_name: Option<&str>,
         stamp_override: Option<String>,
-    ) -> Result<Writer, WriteError> {
+        prev: Prev,
+    ) -> Result<(Header, i64, Option<String>), WriteError> {
         // The whole level dial, resolved once. A level the vocabulary does not
         // define is a hard stop: the alternative is a segment whose header
         // claims a threshold that nothing in the graph can compare against.
@@ -483,7 +539,7 @@ impl Writer {
                     .collect(),
             })?;
 
-        let instance = match &effective_name {
+        let instance = match effective_name {
             Some(name) => crate::config::instance_iri(name),
             None => config.instance.clone(),
         };
@@ -505,7 +561,7 @@ impl Writer {
             instance,
             level: config.level.clone(),
             started: now,
-            prev: options.prev.unwrap_or(Prev::Genesis),
+            prev,
         };
 
         // The header names the graph and the agent every entry is attributed
@@ -517,6 +573,47 @@ impl Writer {
                 return Err(WriteError::Render(RenderError::NotAnIri(iri.clone())));
             }
         }
+        header.render()?;
+        Ok((header, rank, configured_instance))
+    }
+
+    /// Whether a segment for instance `name` could open under `config` right
+    /// now — [`plan`](Self::plan), with nothing written. A rotation asks this
+    /// before it seals the segment it is rotating out of.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn check_opens(
+        config: &LogConfig,
+        vocabulary: &Vocabulary,
+        now: Timestamp,
+        name: &str,
+    ) -> Result<(), WriteError> {
+        Writer::plan(config, vocabulary, now, Some(name), None, Prev::Genesis).map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)] // the private constructor every public
+                                         // `open*` funnels into; splitting it
+                                         // would move the argument list, not
+                                         // shorten it
+    fn start(
+        config: &LogConfig,
+        vocabulary: Arc<Vocabulary>,
+        now: Timestamp,
+        mut sink: Box<dyn LineSink>,
+        path: Option<PathBuf>,
+        effective_name: Option<String>,
+        options: WriterOptions,
+        stamp_override: Option<String>,
+        predecessor: Option<Predecessor>,
+    ) -> Result<Writer, WriteError> {
+        let (header, rank, configured_instance) = Writer::plan(
+            config,
+            &vocabulary,
+            now,
+            effective_name.as_deref(),
+            stamp_override,
+            options.prev.unwrap_or(Prev::Genesis),
+        )?;
+
         let rendered = header.render()?;
         for line in rendered.lines() {
             sink.write_line(line).map_err(|e| io_error(&path, e))?;
@@ -546,6 +643,7 @@ impl Writer {
             configured_instance,
             #[cfg(not(target_family = "wasm"))]
             _lock: None,
+            predecessor,
         };
 
         // Liveness, and the run boundary a span join is scoped between. Always
@@ -561,6 +659,31 @@ impl Writer {
             start = start.with("configured", configured);
         }
         writer.write(start)?;
+
+        // ★ The bracket, written where the change TAKES EFFECT. A segment that
+        // opens at a level its predecessor did not run at is the moment a gap
+        // opens (or closes), and verify demands a sealed log:LevelChange naming
+        // exactly that change. `urn:log:config` records an operator's request in
+        // the segment open at the time, but a `level =` edited in log.toml
+        // between runs, or a host's `set_config`, passes through no endpoint —
+        // and an honest log then verified BROKEN (#904 item 13). The writer
+        // already knows its predecessor, so it records what it is doing and
+        // seals it at once: a bracket in an unsealed tail is not evidence, and
+        // a crash a minute later must not take it with it.
+        //
+        // This records the change; it does not authenticate it. Whoever holds
+        // the writer can still lower the level — the README says so.
+        if let Some(previous) = writer.predecessor.clone() {
+            if previous.level != writer.header.level {
+                let bracket = Entry::new(now, LEVEL_CHANGE_CLASS, writer.header.name.clone())
+                    .with("key", "level")
+                    .with("from", previous.level)
+                    .with("to", writer.header.level.clone())
+                    .with("effective", "this-segment");
+                writer.write(bracket)?;
+                writer.seal(now)?;
+            }
+        }
         Ok(writer)
     }
 
@@ -608,7 +731,14 @@ impl Writer {
             time,
             self.last_seal_at,
         ) {
-            self.seal(time)?;
+            // ★ A seal that fails here does NOT fail the write: the entry is
+            // already on disk and in the chain, and `Err` from this method
+            // means the entry did not land — a caller that retried on it would
+            // write the entry twice (#904 item 9). The seal is still owed:
+            // `sealed_through` has not moved, so the next write tries again,
+            // and an orderly close or rotation seals explicitly and DOES report
+            // a failure.
+            let _ = self.seal(time);
         }
         Ok(Some(seq))
     }
@@ -684,6 +814,12 @@ impl Writer {
     /// The segment file, for a file destination.
     pub fn path(&self) -> Option<&std::path::Path> {
         self.path.as_deref()
+    }
+
+    /// The segment this one chains from, when the writer knows its file.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn predecessor(&self) -> Option<&Predecessor> {
+        self.predecessor.as_ref()
     }
 
     /// The level this segment runs at, as an absolute IRI. One per segment,
@@ -875,8 +1011,9 @@ pub(crate) fn instance_name_of(instance: &str) -> &str {
 #[cfg(not(target_family = "wasm"))]
 const MAX_STAMP_ATTEMPTS: usize = 100;
 
-/// ★ What this segment chains from: the newest segment of the SAME instance in
-/// this directory, at its chain head.
+/// ★ What this segment chains from: the TAIL of the SAME instance's chain in
+/// this directory, at its chain head — and that predecessor, for the bracket and
+/// the clamp.
 ///
 /// Per instance, not per directory, and that is the whole reading: the instance
 /// is the attribution key, so one machine's log directory holds as many chains as
@@ -884,24 +1021,26 @@ const MAX_STAMP_ATTEMPTS: usize = 100;
 /// own — which is right, because it is a different process that never claimed to
 /// continue anyone.
 ///
-/// Reads whole files rather than probing heads, because the chain head is at the
-/// END. One read at process start, of one file; the alternative is a tail scan
-/// that still has to fall back to the header when a segment never sealed.
+/// ★ **The tail by the chain, not by the name** (ledger #159). The largest
+/// `@name` is a proxy for the newest segment, and a proxy that a clock stepped
+/// back or a log written before the stamp clamp breaks: chaining from it forks
+/// the chain, and an untouched log then verifies BROKEN. The links are the
+/// authority, so they decide; name order is the fallback only when they do not
+/// form one chain (see [`crate::segments::chain_tail`]).
 #[cfg(not(target_family = "wasm"))]
-fn discover_prev(directory: &std::path::Path, instance: &str) -> Prev {
-    let Some(path) = crate::segments::newest_for_instance(directory, instance) else {
-        return Prev::Genesis;
+fn discover_prev(directory: &std::path::Path, instance: &str) -> (Prev, Option<Predecessor>) {
+    let Some((path, header, head)) = crate::segments::chain_tail(directory, instance) else {
+        return (Prev::Genesis, None);
     };
-    match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| crate::chain::head_of(&text))
-    {
-        Some(head) => Prev::Seal(head),
-        // A predecessor whose bytes will not parse is not a chain link, and
-        // claiming one would be worse than claiming genesis: a `@prev` pointing
-        // at nothing verifiable looks verified. Verification reports the restart.
-        None => Prev::Genesis,
-    }
+    (
+        Prev::Seal(head),
+        Some(Predecessor {
+            name: header.name,
+            level: header.level,
+            started: header.started,
+            path: Some(path),
+        }),
+    )
 }
 
 /// A timestamp as a token that is safe in an IRI and in a file name: seconds
