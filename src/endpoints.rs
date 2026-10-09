@@ -92,6 +92,34 @@ pub const CAP_CONFIG: &str = "urn:cap:log:config";
 
 /// The append point.
 pub const WRITE_IRI: &str = "urn:log:write";
+
+/// The columns `urn:log:write` refuses from a caller, because something other
+/// than the caller owns them.
+///
+/// * `seq` — the writer's. It numbers every line, a seal range names it, and
+///   verify checks the run is dense; a second `seq=` on one line is two
+///   sequence numbers for one entry.
+/// * `principal` — the host's, through [`crate::Principal::new`] and a
+///   per-tenant [`crate::LogTracer`]. A caller stating it would be one tenant
+///   attributing work to another, with a `prov:Delegation` in the graph to
+///   prove it.
+/// * `cap`, `denied` — the kernel's: the authority a resolution ran under and
+///   the scope a refusal lacked. A caller holding only [`CAP_WRITE`] must not
+///   be able to say it ran under `urn:cap:root`.
+/// * `pid`, `configured`, `next` — the writer's own markers': which process,
+///   which name it was asked for, which segment a rotation rolled into.
+///
+/// Refused rather than stripped: a write that silently lost a column it was
+/// given would be a quieter lie than the one it prevents.
+pub const RESERVED_COLUMNS: [&str; 7] = [
+    "seq",
+    crate::vocabulary::PRINCIPAL_KEY,
+    "cap",
+    ikigai_core::DENIED_NOTE,
+    "pid",
+    "configured",
+    "next",
+];
 /// The effective configuration.
 pub const CONFIG_IRI: &str = "urn:log:config";
 
@@ -509,6 +537,19 @@ impl LogHandle {
     /// usually means the log has stopped being written at all, and swallowing it
     /// would make the one subsystem whose job is to notice things fail silently.
     pub fn write(&self, entry: Entry) -> std::result::Result<Option<u64>, WriteError> {
+        Ok(self.write_landed(entry)?.map(|(_, seq)| seq))
+    }
+
+    /// [`write`](Self::write), naming the segment the entry LANDED in.
+    ///
+    /// Read under the same lock as the append, because a write can trigger a
+    /// rotation before it returns: the segment open afterwards is the
+    /// successor, and an entry IRI built from it would name a segment the entry
+    /// is not in.
+    pub(crate) fn write_landed(
+        &self,
+        entry: Entry,
+    ) -> std::result::Result<Option<(String, u64)>, WriteError> {
         let now = entry.time;
         // Underscored because on wasm there is nothing to rotate INTO — a browser
         // has no segment files — so the whole trigger is `cfg`'d out there and
@@ -517,7 +558,9 @@ impl LogHandle {
             let mut state = self.state.lock().expect("log state");
             match &mut state.writer {
                 Some(writer) => {
-                    let seq = writer.write(entry)?;
+                    let seq = writer
+                        .write(entry)?
+                        .map(|seq| (writer.segment().to_string(), seq));
                     (seq, writer.rotation_due(now))
                 }
                 None => (None, false),
@@ -595,13 +638,16 @@ impl LogHandle {
             .map(|w| (w.segment().to_string(), w.instance().to_string()))
     }
 
-    /// The IRI a written entry will skolemize to: `{segment}:{seq}`.
-    fn entry_iri(&self, seq: u64) -> Option<String> {
+    /// The vocabulary entries are judged against: the open segment's, else the
+    /// built-in one.
+    fn vocabulary(&self) -> Arc<Vocabulary> {
         let state = self.state.lock().expect("log state");
         state
             .writer
             .as_ref()
-            .map(|w| format!("{}:{seq}", w.segment()))
+            .map(|writer| writer.vocabulary().clone())
+            .or_else(|| state.vocabulary.clone())
+            .unwrap_or_else(Vocabulary::shared_builtin)
     }
 
     /// Land a `log:CapabilityDenied` entry: someone was refused `capability`
@@ -673,6 +719,16 @@ fn opt<'a>(inv: &'a Invocation<'a>, name: &str) -> Option<&'a str> {
     }
 }
 
+/// The IRI of `log:always`, the rank below every settable level that the
+/// always-land markers sit at.
+const ALWAYS_LEVEL: &str = "https://ikigai-rs.dev/ns/log#always";
+
+/// Whether RDF will take `iri` as a named node — stricter than the line
+/// grammar's [`is_iri`](crate::line::is_iri).
+fn rdf_iri(iri: &str) -> bool {
+    oxrdf::NamedNode::new(iri).is_ok()
+}
+
 /// Expand a `log:` CURIE, pass an absolute IRI through.
 fn expand(token: &str) -> Option<String> {
     let token = token.trim();
@@ -709,16 +765,41 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
     // the unstructured ratio per module one standing CONSTRUCT away.
     let prose = opt(inv, "msg").or_else(|| opt(inv, "content"));
     let class = match opt(inv, "class") {
-        Some(token) => expand(token).ok_or_else(|| Error::InvalidArgument {
-            name: "class".to_string(),
-            detail: format!("expected a log: CURIE or an absolute IRI, got {token:?}"),
-        })?,
+        Some(token) => {
+            expand(token)
+                .filter(|iri| rdf_iri(iri))
+                .ok_or_else(|| Error::InvalidArgument {
+                    name: "class".to_string(),
+                    detail: format!("expected a log: CURIE or an absolute IRI, got {token:?}"),
+                })?
+        }
         None => MESSAGE_CLASS.to_string(),
     };
+    // ★ The markers are the log's own. Every always-land class — a stop, a
+    // rotation, a level change, a seal, a chain break, a denial, a drop — is
+    // written by the writer, the handle, the tracer or `urn:log:config`, and
+    // verify and the cache believe them: a forged log:ProcessStop is what makes
+    // a segment read as finished, a forged log:LevelChange is what explains a
+    // gap. Judged by the vocabulary, so a module's own subclass of a marker is
+    // refused with it.
+    let vocabulary = handle.vocabulary();
+    if vocabulary.min_level(&class) == ALWAYS_LEVEL {
+        return Err(Error::InvalidArgument {
+            name: "class".to_string(),
+            detail: format!(
+                "{class} is an always-land marker this log writes itself; a caller cannot \
+                 append one"
+            ),
+        });
+    }
 
     let config = handle.config();
     let subject = match opt(inv, "subject") {
-        Some(iri) if crate::line::is_iri(iri) => iri.to_string(),
+        // `is_iri` is the line grammar's test, and it is looser than RDF's: a
+        // subject like `urn:x:{a}` writes a line that parses and a graph that
+        // will not. Refused here, at the door, rather than accepted into a
+        // segment whose graph face would have to degrade around it forever.
+        Some(iri) if crate::line::is_iri(iri) && rdf_iri(iri) => iri.to_string(),
         Some(other) => {
             return Err(Error::InvalidArgument {
                 name: "subject".to_string(),
@@ -744,6 +825,16 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
             name: "fields".to_string(),
             detail: e.to_string(),
         })? {
+            if RESERVED_COLUMNS.contains(&key.as_str()) {
+                return Err(Error::InvalidArgument {
+                    name: "fields".to_string(),
+                    detail: format!(
+                        "`{key}=` is written by this log itself, never by a caller (reserved: \
+                         {})",
+                        RESERVED_COLUMNS.join(", ")
+                    ),
+                });
+            }
             entry = entry.with(key, value);
         }
     }
@@ -757,10 +848,11 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
             "closed: no segment is open, so {class} was not written"
         )));
     }
-    match handle.write(entry).map_err(write_error)? {
-        Some(seq) => Ok(plain(
-            handle.entry_iri(seq).unwrap_or_else(|| seq.to_string()),
-        )),
+    match handle.write_landed(entry).map_err(write_error)? {
+        // The segment the entry LANDED in, not the one open now: a write that
+        // met the rotation policy has rolled the segment over by the time it
+        // returns.
+        Some((segment, seq)) => Ok(plain(format!("{segment}:{seq}"))),
         None => Ok(plain(format!(
             "filtered: {class} is below this segment's level ({})",
             handle.config().level
@@ -781,8 +873,11 @@ pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
                 "Append one entry to this process's segment: a class, a subject and key=value \
                  fields, or just a message (which normalizes to log:Message — severity is \
                  carried by SUBCLASS, log:Warning / log:Error, never by a level= column). \
-                 Returns the entry's IRI, or says so when the class was below the segment's \
-                 level or no segment is open. The segment's level is fixed for its whole life, \
+                 Returns the IRI of the entry in the segment it landed in, or says so when the \
+                 class was below the segment's level or no segment is open. The log's own \
+                 markers (every always-land class: stops, rotations, level changes, seals, \
+                 denials) and the columns it writes itself (seq, principal, cap, denied, pid, \
+                 configured, next) are refused. The segment's level is fixed for its whole life, \
                  so a level change takes effect at the next process start.",
             )
             .verb(Verb::Meta)
@@ -837,8 +932,10 @@ pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
                         ArgSpec::new("fields")
                             .summary(
                                 "the typed columns, in a line's own tail syntax: \
-                                 `dur=12 cap=urn:cap:fs msg=\"two words\"`. Same scanner as the \
-                                 file, so quoting, escaping and repeated keys behave identically",
+                                 `dur=12 tag=a tag=b msg=\"two words\"`. Same scanner as the \
+                                 file, so quoting, escaping and repeated keys behave identically. \
+                                 The log's own columns (seq, principal, cap, denied, pid, \
+                                 configured, next) are refused",
                             )
                             .class(XSD_STRING)
                             .optional(),

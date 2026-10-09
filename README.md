@@ -84,10 +84,32 @@ urn:log:bug:serve:2026-08-23T09-00-00Z:41
 
 The `fields` argument is a line's own **tail syntax**, scanned by the same code
 that reads it back out of the file — one grammar, not two, so quoting, escaping
-and repeated keys (`cap=` twice, for a resolution under two capability scopes)
-behave identically in both directions. Prose goes in `msg=`, or arrives as the
-piped `content` (`… | urn:log:write`) — both declared, so the door a pipeline
-uses is one the manifold shows.
+and repeated keys behave identically in both directions. Prose goes in `msg=`, or
+arrives as the piped `content` (`… | urn:log:write`) — both declared, so the door a
+pipeline uses is one the manifold shows.
+
+The door is narrower than the grammar, on purpose. **A caller cannot speak for
+anyone**, so `urn:log:write` refuses, with `InvalidArgument`:
+
+* the columns the log writes itself — `seq` (the writer's numbering), `principal`
+  (the host's, through `Principal::new` and a per-tenant tracer), `cap` and
+  `denied` (the kernel's: the authority a resolution held, the scope a refusal
+  lacked), and `pid`, `configured` and `next` (the writer's markers'). The list
+  is `RESERVED_COLUMNS`. A tenant that could write `principal=` could attribute
+  its entries to another tenant, with a `prov:Delegation` in the graph to prove
+  it;
+* every **always-land class** — `log:ProcessStart`/`Stop`, `log:Rotation`,
+  `log:LevelChange`/`ConfigChange`, `log:Seal`, `log:ChainBroken`,
+  `log:Dropped`, `log:CapabilityDenied`, and a module's subclass of any of them.
+  Those are the markers verify and the cache believe: a forged stop is what makes
+  a segment read as finished, a forged level change is what explains a gap;
+* a class or subject RDF would not accept (`urn:x:{a}`), which the line grammar
+  would. A segment that holds one anyway still transrepts: the entry degrades to
+  a literal, flagged `log:unreadableIri`, instead of taking the whole segment's
+  graph down.
+
+The IRI a write returns names the segment the entry **landed** in, even when the
+write rolled the segment over before it returned.
 
 ## Queryable across segments — and the segment IS the named graph
 

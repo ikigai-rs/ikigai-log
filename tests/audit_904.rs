@@ -618,3 +618,287 @@ fn h6_a_renamed_file_answers_only_for_its_own_name() {
     let found = issue(&k, req(Verb::Source, &real, &[]), &Capability::root()).unwrap();
     assert!(found.contains(&real), "{found}");
 }
+
+// =====================================================================================
+// #904 item 2 — urn:log:write cannot speak for anyone
+// =====================================================================================
+
+fn sink_as(k: &Kernel, args: &[(&str, &str)], cap: &Capability) -> ikigai_core::Result<String> {
+    issue(k, req(Verb::Sink, ikigai_log::WRITE_IRI, args), cap)
+}
+
+fn refused_as_argument(result: &ikigai_core::Result<String>, name: &str) -> bool {
+    matches!(result, Err(ikigai_core::Error::InvalidArgument { name: n, .. }) if n == name)
+}
+
+/// [C-R4, H-2] One tenant cannot attribute an entry to another through `fields=`.
+#[test]
+fn r4_one_tenant_cannot_attribute_an_entry_to_another() {
+    use ikigai_core::Tracer;
+    let dir = Scratch::new("r4");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "debug")));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let k = kernel(handle.clone());
+    let bob: Arc<dyn Tracer> = Arc::new(
+        ikigai_log::LogTracer::new(handle.clone(), Arc::new(Fixed(T0)))
+            .on_behalf_of(ikigai_log::Principal::new("urn:tenant:bob").unwrap()),
+    );
+    let wrote = futures::executor::block_on(k.issue_traced(
+        req(
+            Verb::Sink,
+            ikigai_log::WRITE_IRI,
+            &[
+                ("msg", "alice approved the transfer"),
+                ("fields", "principal=urn:tenant:alice"),
+            ],
+        ),
+        &Capability::scoped([ikigai_log::CAP_WRITE]),
+        bob,
+    ));
+    assert!(
+        matches!(&wrote, Err(ikigai_core::Error::InvalidArgument { name, .. }) if name == "fields"),
+        "{wrote:?}"
+    );
+    handle.close(at(T0 + 10)).unwrap();
+
+    let text = std::fs::read_to_string(&segment_files(dir.path())[0]).unwrap();
+    assert!(
+        !text.contains("alice"),
+        "nothing about alice landed:\n{text}"
+    );
+    let graph = to_triples(&text, Vocabulary::builtin(), &Options::all()).unwrap();
+    assert!(
+        !graph
+            .iter()
+            .any(|t| t.object.to_string() == "<urn:tenant:alice>"),
+        "the graph attributes nothing to alice"
+    );
+}
+
+/// [C-R4b, H-1, H-2] Every column the log writes itself is refused from a caller —
+/// including a principal `Principal::new` would refuse outright.
+#[test]
+fn r4b_a_caller_cannot_restate_reserved_columns() {
+    let dir = Scratch::new("r4b");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let k = kernel(handle.clone());
+    let only_write = Capability::scoped([ikigai_log::CAP_WRITE]);
+    for fields in [
+        "seq=1",
+        "seq=99",
+        "cap=urn:cap:root",
+        "denied=urn:cap:secret:read",
+        "principal=urn:agent:tenant-b",
+        r#"principal="urn:agent:x y""#,
+        "pid=1",
+        "configured=urn:ikigai:instance:other",
+        "next=urn:log:bug:seg:2030-01-01T00-00-00Z",
+        "dur=1 cap=urn:cap:fs",
+    ] {
+        let wrote = sink_as(&k, &[("msg", "x"), ("fields", fields)], &only_write);
+        assert!(refused_as_argument(&wrote, "fields"), "{fields}: {wrote:?}");
+    }
+    // Ordinary columns still land, repeated keys included.
+    let wrote = sink_as(
+        &k,
+        &[("msg", "x"), ("fields", "span=7 dur=12 tag=a tag=b")],
+        &only_write,
+    )
+    .unwrap();
+    assert!(wrote.ends_with(":2"), "{wrote}");
+    handle.close(at(T0 + 1)).unwrap();
+    let text = std::fs::read_to_string(&segment_files(dir.path())[0]).unwrap();
+    assert_eq!(
+        text.lines().filter(|l| l.contains(" log:Message ")).count(),
+        1,
+        "only the clean write landed:\n{text}"
+    );
+}
+
+/// The always-land markers are the log's own: a caller cannot append a stop, a
+/// rotation, a level change, a seal or a denial.
+#[test]
+fn the_logs_own_markers_cannot_be_written_through_the_door() {
+    let dir = Scratch::new("markers");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "debug")));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let k = kernel(handle.clone());
+    for class in [
+        "log:ProcessStart",
+        "log:ProcessStop",
+        "log:Rotation",
+        "log:LevelChange",
+        "log:ConfigChange",
+        "log:Seal",
+        "log:ChainBroken",
+        "log:Dropped",
+        "log:CapabilityDenied",
+        "https://ikigai-rs.dev/ns/log#ProcessStop",
+    ] {
+        let wrote = sink_as(&k, &[("class", class)], &Capability::root());
+        assert!(refused_as_argument(&wrote, "class"), "{class}: {wrote:?}");
+    }
+    for class in ["log:Message", "log:Warning", "log:Error", "log:Resolution"] {
+        sink_as(&k, &[("class", class)], &Capability::root())
+            .unwrap_or_else(|e| panic!("{class} is a caller's class: {e}"));
+    }
+}
+
+// =====================================================================================
+// #904 item 6 — one bad IRI cannot take down a segment's graph
+// =====================================================================================
+
+/// [C-R3] The door refuses a subject RDF would reject, and a segment that holds
+/// one anyway (hand-written, or from an older writer) still transrepts, with the
+/// odd entry degraded and flagged rather than the whole graph refused.
+#[test]
+fn r3_one_odd_subject_cannot_make_the_whole_segment_unreadable_as_a_graph() {
+    let dir = Scratch::new("r3");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let k = kernel(handle.clone());
+    for (name, args) in [
+        ("subject", [("subject", "urn:x:{a}"), ("msg", "hello")]),
+        ("class", [("class", "urn:x:{Odd}"), ("msg", "hello")]),
+    ] {
+        let wrote = sink_as(&k, &args, &Capability::root());
+        assert!(refused_as_argument(&wrote, name), "{wrote:?}");
+    }
+
+    // The same lines, written by hand into a sealed segment.
+    let captured = Captured::default();
+    let mut writer = captured.writer("info", T0, Prev::Genesis, SealPolicy::manual());
+    writer.write(msg(T0 + 1, "before")).unwrap();
+    writer
+        .write(Entry::new(at(T0 + 2), MESSAGE_CLASS, "urn:x:{a}").with("msg", "odd subject"))
+        .unwrap();
+    writer
+        .write(Entry::new(at(T0 + 3), "urn:x:{Odd}", "urn:x:fine").with("msg", "odd class"))
+        .unwrap();
+    writer.write(msg(T0 + 4, "after")).unwrap();
+    writer.close(at(T0 + 5)).unwrap();
+    let text = captured.text();
+
+    let graph = to_triples(&text, Vocabulary::builtin(), &Options::all())
+        .expect("one odd line does not take the segment's graph down");
+    let rendered: Vec<String> = graph.iter().map(|t| t.to_string()).collect();
+    for kept in [
+        "\"before\"",
+        "\"after\"",
+        "\"odd subject\"",
+        "\"odd class\"",
+    ] {
+        assert!(
+            rendered.iter().any(|t| t.contains(kept)),
+            "{kept} is in the graph"
+        );
+    }
+    let flags: Vec<String> = graph
+        .iter()
+        .filter(|t| t.predicate.as_str() == log("unreadableIri"))
+        .map(|t| t.object.to_string())
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            "\"subject=urn:x:{a}\"".to_string(),
+            "\"class=urn:x:{Odd}\"".to_string()
+        ],
+        "each degradation is reported in the graph"
+    );
+    // And it is still Turtle a parser takes.
+    let turtle = ikigai_log::to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap();
+    let parsed: Result<Vec<_>, _> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(turtle.as_bytes())
+        .collect();
+    assert!(parsed.is_ok(), "{parsed:?}");
+}
+
+/// [C-R3b] An instance name RDF would refuse is refused where it enters: by
+/// log.toml, by urn:log:config, and by the writer that would put it in a header.
+#[test]
+fn r3b_an_instance_name_rdf_refuses_cannot_reach_a_header() {
+    let patch = ikigai_log::config::Patch::parse("instance = \"bug{1}\"\n", None);
+    assert!(patch.is_err(), "log.toml refuses it: {patch:?}");
+
+    let config = LogConfig::default()
+        .with_instance("bug{1}")
+        .with_level("info")
+        .unwrap();
+    let opened = Writer::open_with_sink(
+        &config,
+        Vocabulary::shared_builtin(),
+        at(T0),
+        Box::new(ClosureSink(|_: &str| {})),
+    );
+    assert!(
+        matches!(opened, Err(ikigai_log::WriteError::Render(_))),
+        "the writer refuses a header RDF would refuse"
+    );
+
+    let home = Scratch::new("r3bhome");
+    let dir = Scratch::new("r3b");
+    let handle = Arc::new(LogHandle::new(
+        Some(home.path().to_path_buf()),
+        None,
+        file_config(dir.path(), "info"),
+    ));
+    let wrote = issue(
+        &kernel(handle),
+        req(
+            Verb::Sink,
+            ikigai_log::CONFIG_IRI,
+            &[("instance", "bug{1}")],
+        ),
+        &Capability::scoped([ikigai_log::CAP_CONFIG]),
+    );
+    assert!(
+        matches!(wrote, Err(ikigai_core::Error::InvalidArgument { .. })),
+        "{wrote:?}"
+    );
+}
+
+// =====================================================================================
+// #904 item 14 — the IRI a write returns names the segment the entry is in
+// =====================================================================================
+
+/// [H-7] A write that triggers a rotation returns the entry's IRI in the segment
+/// it landed in, not in the successor that is open by the time it returns.
+#[test]
+fn h7_a_write_returns_the_iri_of_the_segment_the_entry_landed_in() {
+    let dir = Scratch::new("h7");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    handle.set_policies(
+        SealPolicy::default(),
+        ikigai_log::RotationPolicy {
+            max_entries: Some(2),
+            max_age_millis: None,
+        },
+    );
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    let (first, _) = handle.open_segment().unwrap();
+    let wrote = sink_as(
+        &kernel(handle.clone()),
+        &[("msg", "rotates")],
+        &Capability::root(),
+    )
+    .unwrap();
+    let (now_open, _) = handle.open_segment().unwrap();
+    assert_ne!(
+        now_open, first,
+        "precondition: the write rotated the segment"
+    );
+    assert_eq!(wrote.trim(), format!("{first}:2"));
+    let landed = segment_files(dir.path())
+        .into_iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .find(|t| name_of(t) == first)
+        .unwrap();
+    assert!(
+        landed
+            .lines()
+            .any(|l| l.contains("msg=rotates") && l.contains("seq=2")),
+        "{landed}"
+    );
+}

@@ -134,6 +134,8 @@ const LOG_PREV_SEAL: &str = "https://ikigai-rs.dev/ns/log#prevSeal";
 const LOG_SEGMENT: &str = "https://ikigai-rs.dev/ns/log#segment";
 const LOG_SUBJECT: &str = "https://ikigai-rs.dev/ns/log#subject";
 const LOG_UNDECLARED_KEY: &str = "https://ikigai-rs.dev/ns/log#undeclaredKey";
+const LOG_UNREADABLE_IRI: &str = "https://ikigai-rs.dev/ns/log#unreadableIri";
+const LOG_ENTRY_CLASS: &str = crate::vocabulary::ENTRY_CLASS;
 const LOG_INVOKED: &str = "https://ikigai-rs.dev/ns/log#invoked";
 const LOG_FIRST_SEQUENCE: &str = "https://ikigai-rs.dev/ns/log#firstSequence";
 const LOG_LAST_SEQUENCE: &str = "https://ikigai-rs.dev/ns/log#lastSequence";
@@ -167,10 +169,14 @@ pub enum GraphError {
         /// What was wrong with it.
         error: ParseError,
     },
-    /// An IRI the segment supplied is not one oxrdf will accept — a header
-    /// `@name`, a subject column, or an entry class. The line grammar's
-    /// [`is_iri`](crate::is_iri) is deliberately looser than RDF's, so this is
-    /// reachable and says which token failed.
+    /// An IRI in the segment's HEADER is not one oxrdf will accept — `@name`,
+    /// `@instance` or `@level`. The line grammar's [`is_iri`](crate::is_iri) is
+    /// deliberately looser than RDF's, so this is reachable and says which token
+    /// failed. An entry's class or subject never raises it: those degrade per
+    /// entry, flagged `log:unreadableIri`, because one odd line must not take
+    /// the whole segment's graph down. The header cannot degrade that way — it
+    /// names the graph and the agent every entry is attributed to — and the
+    /// writer refuses to open a segment whose header RDF would refuse.
     Iri(String),
     /// Serialization failed. Unreachable writing to a `Vec<u8>`, and reported
     /// rather than unwrapped because a panic in a log reader is worse than a
@@ -325,8 +331,15 @@ pub fn to_triples(
             continue;
         }
         let node = iri(&format!("{}:{}", header.name, row.seq))?;
-        let class = iri(&row.entry.class)?;
-        let subject = iri(&row.entry.subject)?;
+        // ★ Per entry, never per segment. The line grammar's `is_iri` is looser
+        // than RDF's, so a line can parse and still carry a class or subject
+        // oxrdf refuses (`urn:x:{a}`). Aborting here took the WHOLE segment's
+        // graph face down, permanently, for every entry in it — and with it any
+        // SPARQL that listed the segment. So the entry degrades the way
+        // `value_term` degrades a value: stated as the literal it was, and
+        // flagged `log:unreadableIri` so the degradation is a query away.
+        let class = NamedNode::new(row.entry.class.as_str()).ok();
+        let subject = NamedNode::new(row.entry.subject.as_str()).ok();
         // Where this entry's triples begin. A set has no duplicates, so neither
         // should the serialization — and two of them arise naturally here: a
         // class whose log:subjectPredicate IS prov:wasAssociatedWith (log:
@@ -337,7 +350,23 @@ pub fn to_triples(
         // nothing.
         let first = out.len();
 
-        out.push(triple(&node, RDF_TYPE, Term::NamedNode(class)));
+        match class {
+            Some(class) => out.push(triple(&node, RDF_TYPE, Term::NamedNode(class))),
+            None => {
+                // Typed by the root, which is true of every entry, rather than
+                // left untyped — an entry no `?e a log:Entry` finds would be the
+                // silent kind of loss.
+                out.push(triple(&node, RDF_TYPE, term_iri(LOG_ENTRY_CLASS)?));
+                out.push(triple(
+                    &node,
+                    LOG_UNREADABLE_IRI,
+                    Term::Literal(Literal::new_simple_literal(format!(
+                        "class={}",
+                        row.entry.class
+                    ))),
+                ));
+            }
+        }
         // Convenience, not mechanism — see the module docs.
         out.push(triple(&node, LOG_SEGMENT, Term::NamedNode(segment.clone())));
         out.push(triple(
@@ -356,13 +385,34 @@ pub fn to_triples(
         // declared log:subjectPredicate where there is one. Two triples, both
         // true, no reasoner required — an ad-hoc query asks one question of
         // every entry, a PROV reader still gets the precise reading.
-        out.push(triple(&node, LOG_SUBJECT, Term::NamedNode(subject.clone())));
-        if let Some(predicate) = vocab.subject_predicate(&row.entry.class) {
-            push_unique(
-                &mut out,
-                first,
-                triple(&node, predicate, Term::NamedNode(subject)),
-            );
+        match subject {
+            Some(subject) => {
+                out.push(triple(&node, LOG_SUBJECT, Term::NamedNode(subject.clone())));
+                if let Some(predicate) = vocab.subject_predicate(&row.entry.class) {
+                    push_unique(
+                        &mut out,
+                        first,
+                        triple(&node, predicate, Term::NamedNode(subject)),
+                    );
+                }
+            }
+            None => {
+                // Lossless, and flagged. The refined predicate is left out: it
+                // claims a resource, and a literal is not one.
+                out.push(triple(
+                    &node,
+                    LOG_SUBJECT,
+                    Term::Literal(Literal::new_simple_literal(&row.entry.subject)),
+                ));
+                out.push(triple(
+                    &node,
+                    LOG_UNREADABLE_IRI,
+                    Term::Literal(Literal::new_simple_literal(format!(
+                        "subject={}",
+                        row.entry.subject
+                    ))),
+                ));
+            }
         }
 
         let mut flagged: BTreeSet<&str> = BTreeSet::new();
