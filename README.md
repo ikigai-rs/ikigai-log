@@ -100,7 +100,11 @@ anyone**, so `urn:log:write` refuses, with `InvalidArgument`:
   its entries to another tenant, with a `prov:Delegation` in the graph to prove
   it. The entry IS attributed, from the capability the write ran under: a door that
   minted `urn:cap:principal:<iri>` gets `principal=` on what its caller wrote, by
-  the same rule the tracer reads (`principal_of`);
+  the same rule the tracer reads (`principal_of`). So is every other entry an
+  endpoint here writes on a caller's behalf: `urn:log:config`'s
+  `log:LevelChange`, `log:ConfigChange` and `log:LevelChangeRejected`, and an
+  endpoint's own `log:CapabilityDenied` (only a detached or shimmed call reaches
+  that gate; under a kernel the floor refuses first and the tracer attributes it);
 * every **always-land class** — `log:ProcessStart`/`Stop`, `log:Rotation`,
   `log:LevelChange`/`ConfigChange`, `log:Seal`, `log:ChainBroken`,
   `log:Dropped`, `log:CapabilityDenied` (and its `log:EndpointDenied`), and a
@@ -681,6 +685,13 @@ A level a vocabulary does not define (`level=infoo`) is refused where it is type
 and the refusal lands as `log:LevelChangeRejected`. It used to be accepted, and the
 next rotation sealed the open segment, failed to open a successor, and left the log
 closed for the rest of the process.
+
+**Every entry a change lands is attributed**: `log:LevelChange`,
+`log:ConfigChange` and `log:LevelChangeRejected` carry `principal=` when the
+capability the write ran under names one, by the rule `urn:log:write` and the
+tracer use, so "who lowered the level?" is a grep. A write with no principal in its
+capability gets no column. The writer's own bracket below is not a caller's write
+and names nobody.
 
 **The writer brackets the level it opens at.** A segment that opens at a level its
 predecessor did not run at — whether an operator asked through `urn:log:config`,

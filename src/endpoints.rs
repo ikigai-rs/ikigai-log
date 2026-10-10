@@ -103,10 +103,13 @@ pub const WRITE_IRI: &str = "urn:log:write";
 /// * `seq` — the writer's. It numbers every line, a seal range names it, and
 ///   verify checks the run is dense; a second `seq=` on one line is two
 ///   sequence numbers for one entry.
-/// * `principal` — the capability's: `urn:log:write` writes it from the one
-///   `urn:cap:principal:<iri>` the write ran under, as the tracer does for every
-///   resolution. A caller stating it would be one tenant attributing work to
-///   another, with a `prov:Delegation` in the graph to prove it.
+/// * `principal` — the capability's: every entry an endpoint here writes on a
+///   caller's behalf carries it from the one `urn:cap:principal:<iri>` the call
+///   ran under, as the tracer does for every resolution — `urn:log:write`'s
+///   entry, `urn:log:config`'s `log:LevelChange`, `log:ConfigChange` and
+///   `log:LevelChangeRejected`, and an endpoint's own `log:CapabilityDenied`. A
+///   caller stating it would be one tenant attributing work to another, with a
+///   `prov:Delegation` in the graph to prove it.
 /// * `cap`, `denied`, `failed` — the kernel's: the authority a resolution ran
 ///   under, the scope a refusal lacked, and the kind of error an invocation that
 ///   ran returned. A caller holding only [`CAP_WRITE`] must not be able to say
@@ -755,23 +758,71 @@ impl LogHandle {
     /// Best-effort by nature: a log with no open segment cannot record that
     /// something was refused, and the refusal still has to reach the caller.
     ///
+    /// **Unattributed**: this door has no invocation to read a principal from.
+    /// The endpoints here refuse through a private twin that has one, so their own
+    /// denials carry `principal=` as the tracer's do.
+    ///
     /// The scope goes in `denied=`, not `cap=`. They are different facts —
     /// `log:deniedScope` is what the caller LACKED and `log:capability` is what
     /// it HELD — and the kernel reports both, so one column could not carry
     /// them both without making every query about refusals ambiguous.
     pub fn record_denial(&self, now: Timestamp, capability: &str, action: &str) -> Option<u64> {
-        let entry = Entry::new(now, CAPABILITY_DENIED_CLASS, subject_for_denial(self))
-            .with("denied", capability)
-            .with("reason", action);
-        self.write(entry).ok().flatten()
+        self.write(self.denial(now, None, capability, action))
+            .ok()
+            .flatten()
     }
 
-    /// [`record_denial`](Self::record_denial), then the error to return.
-    fn deny(&self, now: Option<Timestamp>, capability: &str, action: &str) -> Error {
-        if let Some(now) = now {
-            self.record_denial(now, capability, action);
+    /// The `log:CapabilityDenied` entry, attributed when the refused invocation
+    /// is in hand.
+    fn denial(
+        &self,
+        now: Timestamp,
+        inv: Option<&Invocation<'_>>,
+        capability: &str,
+        action: &str,
+    ) -> Entry {
+        let entry = Entry::new(now, CAPABILITY_DENIED_CLASS, subject_for_denial(self));
+        match inv {
+            Some(inv) => attributed(entry, inv),
+            None => entry,
+        }
+        .with("denied", capability)
+        .with("reason", action)
+    }
+
+    /// Land a `log:CapabilityDenied` for `inv`, attributed to the principal it
+    /// ran under (the tracer attributes the kernel's own refusals the same way),
+    /// then return the error. Only an endpoint's own gate reaches this: under a
+    /// kernel the declared floor refuses first. Best-effort, as
+    /// [`record_denial`](Self::record_denial) is; with no clock there is no stamp,
+    /// so nothing lands and the refusal still reaches the caller.
+    fn deny(&self, inv: &Invocation<'_>, capability: &str, action: &str) -> Error {
+        if let Some(now) = inv.now().map(|t| Timestamp::from_millis(t.as_millis())) {
+            let _ = self.write(self.denial(now, Some(inv), capability, action));
         }
         Error::Denied(format!("{action} requires `{capability}`"))
+    }
+}
+
+/// `entry`, attributed to the principal `inv` ran under — the one
+/// `urn:cap:principal:<iri>` in its capability, read by core's rule
+/// (`Capability::principal`) through [`crate::Principal::new`], the same source
+/// and the same rule the tracer reads (`principal_of`). Every entry this crate's
+/// endpoints write on a caller's behalf goes through here: `urn:log:write`'s,
+/// `urn:log:config`'s changes and rejections, and an endpoint's own denial.
+///
+/// The column goes first, where the tracer puts it, so the eye finds it in one
+/// place on every line. No principal is no column, never an empty one; a
+/// principal core carries and the line cannot hold bare is left off rather than
+/// written quoted (no tested shape reaches that; see `principal_of`).
+fn attributed(entry: Entry, inv: &Invocation<'_>) -> Entry {
+    match inv
+        .capability
+        .principal()
+        .and_then(|iri| crate::Principal::new(iri).ok())
+    {
+        Some(principal) => entry.with(crate::vocabulary::PRINCIPAL_KEY, principal.as_str()),
+        None => entry,
     }
 }
 
@@ -845,8 +896,7 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
     // clock. Under a kernel this never fires — `requires` is enforced before
     // dispatch — but a detached or shimmed invocation reaches it.
     if !inv.capability.allows(CAP_WRITE) {
-        let stamp = inv.now().map(|t| Timestamp::from_millis(t.as_millis()));
-        return Err(handle.deny(stamp, CAP_WRITE, "appending a log entry"));
+        return Err(handle.deny(inv, CAP_WRITE, "appending a log entry"));
     }
     let stamp = now(inv)?;
 
@@ -904,20 +954,7 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
             .unwrap_or(config.instance),
     };
 
-    let mut entry = Entry::new(stamp, &class, subject);
-    // ★ Attributed from the capability the write ran under, the same source and
-    // the same rule the tracer reads (`principal_of`): a door mints
-    // `urn:cap:principal:<iri>` and the kernel hands it here verbatim. First,
-    // where the tracer puts it, so the eye finds it in one place on every line.
-    // A principal core carries and the line cannot hold bare is left off rather
-    // than written quoted; no tested shape reaches that (see `principal_of`).
-    if let Some(principal) = inv
-        .capability
-        .principal()
-        .and_then(|iri| crate::Principal::new(iri).ok())
-    {
-        entry = entry.with(crate::vocabulary::PRINCIPAL_KEY, principal.as_str());
-    }
+    let mut entry = attributed(Entry::new(stamp, &class, subject), inv);
     if let Some(prose) = prose {
         entry = entry.with("msg", prose);
     }
@@ -1067,8 +1104,7 @@ fn config_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
 #[cfg(not(target_family = "wasm"))]
 fn config_source(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Representation> {
     if !inv.capability.allows(CAP_READ) {
-        let stamp = inv.now().map(|t| Timestamp::from_millis(t.as_millis()));
-        return Err(handle.deny(stamp, CAP_READ, "reading the log config"));
+        return Err(handle.deny(inv, CAP_READ, "reading the log config"));
     }
     let config = handle.config();
     let open = handle.open_segment();
@@ -1121,8 +1157,7 @@ fn config_source(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Repres
 #[cfg(not(target_family = "wasm"))]
 fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Representation> {
     if !inv.capability.allows(CAP_CONFIG) {
-        let stamp = inv.now().map(|t| Timestamp::from_millis(t.as_millis()));
-        return Err(handle.deny(stamp, CAP_CONFIG, "changing the log config"));
+        return Err(handle.deny(inv, CAP_CONFIG, "changing the log config"));
     }
     let stamp = now(inv)?;
 
@@ -1148,9 +1183,12 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
                 } = &e
                 {
                     let _ = handle.write(
-                        Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI)
-                            .with("to", value.as_str())
-                            .with("reason", format!("not {expected}")),
+                        attributed(
+                            Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI),
+                            inv,
+                        )
+                        .with("to", value.as_str())
+                        .with("reason", format!("not {expected}")),
                     );
                 }
                 return Err(Error::InvalidArgument {
@@ -1196,9 +1234,12 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
             // Rejected, and the rejection lands: under any future `locked` mode
             // this entry is the evidence that a change did not take.
             let _ = handle.write(
-                Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI)
-                    .with("to", level.as_str())
-                    .with("reason", reason.clone()),
+                attributed(
+                    Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI),
+                    inv,
+                )
+                .with("to", level.as_str())
+                .with("reason", reason.clone()),
             );
             return Err(Error::InvalidArgument {
                 name: door.to_string(),
@@ -1307,7 +1348,7 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     let mut record = |class: &str, key: &str, from: String, to: String| {
         let when = effective(key);
         changed.push((key.to_string(), when));
-        let entry = Entry::new(stamp, class, CONFIG_IRI)
+        let entry = attributed(Entry::new(stamp, class, CONFIG_IRI), inv)
             .with("key", key)
             .with("from", from)
             .with("to", to)

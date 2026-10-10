@@ -6352,3 +6352,108 @@ fn a_depth_refusal_is_its_own_class_and_lands_at_the_default_level_but_not_at_er
         "a refusal's subject column means what every refusal's does"
     );
 }
+
+// ----- urn:log:config is attributed too (ledger #1116) ---------------------------------
+//
+// urn:log:write gained a `principal=` column in ledger #1103 (3); the config door writes
+// entries on a caller's behalf as well, and an operator asking "who lowered the level?"
+// is asking exactly the question that column answers.
+
+#[test]
+fn a_config_change_under_a_principal_bearing_capability_is_attributed_to_it() {
+    let home = Scratch::new("config-principal");
+    let (handle, captured) = open_handle(home.path(), Some("serve"), "error");
+    let kernel = kernel(handle);
+    let alice = Capability::scoped([CAP_CONFIG])
+        .with_principal(ALICE)
+        .expect("carried");
+    futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("level", "debug"), ("destination", "file")]),
+        &alice,
+    ))
+    .expect("the change lands");
+    // And one change with no principal in the capability: no column at all.
+    futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("instance", "bug:other")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect("the change lands");
+
+    let level_change = of_class(&captured, LEVEL_CHANGE_CLASS);
+    assert_eq!(level_change.len(), 1, "{level_change:#?}");
+    assert_eq!(level_change[0].get(PRINCIPAL_KEY), Some(ALICE));
+    let config_changes = of_class(&captured, CONFIG_CHANGE_CLASS);
+    let by_key = |key: &str| {
+        config_changes
+            .iter()
+            .find(|e| e.get("key") == Some(key))
+            .unwrap_or_else(|| panic!("{key}: {config_changes:#?}"))
+            .clone()
+    };
+    assert_eq!(by_key("destination").get(PRINCIPAL_KEY), Some(ALICE));
+    assert_eq!(
+        by_key("instance").get(PRINCIPAL_KEY),
+        None,
+        "no principal is no column, never an empty one"
+    );
+}
+
+#[test]
+fn a_rejected_level_change_is_attributed_through_either_door() {
+    let home = Scratch::new("rejected-principal");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle);
+    let alice = Capability::scoped([CAP_CONFIG])
+        .with_principal(ALICE)
+        .expect("carried");
+    // The named argument: a well-formed level the vocabulary does not define.
+    futures::executor::block_on(
+        kernel.issue(sink_request(CONFIG_IRI, &[("level", "log:loud")]), &alice),
+    )
+    .expect_err("not a level this vocabulary defines");
+    // The body: a level that is not even level-shaped.
+    futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("content", "level = \"not a level\"\n")]),
+        &alice,
+    ))
+    .expect_err("not a level");
+
+    let rejected = of_class(&captured, crate::vocabulary::LEVEL_CHANGE_REJECTED_CLASS);
+    assert_eq!(rejected.len(), 2, "one per door: {rejected:#?}");
+    for entry in &rejected {
+        assert_eq!(entry.get(PRINCIPAL_KEY), Some(ALICE), "{entry:#?}");
+    }
+}
+
+#[test]
+fn an_endpoints_own_denial_is_attributed_to_the_principal_that_was_refused() {
+    // Under a kernel the floor refuses first and the tracer attributes it; a
+    // detached or shimmed invocation reaches the endpoint's own gate, which lands
+    // log:CapabilityDenied itself — and must say for whom, as the tracer does.
+    let home = Scratch::new("deny-principal");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let alice = Capability::scoped([CAP_READ])
+        .with_principal(ALICE)
+        .expect("carried");
+    let bindings = ikigai_core::Bindings::new();
+    for (endpoint, request) in [
+        (
+            crate::endpoints::write(handle.clone()),
+            sink_request(WRITE_IRI, &[("msg", "hello")]),
+        ),
+        (
+            crate::endpoints::config(handle.clone()),
+            sink_request(CONFIG_IRI, &[("level", "debug")]),
+        ),
+    ] {
+        let inv = ikigai_core::Invocation::detached(&request, &bindings, &alice)
+            .with_clock(Arc::new(Fixed(1_700_000_000_000)));
+        let error = futures::executor::block_on(endpoint.invoke(&inv)).expect_err("refused");
+        assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    }
+    let denials = of_class(&captured, CAPABILITY_DENIED_CLASS);
+    assert_eq!(denials.len(), 2, "{denials:#?}");
+    for entry in &denials {
+        assert_eq!(entry.get(PRINCIPAL_KEY), Some(ALICE), "{entry:#?}");
+    }
+}
