@@ -75,6 +75,20 @@
 //!   before dispatch and this kernel has no tracer, so the only entry the walk
 //!   adds is PIPELINE's `log:Message msg=x`.
 //!
+//! ## Spaces: both constructors are HOST-named
+//!
+//! `SPACE-NAME` (conformance 0.6.0, ledger #987) holds a module to what each of
+//! its space constructors claims. Both of this crate's are instance-built:
+//! [`ikigai_log::endpoints::space`] and
+//! [`ikigai_log::endpoints::space_with_vocabulary`] take the `LogHandle` that
+//! decides which process logs where, and the latter a host-assembled vocabulary
+//! besides. Two hosts calling `space(..)` hold different logs behind the same
+//! doors, so a name would be a false cache claim; only the host knows which
+//! instance it passed in. Both are declared `host_named_space` and the walk holds
+//! each to claiming no name (`id()` is `None`, the topology root anonymous). The
+//! walked kernel is built over the SAME `Arc` the suite is handed for `space`,
+//! so the declaration is about the space under test rather than a twin of it.
+//!
 //! ## Names
 //!
 //! The six ids (`logWrite`, `logConfig`, `logSegments`, `logVerify`,
@@ -88,7 +102,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ikigai_conformance::{rdf, Check, Checks, Fixture, Report, Suite};
-use ikigai_core::{ArgRef, Capability, Clock, Iri, Kernel, Representation, Request, Time, Verb};
+use ikigai_core::{
+    ArgRef, Capability, Clock, EndpointSpace, Iri, Kernel, Representation, Request, Time, Verb,
+};
 use ikigai_log::{
     Destination, LogConfig, LogHandle, SealPolicy, Timestamp, Vocabulary, CAP_READ, CONFIG_IRI,
     LOG_NS, SEGMENTS_IRI, SIG_NS, TRANSREPT_IRI, VERIFY_IRI, VOCABULARY_TTL, WRITE_IRI,
@@ -103,6 +119,12 @@ const CONFIG: &str = "logConfig";
 const SEGMENTS: &str = "logSegments";
 const VERIFY: &str = "logVerify";
 const SEGMENT: &str = "logSegment";
+
+/// What `SPACE-NAME` findings and the report's `space:` lines call the two
+/// constructors — the call, as the conformance README asks.
+const SPACE_LABEL: &str = "ikigai_log::endpoints::space(handle)";
+const WITH_VOCABULARY_LABEL: &str =
+    "ikigai_log::endpoints::space_with_vocabulary(handle, vocabulary)";
 
 /// The instance every fixture segment is attributed to.
 const INSTANCE: &str = "conformance";
@@ -179,6 +201,12 @@ struct Log {
     iri: String,
     /// The segment file — the golden thread a read declares.
     path: PathBuf,
+    /// `space(handle)`: the space the kernel walks, the same `Arc` the suite's
+    /// `host_named_space` declaration is handed.
+    space: Arc<EndpointSpace>,
+    /// `space_with_vocabulary(handle, vocabulary)` over the same handle, the
+    /// other constructor, declared host-named beside it.
+    with_vocabulary: Arc<EndpointSpace>,
     _scratch: Scratch,
 }
 
@@ -222,12 +250,18 @@ impl Log {
             "the fixture segment is checkpointed before the walk: {}",
             path.display()
         );
-        let kernel = Kernel::new(Arc::new(ikigai_log::endpoints::space(handle)))
-            .with_clock(Arc::new(Fixed(T0 + 2_000)));
+        let with_vocabulary = Arc::new(ikigai_log::endpoints::space_with_vocabulary(
+            handle.clone(),
+            Vocabulary::shared_builtin(),
+        ));
+        let space = Arc::new(ikigai_log::endpoints::space(handle));
+        let kernel = Kernel::new(space.clone()).with_clock(Arc::new(Fixed(T0 + 2_000)));
         Log {
             kernel,
             iri,
             path,
+            space,
+            with_vocabulary,
             _scratch: scratch,
         }
     }
@@ -283,8 +317,8 @@ fn reader() -> Capability {
 
 /// The suite, configured for this module (the file docs say why each line): the
 /// two namespaces the faces use beside the well-known ones, a real segment for
-/// the transreptor and the segment's own tail for the template, and the one pure
-/// function declared as such.
+/// the transreptor and the segment's own tail for the template, the one pure
+/// function declared as such, and both space constructors declared host-named.
 fn suite(log: &Log) -> Suite {
     Suite::new()
         .checks(Checks::all() - Checks::NAMES)
@@ -295,6 +329,8 @@ fn suite(log: &Log) -> Suite {
         .fixture(Fixture::new(SEGMENT, Verb::Exists).binding("segment", log.tail()))
         .pure(TRANSREPT)
         .cacheable(TRANSREPT)
+        .host_named_space(SPACE_LABEL, log.space.clone())
+        .host_named_space(WITH_VOCABULARY_LABEL, log.with_vocabulary.clone())
 }
 
 /// The walk saw the six endpoints and their eight actions (config and the
@@ -316,6 +352,16 @@ fn assert_shape(report: &Report) {
         [Check::Names],
         "wave two, and nothing else: {report}"
     );
+    // Both constructors reached SPACE-NAME (a declaration that reached nothing
+    // would be a DECLARATIONS finding, but a report that silently dropped the
+    // `space:` lines would not).
+    let printed = report.to_string();
+    for label in [SPACE_LABEL, WITH_VOCABULARY_LABEL] {
+        assert!(
+            printed.contains(&format!("space: {label} host-named")),
+            "{label} is checked as host-named: {report}"
+        );
+    }
 }
 
 #[test]

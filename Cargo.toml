@@ -29,6 +29,13 @@ rust-version = "1.89"
 # seam the per-tenant `LogTracer` exists to be handed to, which landed in 0.1.48.
 # This crate never CALLS it (a host does), but rustdoc resolves the link, so it
 # belongs in this accounting.
+#
+# ⚠ This floor is the LIBRARY's, and it is deliberately below what the tests
+# build against: the conformance dev-dependency (0.6.0) needs core 0.1.89, so the
+# test graph never resolves below that, and no CI job compiles this crate at
+# 0.1.62. Raising the pin would not make the floor tested — it would only make a
+# consumer's resolve stricter than anything in src needs (rule 5: a pin states the
+# true minimum API used). A dev-dependency never enters a consumer's resolve.
 ikigai-core = "0.1.62"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
@@ -87,12 +94,14 @@ futures = "0.3" # block_on, for the endpoint tests
 ikigai-sparql = "0.1.6"
 
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
-# crate binds, every action each declares, every checkable rule at once. 0.2.0
-# adds DECLARATIONS (a declaration whose target the walk never reached is
-# reported, rather than silently doing nothing) and carries OUTPUTS from 0.1.1,
-# which the 0.1.0 pin never ran. The floor is 0.2.0, not `0.1`, because this
-# crate's suite is now written to be clean under DECLARATIONS and a resolve that
-# fell back to 0.1.x would be checking less than the file claims. It pulls
-# ikigai-core 0.1.67 (`Kernel::entries` listing the kernel's own operations),
-# which the caret above admits.
-ikigai-conformance = "0.2.0"
+# crate binds, every action each declares, every checkable rule at once.
+#
+# ⚠ Under Cargo's 0.x rules this pin is a CEILING as well as a floor: `"0.6.0"`
+# means `>=0.6.0, <0.7.0`. The previous `"0.2.0"` pin froze this crate out of
+# 0.3 (AUTHORITY), 0.4 (request-memoized firing), 0.5 (own-name purity) and 0.6
+# (SPACE-NAME) while the suite kept reporting green against the old definition
+# of "done". 0.6.0 is the floor because the suite declares both space
+# constructors host-named (`Suite::host_named_space`, new there); it pulls
+# ikigai-core 0.1.89, which the library caret above admits. Raise this pin
+# deliberately when 0.7 ships, and read what it checks.
+ikigai-conformance = "0.6.0"
