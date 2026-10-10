@@ -93,15 +93,16 @@ anyone**, so `urn:log:write` refuses, with `InvalidArgument`:
 
 * the columns the log writes itself — `seq` (the writer's numbering), `principal`
   (the host's: minted into the capability at its door, or named through
-  `Principal::new` and a per-tenant tracer), `cap` and
-  `denied` (the kernel's: the authority a resolution held, the scope a refusal
-  lacked), and `pid`, `configured` and `next` (the writer's markers'). The list
+  `Principal::new` and a per-tenant tracer), `cap`, `denied` and `failed` (the
+  kernel's: the authority a resolution held, the scope a refusal lacked, the kind
+  of error an invocation that ran returned), and `pid`, `configured` and `next` (the writer's markers'). The list
   is `RESERVED_COLUMNS`. A tenant that could write `principal=` could attribute
   its entries to another tenant, with a `prov:Delegation` in the graph to prove
   it;
 * every **always-land class** — `log:ProcessStart`/`Stop`, `log:Rotation`,
   `log:LevelChange`/`ConfigChange`, `log:Seal`, `log:ChainBroken`,
-  `log:Dropped`, `log:CapabilityDenied`, and a module's subclass of any of them.
+  `log:Dropped`, `log:CapabilityDenied` (and its `log:EndpointDenied`), and a
+  module's subclass of any of them.
   Those are the markers verify and the cache believe: a forged stop is what makes
   a segment read as finished, a forged level change is what explains a gap;
 * a class or subject RDF would not accept (`urn:x:{a}`), which the line grammar
@@ -462,6 +463,19 @@ The mapping is nearly one-to-one, and two pieces of it are load-bearing:
   (`DENIED_NOTE`), and `log:CapabilityDenied` is always-land. `denied=` is the
   scope the caller **lacked**; `cap=` is the authority it **held** — two facts,
   two columns.
+* **An endpoint's own refusal lands too.** A module's parameterized ACL (an fs
+  path rule, a net host rule) is the real gate for those modules, and it refuses
+  from INSIDE the endpoint. Core 0.1.92 reports every invocation that ran and
+  failed as `failed=<kind>` (`FAILED_NOTE`, the error's kind and nothing from its
+  message); `failed=denied` is the class `log:EndpointDenied`,
+  `rdfs:subClassOf log:CapabilityDenied` and always-land, and every other kind
+  stays a `log:Resolution` with a `failed=` column (`log:failureKind`). A query
+  without a reasoner names both denial classes. One refusal under a composite
+  that propagates it with `?` lands once per refusing level.
+
+```
+2026-10-10T18:02:11.400Z log:EndpointDenied urn:file:/etc/shadow seq=43 principal=urn:agent:alice worker=ikigai-sched-1 span=4 dur=0 failed=denied
+```
 
 Two costs, stated rather than left to be discovered:
 

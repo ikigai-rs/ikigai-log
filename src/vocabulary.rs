@@ -70,6 +70,18 @@ pub const LEVEL_CHANGE_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChange";
 pub const LEVEL_CHANGE_REJECTED_CLASS: &str = "https://ikigai-rs.dev/ns/log#LevelChangeRejected";
 /// `log:CapabilityDenied` — always-land.
 pub const CAPABILITY_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#CapabilityDenied";
+/// `log:EndpointDenied` — always-land. An endpoint that RAN and refused with its
+/// own `Error::Denied` (a module's parameterized ACL, the real gate for fs and
+/// net), which core reports as `failed=denied` on a timed event
+/// ([`ikigai_core::FAILED_NOTE`]) rather than as the floor's
+/// [`ikigai_core::DENIED_NOTE`]. A subclass of [`CAPABILITY_DENIED_CLASS`], so
+/// its subject column means `log:refused` and a reasoner reads every refused
+/// authority as one class; a query WITHOUT a reasoner names both.
+pub const ENDPOINT_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#EndpointDenied";
+/// The `key=` column `log:failureKind` is bound to: core's
+/// [`FAILED_NOTE`](ikigai_core::FAILED_NOTE), the same string, so the note key
+/// and the log's column cannot drift into two spellings of one fact.
+pub const FAILED_KEY: &str = ikigai_core::FAILED_NOTE;
 /// `log:Resolution` — one resolved invocation, as `ikigai_core::Tracer` reports
 /// it. Written at `debug` and above.
 pub const RESOLUTION_CLASS: &str = "https://ikigai-rs.dev/ns/log#Resolution";

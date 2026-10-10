@@ -5760,3 +5760,171 @@ fn every_principal_core_will_mint_is_one_the_log_can_write() {
         assert_eq!(core, log, "{iri}: core mints = {core}, log writes = {log}");
     }
 }
+
+// =====================================================================================
+// ledger #1062 — a failed invocation has a term, and an endpoint's own refusal lands
+// =====================================================================================
+
+use crate::vocabulary::{ENDPOINT_DENIED_CLASS, FAILED_KEY};
+use ikigai_core::FAILED_NOTE;
+
+const REFUSING_IRI: &str = "urn:traced:refusing";
+const MISSING_IRI: &str = "urn:traced:missing";
+
+/// An endpoint that runs and refuses (`Error::Denied` from the module's own ACL,
+/// the real gate for fs and net), and one that runs and finds nothing.
+fn failing_space() -> EndpointSpace {
+    EndpointSpace::new()
+        .bind(
+            Exact::new(REFUSING_IRI),
+            FnEndpoint::new("tracedRefusing", |_inv| {
+                Err(ikigai_core::Error::Denied(
+                    "the module's own path rule".into(),
+                ))
+            }),
+        )
+        .bind(
+            Exact::new(MISSING_IRI),
+            FnEndpoint::new("tracedMissing", |_inv| {
+                Err(ikigai_core::Error::NotFound(MISSING_IRI.to_string()))
+            }),
+        )
+}
+
+fn failing_kernel(tracer: Arc<LogTracer>) -> Kernel {
+    let kernel =
+        Kernel::new(Arc::new(failing_space())).with_clock(Arc::new(Fixed(1_700_000_000_000)));
+    kernel.set_tracer(tracer);
+    kernel
+}
+
+#[test]
+fn the_failed_column_is_cores_note_key() {
+    assert_eq!(FAILED_KEY, FAILED_NOTE);
+}
+
+#[test]
+fn an_endpoints_own_refusal_is_its_own_class_and_lands_at_every_level() {
+    // ★ The claim of ledger #1062, reproduced: core 0.1.92 reports an endpoint's
+    // own `Denied` as `failed=denied` on a TIMED event (not DENIED_NOTE, which is
+    // the floor's), and a refused authority is a security fact. At `error`, where
+    // a `log:Resolution` is filtered, it must still land.
+    let home = Scratch::new("endpoint-denied");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let kernel = failing_kernel(tracer_for(handle, 1_700_000_000_000));
+    let alice = Capability::scoped(Vec::<String>::new())
+        .with_principal(ALICE)
+        .expect("carried");
+
+    let refused = futures::executor::block_on(kernel.issue(get(REFUSING_IRI), &alice));
+    assert!(
+        matches!(refused, Err(ikigai_core::Error::Denied(_))),
+        "{refused:?}"
+    );
+    let missing = futures::executor::block_on(kernel.issue(get(MISSING_IRI), &alice));
+    assert!(
+        matches!(missing, Err(ikigai_core::Error::NotFound(_))),
+        "{missing:?}"
+    );
+
+    let entry = the_entry(&captured, ENDPOINT_DENIED_CLASS, REFUSING_IRI);
+    assert_eq!(entry.get(FAILED_KEY), Some("denied"));
+    assert_eq!(
+        entry.get("dur"),
+        Some("0"),
+        "it RAN, so it is timed: {entry:?}"
+    );
+    assert_eq!(entry.get(PRINCIPAL_KEY), Some(ALICE), "and attributed");
+    assert_eq!(entry.get(DENIED_NOTE), None, "no floor scope was lacking");
+    assert!(
+        entries(&captured).iter().all(|e| e.subject != MISSING_IRI),
+        "an ordinary failure is a log:Resolution, filtered at error like any other"
+    );
+}
+
+#[test]
+fn the_class_order_is_floor_refusal_then_endpoint_refusal_then_the_rest() {
+    let event = |notes: Vec<(&str, &str)>, cache_hit: bool| TraceEvent {
+        notes: notes
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        cache_hit,
+        ..resolution("urn:traced:thing", 0, 1_700_000_000_000)
+    };
+    assert_eq!(
+        class_for(&event(vec![(FAILED_NOTE, "denied")], false)),
+        ENDPOINT_DENIED_CLASS
+    );
+    assert_eq!(
+        class_for(&event(vec![(FAILED_NOTE, "not-found")], false)),
+        RESOLUTION_CLASS,
+        "only a refusal is a security fact; other failures keep their class"
+    );
+    assert_eq!(
+        class_for(&event(
+            vec![(DENIED_NOTE, "urn:cap:x"), (FAILED_NOTE, "denied")],
+            false
+        )),
+        CAPABILITY_DENIED_CLASS,
+        "the floor's refusal is the more specific fact, should both ever appear"
+    );
+}
+
+#[test]
+fn a_failed_column_transrepts_to_a_declared_term_not_an_undeclared_key() {
+    let home = Scratch::new("failed-graph");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = failing_kernel(tracer_for(handle, 1_700_000_000_000));
+    let _ = futures::executor::block_on(kernel.issue(get(REFUSING_IRI), &Capability::root()));
+    let _ = futures::executor::block_on(kernel.issue(get(MISSING_IRI), &Capability::root()));
+
+    let text = captured.text();
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let has = |p: &str, o: &str| {
+        triples
+            .iter()
+            .any(|t| t.predicate.as_str() == p && t.object.to_string() == o)
+    };
+    assert!(
+        has(&log("failureKind"), "\"denied\""),
+        "the refusal's kind: {triples:#?}"
+    );
+    assert!(has(&log("failureKind"), "\"not-found\""), "the miss's kind");
+    assert!(
+        !has(&log("undeclaredKey"), "\"failed\""),
+        "★ the column is declared now, not flagged: {triples:#?}"
+    );
+    assert!(
+        has(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            &format!("<{ENDPOINT_DENIED_CLASS}>")
+        ),
+        "the class is stated"
+    );
+    assert!(
+        has(&log("refused"), &format!("<{REFUSING_IRI}>")),
+        "and its subject column means what a denial's does, inherited from \
+         log:CapabilityDenied: {triples:#?}"
+    );
+}
+
+#[test]
+fn a_caller_cannot_write_a_failure_or_an_endpoint_refusal() {
+    // `failed` is the kernel's column, as `denied` is: a caller holding only the
+    // write cap must not state that something failed, or was refused.
+    let home = Scratch::new("failed-reserved");
+    let (handle, _captured) = open_handle(home.path(), None, "debug");
+    let kernel = kernel(handle);
+    let cap = Capability::scoped([CAP_WRITE]);
+    for args in [
+        vec![("msg", "x"), ("fields", "failed=denied")],
+        vec![("msg", "x"), ("class", "log:EndpointDenied")],
+    ] {
+        let wrote = futures::executor::block_on(kernel.issue(sink_request(WRITE_IRI, &args), &cap));
+        assert!(
+            matches!(wrote, Err(ikigai_core::Error::InvalidArgument { .. })),
+            "{args:?}: {wrote:?}"
+        );
+    }
+}
