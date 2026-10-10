@@ -673,6 +673,13 @@ must cut. `urn:log:transrept` is declared `pure` and `cacheable` (Turtle from
 bytes, no file, no clock); `urn:log:config`, `urn:log:segments` and
 `urn:log:verify` are live by design and say so in their descriptions.
 
+**The space has no name of its own, on purpose.** Both constructors,
+`endpoints::space(handle)` and `endpoints::space_with_vocabulary(handle,
+vocabulary)`, are built over the `LogHandle` a host passes in, so two hosts hold
+different logs behind the same doors and a fixed name would be a false cache
+claim. The HOST names the space it builds; the test declares both constructors
+host-named, and conformance's `SPACE-NAME` check holds each to claiming no name.
+
 Two namespaces are registered as the module's own beside the well-known ones:
 `log:` (`https://ikigai-rs.dev/ns/log#`), defined in
 [`src/vocabulary.ttl`](src/vocabulary.ttl) — and since registering a namespace
