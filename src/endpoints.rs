@@ -103,10 +103,10 @@ pub const WRITE_IRI: &str = "urn:log:write";
 /// * `seq` — the writer's. It numbers every line, a seal range names it, and
 ///   verify checks the run is dense; a second `seq=` on one line is two
 ///   sequence numbers for one entry.
-/// * `principal` — the host's, through [`crate::Principal::new`] and a
-///   per-tenant [`crate::LogTracer`]. A caller stating it would be one tenant
-///   attributing work to another, with a `prov:Delegation` in the graph to
-///   prove it.
+/// * `principal` — the capability's: `urn:log:write` writes it from the one
+///   `urn:cap:principal:<iri>` the write ran under, as the tracer does for every
+///   resolution. A caller stating it would be one tenant attributing work to
+///   another, with a `prov:Delegation` in the graph to prove it.
 /// * `cap`, `denied`, `failed` — the kernel's: the authority a resolution ran
 ///   under, the scope a refusal lacked, and the kind of error an invocation that
 ///   ran returned. A caller holding only [`CAP_WRITE`] must not be able to say
@@ -905,6 +905,19 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
     };
 
     let mut entry = Entry::new(stamp, &class, subject);
+    // ★ Attributed from the capability the write ran under, the same source and
+    // the same rule the tracer reads (`principal_of`): a door mints
+    // `urn:cap:principal:<iri>` and the kernel hands it here verbatim. First,
+    // where the tracer puts it, so the eye finds it in one place on every line.
+    // A principal core carries and the line cannot hold bare is left off rather
+    // than written quoted; no tested shape reaches that (see `principal_of`).
+    if let Some(principal) = inv
+        .capability
+        .principal()
+        .and_then(|iri| crate::Principal::new(iri).ok())
+    {
+        entry = entry.with(crate::vocabulary::PRINCIPAL_KEY, principal.as_str());
+    }
     if let Some(prose) = prose {
         entry = entry.with("msg", prose);
     }

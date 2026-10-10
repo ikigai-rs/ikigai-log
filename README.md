@@ -98,7 +98,9 @@ anyone**, so `urn:log:write` refuses, with `InvalidArgument`:
   of error an invocation that ran returned), and `pid`, `configured` and `next` (the writer's markers'). The list
   is `RESERVED_COLUMNS`. A tenant that could write `principal=` could attribute
   its entries to another tenant, with a `prov:Delegation` in the graph to prove
-  it;
+  it. The entry IS attributed, from the capability the write ran under: a door that
+  minted `urn:cap:principal:<iri>` gets `principal=` on what its caller wrote, by
+  the same rule the tracer reads (`principal_of`);
 * every **always-land class** — `log:ProcessStart`/`Stop`, `log:Rotation`,
   `log:LevelChange`/`ConfigChange`, `log:Seal`, `log:ChainBroken`,
   `log:Dropped`, `log:CapabilityDenied` (and its `log:EndpointDenied`), and a
@@ -197,6 +199,12 @@ already shipped.
   both lines sit in one segment **and one process run** — spans restart with the
   process, so the join is scoped between `log:ProcessStart` markers. Where it
   does not resolve the literal stays and no edge is invented.
+* **no `rdfs:domain` types an entry into a family it is not in.** A domain is an
+  inference, not a constraint: `span=` declared on `log:Resolution` made a
+  reasoner conclude every refusal carrying it was a resolution. Columns that ride
+  on more than one family declare `log:Entry`, or no domain at all, and a test
+  runs the RDFS domain and range inference over what the tracer, the writer and
+  `urn:log:config` actually write and refuses any type it would add that is false.
 
 `log:segment` lands on every entry too. Not as the mechanism — as insurance:
 `urn:rdf:union` is triple-only and loses graph names, so this is what keeps a
@@ -472,6 +480,18 @@ The mapping is nearly one-to-one, and two pieces of it are load-bearing:
   stays a `log:Resolution` with a `failed=` column (`log:failureKind`). A query
   without a reasoner names both denial classes. One refusal under a composite
   that propagates it with `?` lands once per refusing level.
+* **A depth refusal is its own class, at `warn`.** A sub-request nested past
+  `Kernel::with_max_depth` never ran (`DEPTH_NOTE`), so it is `log:DepthExceeded`
+  with `depth=` and its subject read as `log:refused`, not a resolution. It is not
+  always-land, because no authority was refused; it lands at the default level,
+  because a runaway tree is always a defect and produces exactly one.
+* **Every other note core reports has a term**, spelled as core spells the key:
+  `alias=` / `alias-unresolved=`, `scope=` / `scope-unresolved=` / `scope-clock=`,
+  `limited=`, `answered-by=`, `sealed=`, `level=` (the scope levels an endpoint ran
+  in, `log:levelPath`, not the dial) and `uncached=` (why a read was not cached).
+  Names are IRIs, so `answered-by=` joins; `depth=` and `scope-clock=` are
+  integers. None of them lands as `log:undeclaredKey`, which `uncached=` on every
+  uncacheable resolution had turned into noise.
 
 ```
 2026-10-10T18:02:11.400Z log:EndpointDenied urn:file:/etc/shadow seq=43 principal=urn:agent:alice worker=ikigai-sched-1 span=4 dur=0 failed=denied

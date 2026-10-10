@@ -78,10 +78,10 @@ log:resolved a rdf:Property ;
 
 log:invoked a rdf:Property ;
     rdfs:subPropertyOf prov:wasInformedBy ;
-    rdfs:domain log:Resolution ;
-    rdfs:range log:Resolution ;
+    rdfs:domain log:Entry ;
+    rdfs:range log:Entry ;
     rdfs:label "invoked" ;
-    rdfs:comment "This resolution issued that sub-resolution and consumed its representation — the call-tree edge, parent to child. prov:wasInformedBy holds in exactly this direction: the parent used an entity the child generated. Materialized from log:parentSpan where both lines sit in one segment and one process run; across a rotation or a restart the literal spans survive and the edge is recovered by union." .
+    rdfs:comment "This resolution issued that sub-resolution and consumed its representation — the call-tree edge, parent to child. prov:wasInformedBy holds in exactly this direction: the parent used an entity the child generated. Materialized from log:parentSpan where both lines sit in one segment and one process run; across a rotation or a restart the literal spans survive and the edge is recovered by union. Domain and range are log:Entry, NOT log:Resolution: the edge reaches a child that was refused (a log:CapabilityDenied, a log:DepthExceeded) as readily as one that ran, and leaves a composite that propagated its child's refusal (a log:EndpointDenied), so a narrower declaration would type every refusal in a call tree a resolution — the rdfs:domain family trap." .
 
 log:subject a rdf:Property ;
     rdfs:domain log:Entry ;
@@ -176,21 +176,21 @@ log:CacheHit a rdfs:Class ;
 
 log:span a rdf:Property ;
     log:keyName "span" ;
-    rdfs:domain log:Resolution ;
+    rdfs:domain log:Entry ;
     rdfs:range xsd:integer ;
     rdfs:label "span" ;
-    rdfs:comment "TraceEvent.span — unique within one process run of the kernel, which is why log:ProcessStart is what bounds a span join." .
+    rdfs:comment "TraceEvent.span — unique within one process run of the kernel, which is why log:ProcessStart is what bounds a span join. On every entry the tracer writes, refusals included, which is why the domain is log:Entry: an rdfs:domain is an inference, not a constraint, and log:Resolution here made a reasoner conclude that every log:CapabilityDenied was a resolution (ledger #1103)." .
 
 log:parentSpan a rdf:Property ;
     log:keyName "parent" ;
-    rdfs:domain log:Resolution ;
+    rdfs:domain log:Entry ;
     rdfs:range xsd:integer ;
     rdfs:label "parentSpan" ;
     rdfs:comment "TraceEvent.parent, kept as the literal it was written as. log:invoked is materialized from it where it resolves; the literal remains, so the edge is still recoverable after a union across segments." .
 
 log:worker a rdf:Property ;
     log:keyName "worker" ;
-    rdfs:domain log:Resolution ;
+    rdfs:domain log:Entry ;
     rdfs:range xsd:string ;
     rdfs:label "worker" ;
     rdfs:comment "The scheduler worker the invocation ran on (TraceEvent.thread). Named `worker`, NOT `thread`: in ikigai a thread is a GOLDEN thread, and a vocabulary that spent that word on an OS thread would mislead every query later written against it." .
@@ -215,6 +215,103 @@ log:durationMs a rdf:Property ;
     rdfs:range xsd:integer ;
     rdfs:label "durationMs" ;
     rdfs:comment "Elapsed milliseconds, from TraceEvent.started/ended. A duration rather than a second absolute timestamp because a threshold is what anyone greps or filters on; prov:endedAtTime is derivable from it and the start, and is materialized only where a consumer needs it." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# What the kernel notes about a resolution — core's TraceEvent.notes keys
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Every column below is spelled exactly as ikigai_core spells the note key (the
+# `*_NOTE` constants), so the mapping stays identity: the tracer copies notes
+# into columns, and this table is what gives each one a meaning. Before these
+# were declared, each landed as log:{key} flagged log:undeclaredKey, and
+# `uncached=` rides on EVERY uncacheable resolution, so the hygiene signal was
+# noise by construction (ledger #1103). Every domain is log:Entry: a note rides
+# on whatever event the kernel attaches it to, refusals included, and a
+# narrower rdfs:domain would type those into a family they are not in.
+
+log:DepthExceeded a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:warn ;
+    log:subjectPredicate log:refused ;
+    rdfs:label "DepthExceeded" ;
+    rdfs:comment "A sub-request refused for nesting past the kernel's budget (ikigai_core::DEPTH_NOTE, Kernel::with_max_depth): the caller got Error::DepthExceeded, and nothing at that depth RAN, so this is not a log:Resolution — log:resolved is a sub-property of prov:used, and nothing was used. Its parent span is the invocation that asked once too often, which is where a self-issuing endpoint or a transclusion cycle shows in the call tree. At log:warn, NOT always-land: no authority was refused (the caller's capability was sufficient), so it is not the security fact a log:CapabilityDenied is, and its absence at `error` hides nothing a verifier needs to explain. But unlike an ordinary failed= resolution (often a NotFound a fallback consumed on purpose), a depth refusal is always a defect, and one runaway tree produces exactly one, so it lands at the default level rather than among the debug-level resolutions around it. The invocations above it that ran and failed with depth-exceeded stay log:Resolution with failed=depth-exceeded." .
+
+log:depth a rdf:Property ;
+    log:keyName "depth" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:integer ;
+    rdfs:label "depth" ;
+    rdfs:comment "The nesting depth a refused sub-request would have run at (ikigai_core::DEPTH_NOTE): one past the kernel's budget." .
+
+log:aliasHop a rdf:Property ;
+    log:keyName "alias" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "aliasHop" ;
+    rdfs:comment "The logical rewrite a request's target arrived through, as core renders it: `{asked} -> {backing}` (ikigai_core::ALIAS_NOTE). On every event of an aliased request, the refusal and the miss included, because a denial on a rewritten target is the shape that fails by simply not holding." .
+
+log:aliasUnresolved a rdf:Property ;
+    log:keyName "alias-unresolved" ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "aliasUnresolved" ;
+    rdfs:comment "The backing name a rewrite led to that had no binding (ikigai_core::ALIAS_MISS_NOTE). Only beside log:aliasHop, on an event recording a resolution that never happened. An IRI, so it joins to the bindings that should have answered." .
+
+log:scopeChain a rdf:Property ;
+    log:keyName "scope" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "scopeChain" ;
+    rdfs:comment "The resolution chain a request resolved in, innermost first, ending in `root` or `severed`, as ikigai_core::Scope renders it (ikigai_core::SCOPE_NOTE). A string, not a list of IRIs, because its last token is a keyword and not a name. Absent in the empty chain." .
+
+log:scopeUnresolved a rdf:Property ;
+    log:keyName "scope-unresolved" ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "scopeUnresolved" ;
+    rdfs:comment "A target that resolved to nothing INSIDE a non-empty chain (ikigai_core::SCOPE_MISS_NOTE). The caller saw an ordinary Unresolved by design, so this is the only place the fact \"it is bound, just not in here\" shows." .
+
+log:limitedTarget a rdf:Property ;
+    log:keyName "limited" ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "limitedTarget" ;
+    rdfs:comment "The canonical target a limiter admitted (ikigai_core::LIMITED_NOTE). The caller's answer is byte-identical to a name bound nowhere; this is the operator's face, and whoever reads it is whoever placed the limiter." .
+
+log:answeredBy a rdf:Property ;
+    log:keyName "answered-by" ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "answeredBy" ;
+    rdfs:comment "The space that answered: the innermost named space on the path, or the named corridor a hit came from (ikigai_core::ANSWERED_NOTE). An IRI, because it is the datum a cache keyed on the corridors actually consulted would key on, and a string joins to nothing." .
+
+log:sealViolation a rdf:Property ;
+    log:keyName "sealed" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "sealViolation" ;
+    rdfs:comment "A sealed name answered where its owner is not, as core states the refusal: the name, its owner and the level that answered (ikigai_core::SEALED_NOTE). A kernel seal on a NAME, unrelated to this log's log:Seal over a run of entries; the column keeps core's spelling and the property says which seal it means." .
+
+log:levelPath a rdf:Property ;
+    log:keyName "level" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "levelPath" ;
+    rdfs:comment "The scope levels an endpoint was found in, innermost first, as ikigai_core::LevelPath renders it (ikigai_core::LEVEL_NOTE): where the endpoint RAN, and so where its sub-requests resolve. A kernel level, not a verbosity level, and deliberately not log:level, the segment's rung on the dial. Undeclared, the column fell back to log:level and a reasoner typed the resolution a log:Segment." .
+
+log:uncachedReason a rdf:Property ;
+    log:keyName "uncached" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "uncachedReason" ;
+    rdfs:comment "Why a computed read was not cached, in core's clauses joined by `; ` (declared, dependency <iri>…, denied <iri>…, failed <iri>…, +<n> more, upstream, no-clock, expired <ms>, cut-in-flight, policy; ikigai_core::UNCACHED_NOTE). Only the immediate cause: the dependency's own entry names the next one. Kept as core writes it rather than split, so the column greps exactly as urn:kernel:uncached reads." .
+
+log:scopeClockMs a rdf:Property ;
+    log:keyName "scope-clock" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:integer ;
+    rdfs:label "scopeClockMs" ;
+    rdfs:comment "What a temporal corridor's derived clock read as the event was recorded, in milliseconds since the epoch (ikigai_core::SCOPE_CLOCK_NOTE). Only beside log:scopeChain. The corridor's name is a claim about time; this is what the kernel observed. The kernel's own clock stays on prov:startedAtTime." .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The unstructured escape hatch — permitted, honest, and MEASURABLE
@@ -357,10 +454,10 @@ log:CapabilityDenied a rdfs:Class ;
     rdfs:comment "A refused authority is a security fact, so it lands at every level. The kernel reports one per pre-dispatch refusal (ikigai_core::DENIED_NOTE); log:deniedScope names the scope the caller LACKED and log:capability the authority it actually held — two different facts that must never share a column." .
 
 log:refused a rdf:Property ;
-    rdfs:domain log:CapabilityDenied ;
+    rdfs:domain log:Entry ;
     rdfs:range rdfs:Resource ;
     rdfs:label "refused" ;
-    rdfs:comment "The resource the caller was refused: the subject column of a log:CapabilityDenied. NOT a sub-property of prov:used — nothing was used, which is the whole point. PROV describes what happened and has no term for what was prevented, so this is ikigai's own, and it is the join key that connects a refusal to the resolutions of the same target that did succeed." .
+    rdfs:comment "The resource the caller was refused: the subject column of a log:CapabilityDenied. NOT a sub-property of prov:used — nothing was used, which is the whole point. PROV describes what happened and has no term for what was prevented, so this is ikigai's own, and it is the join key that connects a refusal to the resolutions of the same target that did succeed. The subject predicate of every refusal class, log:DepthExceeded included, which is why its domain is log:Entry rather than log:CapabilityDenied: a depth refusal is not a refused AUTHORITY, and a narrower domain would make a reasoner say it was." .
 
 log:deniedScope a rdf:Property ;
     log:keyName "denied" ;
@@ -434,10 +531,9 @@ log:instance a rdf:Property ;
 
 log:configLayer a rdf:Property ;
     log:keyName "file" ;
-    rdfs:domain log:Config ;
     rdfs:range xsd:string ;
     rdfs:label "configLayer" ;
-    rdfs:comment "One config file that contributed to the effective config, lowest precedence first. Provenance, not configuration — which is why the TOML face omits it and the graph face does not. Also bound as the line column `file=`, naming the layer a log:ConfigChange actually wrote." .
+    rdfs:comment "One config file that contributed to the effective config, lowest precedence first. Provenance, not configuration — which is why the TOML face omits it and the graph face does not. Also bound as the line column `file=`, naming the layer a log:ConfigChange actually wrote — which is why it declares no rdfs:domain: it describes a log:Config and an entry, two things with no common class short of rdfs:Resource, and either narrower domain would type the other into it." .
 
 log:Cadence a rdfs:Class ;
     rdfs:label "Cadence" ;
@@ -481,10 +577,9 @@ log:currentSegment a rdf:Property ;
 
 log:configuredInstance a rdf:Property ;
     log:keyName "configured" ;
-    rdfs:domain log:Instance ;
     rdfs:range log:Instance ;
     rdfs:label "configuredInstance" ;
-    rdfs:comment "The instance name that was ASKED for, when a live process already held it and this one took a disambiguated name instead. Two facts, both true — a silent disambiguation would make the header disagree with the config and nothing would say why. Also the line column `configured=` on log:ProcessStart." .
+    rdfs:comment "The instance name that was ASKED for, when a live process already held it and this one took a disambiguated name instead. Two facts, both true — a silent disambiguation would make the header disagree with the config and nothing would say why. Also the line column `configured=` on log:ProcessStart, so it declares no rdfs:domain: log:Instance would type that entry a process." .
 
 log:processId a rdf:Property ;
     log:keyName "pid" ;
@@ -508,9 +603,10 @@ log:fromValue a rdf:Property ;
 
 log:toValue a rdf:Property ;
     log:keyName "to" ;
-    rdfs:domain log:ConfigChange ;
+    rdfs:domain log:Entry ;
     rdfs:range xsd:string ;
-    rdfs:label "toValue" .
+    rdfs:label "toValue" ;
+    rdfs:comment "The value a change asked for. Written on a log:LevelChangeRejected too, which is exactly NOT a change, so the domain is log:Entry: log:ConfigChange here made a reasoner type every refused level set as the change it refused." .
 
 log:effective a rdf:Property ;
     log:keyName "effective" ;

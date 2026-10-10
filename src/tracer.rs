@@ -22,6 +22,8 @@
 //! | `notes` | `key=value` columns, through the vocabulary's term table |
 //! | `notes[DENIED_NOTE]` | **the CLASS**: `log:CapabilityDenied`, plus `denied=` |
 //! | `notes[FAILED_NOTE]` | `failed=` → `log:failureKind`; `denied` is **the CLASS** `log:EndpointDenied` |
+//! | `notes[DEPTH_NOTE]` | **the CLASS**: `log:DepthExceeded`, plus `depth=` → `log:depth` |
+//! | every other core note | its own column, spelled as core spells the key: `alias=`, `scope=`, `uncached=`, … (see `vocabulary.ttl`) |
 //! | the `capability`'s one `urn:cap:principal:<iri>` | `principal=` → `log:onBehalfOf` |
 //!
 //! `principal=` is the one column read OUT of another: a door that authenticated
@@ -209,14 +211,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ikigai_core::{
-    Capability, Clock, TraceEvent, Tracer, DENIED_NOTE, FAILED_NOTE, PRINCIPAL_SCOPE_PREFIX,
+    Capability, Clock, TraceEvent, Tracer, DENIED_NOTE, DEPTH_NOTE, FAILED_NOTE,
+    PRINCIPAL_SCOPE_PREFIX,
 };
 
 use crate::endpoints::LogHandle;
 use crate::line::{Entry, Timestamp};
 use crate::vocabulary::{
-    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DROPPED_CLASS, ENDPOINT_DENIED_CLASS, PRINCIPAL_KEY,
-    RESOLUTION_CLASS,
+    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DEPTH_EXCEEDED_CLASS, DROPPED_CLASS,
+    ENDPOINT_DENIED_CLASS, PRINCIPAL_KEY, RESOLUTION_CLASS,
 };
 
 /// The `reason=` token on each `log:Dropped` entry, one per way this tracer can
@@ -726,9 +729,17 @@ pub fn principal_of(event: &TraceEvent) -> Option<Principal> {
 /// that ran) is `log:EndpointDenied`. Both land at every level. The floor's is
 /// read first, the more specific fact should both ever appear. Every other
 /// failure kind keeps its ordinary class and carries `failed=` as a column.
+///
+/// A depth refusal ([`DEPTH_NOTE`]) is `log:DepthExceeded`: like the floor's
+/// refusal it names something that never ran, so it is not a resolution, but no
+/// authority was refused, so it lands at `warn` rather than at every level. The
+/// invocations above it that ran and failed keep `log:Resolution` with
+/// `failed=depth-exceeded`.
 pub fn class_for(event: &TraceEvent) -> &'static str {
     if event.notes.iter().any(|(key, _)| key == DENIED_NOTE) {
         CAPABILITY_DENIED_CLASS
+    } else if event.notes.iter().any(|(key, _)| key == DEPTH_NOTE) {
+        DEPTH_EXCEEDED_CLASS
     } else if event
         .notes
         .iter()
