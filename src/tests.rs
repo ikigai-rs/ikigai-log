@@ -1557,6 +1557,92 @@ fn a_body_that_is_not_a_layer_is_refused_by_name_and_nothing_is_written() {
 }
 
 #[test]
+fn a_refused_config_write_names_the_input_that_stated_the_bad_value() {
+    // Ledger #1070: every validation failure used to come back blaming
+    // `cadence`, whichever input carried it, so a caller (and an agent reading
+    // the error) was sent to fix an argument it had not passed. Each refusal
+    // names the door the bad value came through, and the detail keeps the
+    // dotted config spelling, which is the line an operator edits.
+    let home = Scratch::new("config-error-names");
+    let (handle, _captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle.clone());
+
+    for (args, blamed, says) in [
+        (&[("instance", "has a space")][..], "instance", "instance"),
+        // No `directory=` row: a blank directory is the only one `validate`
+        // refuses, and a blank named argument reads as unstated, so that
+        // door cannot carry a bad directory. The body can (below).
+        (
+            &[("seal_every_entries", "0")][..],
+            "seal_every_entries",
+            "seal.every_entries",
+        ),
+        (
+            &[("seal_every_millis", "sometimes")][..],
+            "seal_every_millis",
+            "seal.every_millis",
+        ),
+        (
+            &[("rotation_max_entries", "-3")][..],
+            "rotation_max_entries",
+            "rotation.max_entries",
+        ),
+        (
+            &[("rotation_max_age_millis", "0")][..],
+            "rotation_max_age_millis",
+            "rotation.max_age_millis",
+        ),
+        // A good body under a bad named argument: the argument is to blame,
+        // not the body it was layered over.
+        (
+            &[
+                ("content", "[seal]\nevery_entries = 5\n"),
+                ("seal_every_entries", "0"),
+            ][..],
+            "seal_every_entries",
+            "seal.every_entries",
+        ),
+        // A bad body under a good named argument for a DIFFERENT key: the body
+        // is to blame, judged as a whole layer before anything is merged.
+        (
+            &[
+                ("content", "instance = \"has a space\"\n"),
+                ("directory", "/x"),
+            ][..],
+            "content",
+            "instance",
+        ),
+        (
+            &[("content", "directory = \"  \"\n")][..],
+            "content",
+            "directory",
+        ),
+        (
+            &[("content", "[rotation]\nmax_age_millis = 0\n")][..],
+            "content",
+            "rotation.max_age_millis",
+        ),
+    ] {
+        let error = futures::executor::block_on(kernel.issue(
+            sink_request(CONFIG_IRI, args),
+            &Capability::scoped([CAP_CONFIG]),
+        ))
+        .expect_err("a bad value is refused");
+        match &error {
+            Error::InvalidArgument { name, detail } => {
+                assert_eq!(name, blamed, "{args:?}: {error:?}");
+                assert!(detail.contains(says), "{args:?}: {detail}");
+            }
+            other => panic!("{args:?}: expected InvalidArgument, got {other:?}"),
+        }
+    }
+    assert!(
+        !home.path().join("log.toml").exists(),
+        "a refused write writes nothing"
+    );
+}
+
+#[test]
 fn an_empty_body_states_nothing_and_a_denied_one_is_not_read() {
     let home = Scratch::new("config-content-empty");
     let (handle, _captured) = open_handle(home.path(), None, "error");

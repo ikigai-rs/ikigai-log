@@ -1240,10 +1240,27 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     // Present-but-wrong stops, before anything is written: a cadence of zero is
     // a bound met before anything happened, and `"never"` is the spelling for
     // turning a trigger off. The body already passed this check as a layer, so
-    // what can fail here is a named argument.
-    change.validate().map_err(|e| Error::InvalidArgument {
-        name: "cadence".to_string(),
-        detail: e.to_string(),
+    // what can fail here is a named argument — and the refusal names THAT
+    // argument (ledger #1070: it used to blame `cadence` for every key, a door
+    // that does not exist). A request spells a nested key with an underscore,
+    // so `seal.every_entries` was stated as `seal_every_entries=`; a key no
+    // named argument stated can only have come from the body.
+    change.validate().map_err(|e| {
+        let name = match &e {
+            ConfigError::BadValue { key, .. } => {
+                let arg = key.replace('.', "_");
+                if opt(inv, &arg).is_some() {
+                    arg
+                } else {
+                    "content".to_string()
+                }
+            }
+            _ => "content".to_string(),
+        };
+        Error::InvalidArgument {
+            name,
+            detail: e.to_string(),
+        }
     })?;
     if change.is_empty() {
         return Err(Error::MissingArgument(
