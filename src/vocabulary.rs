@@ -31,6 +31,41 @@ use oxrdfio::{RdfFormat, RdfParser};
 /// consumer; log-specific classes are expected to stay.
 pub const LOG_NS: &str = "https://ikigai-rs.dev/ns/log#";
 
+/// Where a column no property claims lands: `{LOG_KEY_NS}{key}`, with a plain
+/// literal, beside a `log:undeclaredKey` flag.
+///
+/// A namespace of its own, never a `log:` local name: the fallback used to be
+/// `log:{key}`, so an undeclared column named like a declared property
+/// (`resolved=`, `destination=`, `segment=`) was READ as that property and
+/// inherited its `rdfs:domain` and `rdfs:range` (ledger #1114). No term of
+/// [`LOG_NS`] can equal an IRI here, whatever names either side grows, and
+/// nothing in this crate declares a term in it — it is reserved for exactly this.
+///
+/// ```
+/// use ikigai_log::{to_triples, Options, Vocabulary, LOG_KEY_NS, LOG_NS};
+///
+/// let segment = [
+///     "# ikigai-log v1",
+///     "@prefix log:  <https://ikigai-rs.dev/ns/log#> .",
+///     "@prefix prov: <http://www.w3.org/ns/prov#> .",
+///     "@name     urn:log:bug:daemon:2026-08-23T09-00-00Z",
+///     "@instance urn:ikigai:instance:bug:daemon",
+///     "@level    log:info",
+///     "@started  2026-08-23T09:00:00.000Z",
+///     "@prev     genesis",
+///     "",
+///     "2026-08-23T09:14:22.031Z log:Message urn:agent:calendar resolved=x",
+///     "",
+/// ]
+/// .join("\n");
+/// let triples = to_triples(&segment, Vocabulary::builtin(), &Options::all()).unwrap();
+/// let predicates: Vec<&str> = triples.iter().map(|t| t.predicate.as_str()).collect();
+/// assert!(predicates.contains(&format!("{LOG_KEY_NS}resolved").as_str()));
+/// assert!(!predicates.contains(&format!("{LOG_NS}resolved").as_str()));
+/// assert_eq!(LOG_KEY_NS, "https://ikigai-rs.dev/ns/log/key#");
+/// ```
+pub const LOG_KEY_NS: &str = "https://ikigai-rs.dev/ns/log/key#";
+
 /// The vocabulary source, embedded so the table and its documentation cannot
 /// drift apart: there is only one artifact.
 pub const VOCABULARY_TTL: &str = include_str!("vocabulary.ttl");
