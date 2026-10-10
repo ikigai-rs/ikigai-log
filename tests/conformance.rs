@@ -70,10 +70,13 @@
 //!   become a published vocabulary (in `ikigai-vocab`, or served from
 //!   `ikigai-sign`) is `ikigai-sign`'s question, recorded in
 //!   `ikigai-sign-PENDING.md` §1 and not settled here.
-//! - **The Sink is fired exactly once under root, and a refused write lands
+//! - **Each Sink is fired exactly once under root, and a refused write lands
 //!   nowhere** (in [`conforms`]): the kernel refuses `ENFORCED`'s no-grants call
 //!   before dispatch and this kernel has no tracer, so the only entry the walk
-//!   adds is PIPELINE's `log:Message msg=x`.
+//!   adds is PIPELINE's `log:Message msg=x`. `urn:log:config`'s Sink is fired
+//!   through its `content` door with [`CONFIG_BODY`], a layer restating the level
+//!   the fixture already runs at: the layer file is written and nothing is
+//!   recorded, because a write that changes nothing is not a change.
 //!
 //! ## Spaces: both constructors are HOST-named
 //!
@@ -131,6 +134,14 @@ const INSTANCE: &str = "conformance";
 
 /// When the segment opens; the kernel's clock sits a little after it.
 const T0: u64 = 1_700_000_000_000;
+
+/// The layer the walk pipes into `urn:log:config`'s Sink: the level the fixture
+/// opens at, restated. PIPELINE's own sample (`x`) is not TOML, and a body that
+/// is not a layer is refused by name — correctly, and then OUTPUTS has nothing
+/// to observe — so the fixture supplies one that is. Restating rather than
+/// changing keeps the walk from recording a `log:LevelChange` in the segment
+/// under test.
+const CONFIG_BODY: &str = "level = \"info\"\n";
 
 /// The `sig:` terms a `#seal` line becomes — `ikigai-sign`'s, defined in that
 /// crate's README and nowhere machine-readable, so this is the list the face is
@@ -325,6 +336,7 @@ fn suite(log: &Log) -> Suite {
         .namespace(LOG_NS)
         .namespace(SIG_NS)
         .fixture(Fixture::new(TRANSREPT, Verb::Source).arg("content", log.text()))
+        .fixture(Fixture::new(CONFIG, Verb::Sink).arg("content", CONFIG_BODY))
         .fixture(Fixture::new(SEGMENT, Verb::Source).binding("segment", log.tail()))
         .fixture(Fixture::new(SEGMENT, Verb::Exists).binding("segment", log.tail()))
         .pure(TRANSREPT)
@@ -381,7 +393,13 @@ fn conforms() {
         "a live segment is uncacheable"
     );
 
-    // The Sink was fired exactly once under root (PIPELINE, `content=x`), and
+    // The config Sink was fired through its content door: the body landed as a
+    // layer in the fixture's own config home, and restated rather than changed.
+    let layer = std::fs::read_to_string(log._scratch.0.join("log.toml"))
+        .expect("the walk's config write persisted its layer");
+    assert_eq!(layer, CONFIG_BODY, "the piped layer, as written");
+
+    // The write Sink was fired exactly once under root (PIPELINE, `content=x`), and
     // ENFORCED's refused call reached nothing: the kernel denies before dispatch,
     // this kernel has no tracer, so no `log:CapabilityDenied` can land — the one
     // entry the walk added is the message.
@@ -403,6 +421,10 @@ fn conforms() {
     assert!(
         !after.contains("log:CapabilityDenied"),
         "a pre-dispatch refusal with no tracer lands nowhere:\n{after}"
+    );
+    assert!(
+        !after.contains(" log:LevelChange ") && !after.contains(" log:ConfigChange "),
+        "the config write restated the level, so it recorded nothing:\n{after}"
     );
 }
 
@@ -501,10 +523,10 @@ type Case<'a> = (&'a str, Verb, Vec<(&'a str, &'a str)>);
 /// declared output that is not an RDF face is never compared with what the
 /// action serves. Both directions, by hand, for every action: resolved with `as`
 /// omitted the served type is one of the declared outputs, and each declared
-/// output is what `as=<output>` serves. `urn:log:config`'s Sink is the one
-/// action the suite never fires (no `content`, PENDING #4); it is fired here,
-/// with a level it already has, so the layer file is written and nothing is
-/// recorded.
+/// output is what `as=<output>` serves. `urn:log:config`'s Sink is fired here
+/// through its named-argument door, with a level it already has, so the layer
+/// file is written and nothing is recorded; the walk fires the other door
+/// (`content`, [`CONFIG_BODY`]).
 #[test]
 fn declared_outputs_are_the_media_types_served() {
     let log = Log::new(false);

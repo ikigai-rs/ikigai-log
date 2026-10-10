@@ -1394,6 +1394,213 @@ fn a_level_the_config_write_cannot_parse_is_rejected_and_the_rejection_lands() {
     );
 }
 
+// ----- The content door (ledger #156) -------------------------------------------------
+//
+// The engine lands a pipe — and a top-level `sink`'s body — in `content`, by name,
+// for every Sink. Before this door `urn:log:config` read only named scalars, so
+// `cat serve.log.toml | sink urn:log:config` reached it as an argument nothing read
+// and was refused as if nothing had been said.
+
+#[test]
+fn a_piped_layer_file_is_a_config_write() {
+    let home = Scratch::new("config-content");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle.clone());
+
+    let repr = futures::executor::block_on(kernel.issue(
+        sink_request(
+            CONFIG_IRI,
+            &[(
+                "content",
+                "level = \"debug\"\ndestination = \"file\"\n\n[seal]\nevery_entries = 7\n",
+            )],
+        ),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect("a layer file is a config write");
+    let body = text(&repr);
+    assert!(
+        body.contains("level: effective at the next segment")
+            && body.contains("destination: effective at the next process start")
+            && body.contains("seal.every_entries: effective at the next segment"),
+        "every key the body stated is reported: {body}"
+    );
+
+    // Persisted, in the same file and the same spelling a named-argument write
+    // produces — the body is a layer, so it lands as one.
+    let written = home.read("log.toml");
+    assert!(written.contains("level = \"debug\""), "{written}");
+    assert!(written.contains("destination = \"file\""), "{written}");
+    assert!(written.contains("[seal]\nevery_entries = 7\n"), "{written}");
+
+    assert_eq!(handle.config().level, log("debug"));
+    assert_eq!(handle.config().destination, Destination::File);
+    assert_eq!(handle.policies().0.every_entries, 7);
+
+    // And recorded like any other config write: the door is a different intake,
+    // not a quieter one.
+    let text = captured.text();
+    assert!(text.contains("log:LevelChange"), "{text}");
+    assert!(text.contains("key=destination"), "{text}");
+    assert!(text.contains("key=seal.every_entries"), "{text}");
+}
+
+#[test]
+fn named_arguments_win_over_the_body_key_wise_even_inside_a_table() {
+    let home = Scratch::new("config-content-overlay");
+    let (handle, _captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle.clone());
+
+    futures::executor::block_on(kernel.issue(
+        sink_request(
+            CONFIG_IRI,
+            &[
+                (
+                    "content",
+                    "level = \"debug\"\ndestination = \"console\"\n\n\
+                     [seal]\nevery_entries = 5\nevery_millis = 100\n",
+                ),
+                ("level", "warn"),
+                ("seal_every_millis", "200"),
+            ],
+        ),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect("the body and the arguments compose");
+
+    let config = handle.config();
+    assert_eq!(config.level, log("warn"), "the named argument wins");
+    assert_eq!(
+        config.destination,
+        Destination::Console,
+        "and a key it is silent about survives from the body"
+    );
+    let (seals, _) = handle.policies();
+    assert_eq!(
+        (seals.every_entries, seals.every_millis),
+        (5, 200),
+        "key-wise inside [seal]: one bound from each, not the last table wholesale"
+    );
+    let written = home.read("log.toml");
+    assert!(written.contains("level = \"warn\""), "{written}");
+    assert!(!written.contains("debug"), "{written}");
+}
+
+#[test]
+fn a_body_that_is_not_a_layer_is_refused_by_name_and_nothing_is_written() {
+    let home = Scratch::new("config-content-bad");
+    let (handle, captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle.clone());
+
+    for (body, says) in [
+        // Not TOML at all — what a stray `echo debug | sink …` delivers.
+        ("debug\n", "layer"),
+        // A key the schema does not define: `deny_unknown_fields`, the same rule
+        // that makes a typo in log.toml loud.
+        ("levle = \"debug\"\n", "levle"),
+        // Present and wrong, judged by the rule a config file is judged by —
+        // even though a named argument would have stated the dial.
+        ("[seal]\nevery_entries = 0\n", "seal.every_entries"),
+    ] {
+        let error = futures::executor::block_on(kernel.issue(
+            sink_request(CONFIG_IRI, &[("content", body), ("level", "info")]),
+            &Capability::scoped([CAP_CONFIG]),
+        ))
+        .expect_err("a body that is not a layer is refused");
+        match &error {
+            Error::InvalidArgument { name, detail } => {
+                assert_eq!(name, "content", "{error:?}");
+                assert!(detail.contains(says), "{body:?}: {detail}");
+            }
+            other => panic!("{body:?}: expected InvalidArgument, got {other:?}"),
+        }
+    }
+    assert!(
+        !home.path().join("log.toml").exists(),
+        "a refused body writes nothing"
+    );
+    assert_eq!(handle.config().level, log("error"), "and changes nothing");
+
+    // A level the vocabulary does not place on the dial is refused by the same
+    // check a named `level=` meets, and the rejection lands the same way.
+    let error = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("content", "level = \"log:chatty\"\n")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect_err("a level this vocabulary does not define");
+    assert!(
+        matches!(&error, Error::InvalidArgument { name, detail }
+            if name == "content" && detail.contains("not a level this vocabulary defines")),
+        "{error:?}"
+    );
+    assert!(
+        captured.text().contains("log:LevelChangeRejected"),
+        "{}",
+        captured.text()
+    );
+    assert!(!home.path().join("log.toml").exists());
+
+    // And a body that is not even IRI-shaped where a level goes lands the
+    // rejection too: the evidence does not depend on which door was used.
+    let before = captured.text().matches("log:LevelChangeRejected").count();
+    futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("content", "level = \"not a level\"\n")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect_err("not a level at all");
+    assert_eq!(
+        captured.text().matches("log:LevelChangeRejected").count(),
+        before + 1,
+        "{}",
+        captured.text()
+    );
+}
+
+#[test]
+fn an_empty_body_states_nothing_and_a_denied_one_is_not_read() {
+    let home = Scratch::new("config-content-empty");
+    let (handle, _captured) = open_handle(home.path(), None, "error");
+    let kernel = kernel(handle);
+
+    // A layer file that states nothing is a write that states nothing — the
+    // same refusal as no arguments at all, not a successful no-op.
+    let error = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("content", "# just a comment\n")]),
+        &Capability::scoped([CAP_CONFIG]),
+    ))
+    .expect_err("nothing stated");
+    assert!(matches!(error, Error::MissingArgument(_)), "{error:?}");
+
+    let error = futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("content", "level = \"trace\"\n")]),
+        &Capability::scoped([CAP_READ]),
+    ))
+    .expect_err("reading the config is not changing it");
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert!(!home.path().join("log.toml").exists());
+}
+
+#[test]
+fn the_config_sink_declares_the_content_door() {
+    let described =
+        crate::endpoints::config(Arc::new(LogHandle::new(None, None, LogConfig::default())))
+            .describe();
+    let sink = described
+        .action_specs()
+        .into_iter()
+        .find(|a| a.verb == Verb::Sink)
+        .expect("a Sink action");
+    let content = sink
+        .inputs
+        .iter()
+        .find(|i| i.name == "content")
+        .expect("the Sink declares `content`, where the engine lands a pipe");
+    assert!(
+        !content.required,
+        "optional: the named arguments alone are still a complete write"
+    );
+}
+
 // =====================================================================================
 // The transreptor, and the named-graph story
 // =====================================================================================

@@ -69,7 +69,7 @@ use ikigai_core::{
 use crate::chain::{RotationPolicy, SealPolicy, SealSigner};
 use crate::config::LogConfig;
 #[cfg(not(target_family = "wasm"))]
-use crate::config::{level_iri, Destination, Patch};
+use crate::config::{level_iri, ConfigError, Destination, Patch};
 use crate::line::{parse_fields, Entry, Timestamp};
 #[cfg(not(target_family = "wasm"))]
 use crate::segments::{
@@ -1111,15 +1111,56 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     }
     let stamp = now(inv)?;
 
-    let mut change = Patch::default();
-    if let Some(level) = opt(inv, "level") {
+    // The body first: a layer file, the same TOML `log.toml` holds — which is
+    // what a pipe and a top-level `sink`'s body deliver, because the engine
+    // lands both in `content` by name. It is judged as a WHOLE layer by the rule
+    // a config file meets (`Patch::parse`: shape, `deny_unknown_fields`, every
+    // stated value validated), even where a named argument below restates a key,
+    // because a bad line hidden by an override is still a bad line.
+    let mut change = match inv.inline_str("content") {
+        Err(Error::MissingArgument(_)) => Patch::default(),
+        Err(e) => return Err(e),
+        Ok(body) => match Patch::parse(body, None) {
+            Ok(layer) => layer,
+            Err(e) => {
+                // A level that is not even level-shaped lands its rejection here,
+                // as it does through `level=`: the evidence that a change did not
+                // take must not depend on which door it was attempted through.
+                if let ConfigError::BadValue {
+                    key: "level",
+                    value,
+                    expected,
+                } = &e
+                {
+                    let _ = handle.write(
+                        Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI)
+                            .with("to", value.as_str())
+                            .with("reason", format!("not {expected}")),
+                    );
+                }
+                return Err(Error::InvalidArgument {
+                    name: "content".to_string(),
+                    detail: format!("not a log.toml layer: {e}"),
+                });
+            }
+        },
+    };
+
+    // Then the named arguments ON TOP, key-wise — the order the config layers
+    // themselves merge in, so `cat base.toml | sink urn:log:config level=debug`
+    // means "this file, but at debug".
+    let level = match opt(inv, "level") {
+        Some(level) => Some((level.to_string(), "level")),
+        None => change.level.clone().map(|level| (level, "content")),
+    };
+    if let Some((level, door)) = level {
         // Two refusals, one shape: a spelling that is no level at all, and a
         // well-formed level the vocabulary does not place on the dial. The
         // second used to be accepted, persisted, and then fail at the next
         // rotation — which sealed the open segment, could not open a successor,
         // and left the log CLOSED for the rest of the process (#904 item 5). A
-        // typo is caught where it is typed.
-        let refusal = match level_iri(level) {
+        // typo is caught where it is typed, through either door.
+        let refusal = match level_iri(&level) {
             None => Some("not a level name, a log: CURIE, or an absolute IRI".to_string()),
             Some(iri) => {
                 let vocabulary = handle.vocabulary();
@@ -1141,15 +1182,15 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
             // this entry is the evidence that a change did not take.
             let _ = handle.write(
                 Entry::new(stamp, LEVEL_CHANGE_REJECTED_CLASS, CONFIG_IRI)
-                    .with("to", level)
+                    .with("to", level.as_str())
                     .with("reason", reason.clone()),
             );
             return Err(Error::InvalidArgument {
-                name: "level".to_string(),
+                name: door.to_string(),
                 detail: format!("{level:?} is {reason}"),
             });
         }
-        change.level = Some(level.to_string());
+        change.level = Some(level);
     }
     if let Some(destination) = opt(inv, "destination") {
         change.destination =
@@ -1170,31 +1211,44 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     // flattened with an underscore — one name for one dial, spelled the way the
     // surface it is on can spell it, and the error messages keep using the
     // dotted config spelling because that is the line the operator edits.
-    let seal = crate::config::SealPatch {
-        every_entries: bound(inv, "seal_every_entries")?,
-        every_millis: bound(inv, "seal_every_millis")?,
-    };
-    let rotation = crate::config::RotationPatch {
-        max_entries: bound(inv, "rotation_max_entries")?,
-        max_age_millis: bound(inv, "rotation_max_age_millis")?,
-    };
-    if seal.every_entries.is_some() || seal.every_millis.is_some() {
-        change.seal = Some(seal);
+    // Key-wise INSIDE the table, as everywhere else: `seal_every_millis=` over a
+    // body that states both `[seal]` bounds replaces one of them, not the table.
+    if let Some(bound) = bound(inv, "seal_every_entries")? {
+        change
+            .seal
+            .get_or_insert_with(Default::default)
+            .every_entries = Some(bound);
     }
-    if rotation.max_entries.is_some() || rotation.max_age_millis.is_some() {
-        change.rotation = Some(rotation);
+    if let Some(bound) = bound(inv, "seal_every_millis")? {
+        change
+            .seal
+            .get_or_insert_with(Default::default)
+            .every_millis = Some(bound);
+    }
+    if let Some(bound) = bound(inv, "rotation_max_entries")? {
+        change
+            .rotation
+            .get_or_insert_with(Default::default)
+            .max_entries = Some(bound);
+    }
+    if let Some(bound) = bound(inv, "rotation_max_age_millis")? {
+        change
+            .rotation
+            .get_or_insert_with(Default::default)
+            .max_age_millis = Some(bound);
     }
     // Present-but-wrong stops, before anything is written: a cadence of zero is
     // a bound met before anything happened, and `"never"` is the spelling for
-    // turning a trigger off.
+    // turning a trigger off. The body already passed this check as a layer, so
+    // what can fail here is a named argument.
     change.validate().map_err(|e| Error::InvalidArgument {
         name: "cadence".to_string(),
         detail: e.to_string(),
     })?;
     if change.is_empty() {
         return Err(Error::MissingArgument(
-            "one of level|destination|directory|instance|seal_every_entries|seal_every_millis|\
-             rotation_max_entries|rotation_max_age_millis"
+            "one of content|level|destination|directory|instance|seal_every_entries|\
+             seal_every_millis|rotation_max_entries|rotation_max_age_millis"
                 .to_string(),
         ));
     }
@@ -1394,7 +1448,9 @@ pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
                  instance, and the seal and rotation cadences — over built-in defaults ⊕ \
                  log.toml ⊕ {app}.log.toml, plus whether a segment is open right now. Source \
                  serves the effective config (as=text/turtle for the graph face); Sink changes \
-                 it, writes the highest-precedence layer file, and lands an always-land \
+                 it — from a layer file piped in as content, the named arguments, or both, \
+                 the arguments applied over the file key by key — writes the \
+                 highest-precedence layer file, and lands an always-land \
                  log:LevelChange or log:ConfigChange. Every change is RECORDED NOW and takes \
                  effect at a boundary, never inside a segment: the level and the seal and \
                  rotation cadences at the NEXT SEGMENT (a rotation or a process start), \
@@ -1424,6 +1480,16 @@ pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
                         "change the config: writes the layer file and lands an always-land entry",
                     )
                     .requires(CAP_CONFIG)
+                    .input(
+                        ArgSpec::new("content")
+                            .summary(
+                                "a layer file — the TOML log.toml holds, where a pipe or a \
+                                 sink's body lands; judged whole, as a config file is, and the \
+                                 named arguments below are applied over it key by key",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
                     .input(
                         ArgSpec::new("level")
                             .summary(
