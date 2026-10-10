@@ -17,28 +17,21 @@ rust-version = "1.89"
 
 [dependencies]
 # The published kernel, consumed from crates.io — the SAME version the hosts
-# use, so a host links exactly one `ikigai-core`. 0.1.62 is the true minimum:
-# `DENIED_NOTE` arrived there and nowhere earlier, and it is what makes a
-# pre-dispatch capability refusal reach an observer at all — the entry T2
-# reported it could not write. Before that: `config::{config_home,
-# layered_paths_in, data_home_in}` (the path algebra the layered `log.toml`
-# reads) is 0.1.56, and everything else this crate touches (`Tracer`,
-# `TraceEvent`, `Kernel::set_tracer`, ActionSpec, ArgSpec
-# `class`/`one_of`/`default_value`, `Error::Denied`, `Invocation::now`) is older
-# still — including `Kernel::issue_traced` and `TraceScope`, the per-call tracer
-# seam the per-tenant `LogTracer` exists to be handed to, which landed in 0.1.48.
-# This crate never CALLS it (a host does), but rustdoc resolves the link, so it
-# belongs in this accounting.
+# use, so a host links exactly one `ikigai-core`. 0.1.93 is the true minimum:
+# the principal a tracer attributes an entry to is read from the capability the
+# request ran under (`Capability::principal`, `PRINCIPAL_SCOPE_PREFIX`), and this
+# crate's `MAX_PRINCIPAL_LEN` IS core's constant (ledger #1077) — all three
+# arrived in 0.1.93 and nowhere earlier. Before that: `DENIED_NOTE` (0.1.62,
+# what makes a pre-dispatch refusal reach an observer at all), the
+# `config::{config_home, layered_paths_in, data_home_in}` path algebra the
+# layered `log.toml` reads (0.1.56), and older still `Tracer`, `TraceEvent`,
+# `Kernel::set_tracer`, ActionSpec, ArgSpec `class`/`one_of`/`default_value`,
+# `Error::Denied`, `Invocation::now`, and `Kernel::issue_traced`/`TraceScope`
+# (0.1.48, the per-call tracer seam the per-tenant `LogTracer` is handed to).
 #
-# ⚠ This floor is the LIBRARY's, and it is deliberately below what the tests
-# build against: the conformance dev-dependency (0.6.0) needs core 0.1.89, so the
-# test graph never resolves below that, and no CI job compiles this crate at
-# 0.1.62. Checked by hand for 0.2.0 (2026-10-10): a fresh resolve of the
-# library alone, dev-dependencies stripped and this pin made `=0.1.62`, passes
-# `cargo check --lib` (with ikigai-sign 0.2.3). Raising the pin would not make the floor tested — it would only make a
-# consumer's resolve stricter than anything in src needs (rule 5: a pin states the
-# true minimum API used). A dev-dependency never enters a consumer's resolve.
-ikigai-core = "0.1.62"
+# ⚠ Read the caret as a RANGE: `"0.1.93"` is `>=0.1.93, <0.2.0`. Core is still
+# on the 0.1 line, so the ceiling binds nothing today; it will on core 0.2.
+ikigai-core = "0.1.93"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
 # they carry a vocabulary and a handle — and `Endpoint::invoke` is `async_trait`.

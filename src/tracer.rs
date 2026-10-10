@@ -21,11 +21,13 @@
 //! | `capability` | `cap=` per scope; absent = full authority |
 //! | `notes` | `key=value` columns, through the vocabulary's term table |
 //! | `notes[DENIED_NOTE]` | **the CLASS**: `log:CapabilityDenied`, plus `denied=` |
+//! | the `capability`'s one `urn:cap:principal:<iri>` | `principal=` → `log:onBehalfOf` |
 //!
-//! One column is **not** in that table because no `TraceEvent` carries it:
-//! `principal=`, the tenant a per-tenant tracer was built for. The kernel does
-//! not know who a host is serving and this crate does not ask it — see
-//! [`Principal`].
+//! `principal=` is the one column read OUT of another: a door that authenticated
+//! a party mints `urn:cap:principal:<iri>` into the capability the request runs
+//! under (core 0.1.93, ledger #1077), and the event carries that capability, so
+//! the principal reaches the log with no name supplied out of band — see
+//! [`principal_of`]. The scope stays in its `cap=` column as well, verbatim.
 //!
 //! `cache_hit` selects a CLASS and never a boolean column, because a class is
 //! what the level dial can exclude: `log:CacheHit` is `rdfs:subClassOf
@@ -142,8 +144,22 @@
 //!
 //! **Attribution** is [`Principal`] and the `principal=` column it writes,
 //! which transrepts to `log:onBehalfOf` plus a skolemized `prov:Delegation`.
-//! The host names the principal; this crate records it and authenticates
-//! nothing.
+//! This crate records a principal and authenticates nothing. It has two sources,
+//! read in this order for every entry:
+//!
+//! 1. **The capability the invocation ran under** ([`principal_of`]). A door
+//!    mints `urn:cap:principal:<iri>` (core's `Capability::with_principal`) and
+//!    the kernel hands the event that capability, so ANY `LogTracer` attributes
+//!    the request, the process's own `set_tracer` one included, and per
+//!    invocation: a sub-request that shed the principal (`issue_attenuated` to
+//!    scopes that do not name it) is logged as what it was, anonymous. Root
+//!    names nobody, and a capability carrying two principals names nobody
+//!    (core's rule, read through core rather than restated here).
+//! 2. **The tracer's own** ([`on_behalf_of`](LogTracer::on_behalf_of)), for a
+//!    host that names its tenant per call rather than minting it, and for
+//!    whatever the capability does not name. Where both name one, the capability
+//!    wins: it is what the kernel enforced for this invocation, while the tracer's
+//!    is the host's label for the whole tree.
 //!
 //! **Write concurrency** was already safe and it is worth saying exactly why,
 //! because the reason is not "the writer is careful". [`LogHandle`] holds its
@@ -191,7 +207,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use ikigai_core::{Clock, TraceEvent, Tracer, DENIED_NOTE};
+use ikigai_core::{Capability, Clock, TraceEvent, Tracer, DENIED_NOTE, PRINCIPAL_SCOPE_PREFIX};
 
 use crate::endpoints::LogHandle;
 use crate::line::{Entry, Timestamp};
@@ -232,7 +248,10 @@ thread_local! {
 // The principal: attribution that is not the process
 // =====================================================================================
 
-/// The longest principal IRI this crate will write.
+/// The longest principal IRI this crate will write: core's
+/// [`MAX_PRINCIPAL_LEN`](ikigai_core::MAX_PRINCIPAL_LEN), the same constant and
+/// not a second one that agrees today, so every principal a door can mint into a
+/// capability is one this crate can write.
 ///
 /// A bound rather than a truncation: a principal is caller-supplied in the
 /// general case, it lands on **every** entry of a connection, and a log line is
@@ -241,7 +260,12 @@ thread_local! {
 /// certificate fingerprint, a DID) and far short of a line that no longer reads
 /// as a line, and the refusal names the length so an operator can see what was
 /// asked for.
-pub const MAX_PRINCIPAL_LEN: usize = 512;
+///
+/// ```
+/// assert_eq!(ikigai_log::MAX_PRINCIPAL_LEN, 512);
+/// assert_eq!(ikigai_log::MAX_PRINCIPAL_LEN, ikigai_core::MAX_PRINCIPAL_LEN);
+/// ```
+pub const MAX_PRINCIPAL_LEN: usize = ikigai_core::MAX_PRINCIPAL_LEN;
 
 /// The subject of the probe line [`Principal::new`] renders and parses back.
 /// Its own IRI, so a principal that swallowed the subject column is caught by
@@ -304,9 +328,11 @@ impl std::error::Error for PrincipalError {}
 /// answered here. A wire server has a certificate fingerprint, a passkey host
 /// has a credential id, a peer has a peer name — inventing a fourth identity
 /// model inside a logging module would put the least-informed component in
-/// charge of the most consequential answer. So the host names the principal and
-/// this crate writes down exactly what it was told, which is the only claim the
-/// log can honestly make about it.
+/// charge of the most consequential answer. So the host names the principal,
+/// by minting it into the capability at its door (read back by
+/// [`principal_of`]) or by handing it to
+/// [`on_behalf_of`](LogTracer::on_behalf_of), and this crate writes down exactly
+/// what it was told, which is the only claim the log can honestly make about it.
 ///
 /// ## ★★ And it is caller-supplied data reaching a greppable format
 ///
@@ -415,6 +441,14 @@ struct Drops([AtomicU64; DROP_REASONS.len()]);
 /// the kernel holds, so a denial — which the kernel stamps with nothing, having
 /// run nothing — is stamped on the same timeline as its neighbours.
 ///
+/// ## ★ Attribution needs no second tracer when the door mints the principal
+///
+/// Every `LogTracer` reads the principal from the capability each event ran
+/// under ([`principal_of`]), so a host whose doors mint
+/// `urn:cap:principal:<iri>` (core 0.1.93) gets per-tenant attribution from the
+/// one tracer it installed with `set_tracer`. The per-call form below is the
+/// path for a host that names its tenant out of band instead.
+///
 /// ## ★ One handle, N tracers: the per-tenant shape
 ///
 /// [`on_behalf_of`](Self::on_behalf_of) derives a tracer that attributes its
@@ -472,7 +506,8 @@ impl LogTracer {
     }
 
     /// A tracer that writes the same segment as this one and attributes every
-    /// entry it records to `principal`.
+    /// entry it records to `principal`, except where the event's capability names
+    /// a principal of its own, which wins (see [`principal_of`]).
     ///
     /// Hand it to [`Kernel::issue_traced`](ikigai_core::Kernel::issue_traced),
     /// never to `set_tracer`: the global slot is single-tenant by construction
@@ -493,7 +528,8 @@ impl LogTracer {
         }
     }
 
-    /// Who this tracer attributes its entries to, if anyone.
+    /// Who this tracer attributes its entries to when the capability names no
+    /// one, if anyone.
     pub fn principal(&self) -> Option<&Principal> {
         self.principal.as_ref()
     }
@@ -616,6 +652,63 @@ impl Tracer for LogTracer {
     }
 }
 
+/// The principal the capability `event` ran under names, if it names one.
+///
+/// Core's rule, read through core rather than restated: the capability's ONE
+/// well-formed `urn:cap:principal:<iri>` scope
+/// ([`Capability::principal`](ikigai_core::Capability::principal)). So root
+/// (`capability: None`) names nobody, a capability carrying two principals names
+/// nobody, and a held wildcard (`urn:cap:principal:*`) is never an identity.
+///
+/// `None` as well for a principal core will carry and [`Principal::new`] will
+/// not write, which no tested shape reaches (the two rules agree on every probe
+/// in this crate's tests). The entry then lands unattributed, and the fact is
+/// not lost: the scope is still in its `cap=` column, verbatim.
+///
+/// Cheap where it does not apply: the scope list is scanned for the prefix
+/// before anything is built, so an event with no principal scope allocates
+/// nothing here.
+///
+/// ```
+/// use ikigai_core::{Capability, TraceEvent};
+///
+/// let event = |capability: &Capability| TraceEvent {
+///     target: "urn:x".into(),
+///     thread: "w".into(),
+///     started: None,
+///     ended: None,
+///     cache_hit: false,
+///     span: 0,
+///     parent: None,
+///     capability: capability.scopes().map(|s| s.iter().cloned().collect()),
+///     notes: Vec::new(),
+/// };
+/// let alice = Capability::scoped(["urn:cap:x:read"])
+///     .with_principal("urn:agent:alice")
+///     .unwrap();
+/// assert_eq!(
+///     ikigai_log::principal_of(&event(&alice)).map(|p| p.to_string()),
+///     Some("urn:agent:alice".to_string())
+/// );
+/// assert_eq!(ikigai_log::principal_of(&event(&Capability::root())), None);
+/// let both = Capability::scoped([
+///     "urn:cap:principal:urn:agent:alice",
+///     "urn:cap:principal:urn:agent:bob",
+/// ]);
+/// assert_eq!(ikigai_log::principal_of(&event(&both)), None);
+/// ```
+pub fn principal_of(event: &TraceEvent) -> Option<Principal> {
+    let scopes = event.capability.as_ref()?;
+    if !scopes
+        .iter()
+        .any(|scope| scope.starts_with(PRINCIPAL_SCOPE_PREFIX))
+    {
+        return None;
+    }
+    let capability = Capability::scoped(scopes.iter().map(String::as_str));
+    Principal::new(capability.principal()?).ok()
+}
+
 /// The entry class one [`TraceEvent`] is.
 ///
 /// Order matters: a refusal is a refusal whatever else the event says. The
@@ -639,14 +732,17 @@ pub fn class_for(event: &TraceEvent) -> &'static str {
 /// `now` is the fallback stamp, used only when the event carries no `started`
 /// of its own: a pre-dispatch denial, or a kernel built without a clock.
 ///
-/// Attributes to the process alone;
-/// [`entry_for_principal`] is the per-tenant form.
+/// Attributes the entry to the principal its capability names
+/// ([`principal_of`]), else to the process alone; [`entry_for_principal`] adds a
+/// fallback principal, the per-tenant form.
 pub fn entry_for(event: &TraceEvent, class: &str, now: Timestamp) -> Entry {
     entry_for_principal(event, class, now, None)
 }
 
 /// [`entry_for`], attributing the entry to `principal` as well as to the
-/// process that wrote it.
+/// process that wrote it **when the event's capability names no principal**.
+/// A capability that names one wins ([`principal_of`]): it is what the kernel
+/// enforced for this invocation.
 ///
 /// The column goes **first**, before `worker=`: an attribution is what a reader
 /// scanning a mixed segment is separating lines by, and the eye wants it in the
@@ -663,7 +759,8 @@ pub fn entry_for_principal(
         .started
         .map(|time| Timestamp::from_millis(time.as_millis()));
     let mut entry = Entry::new(started.unwrap_or(now), class, event.target.clone());
-    if let Some(principal) = principal {
+    let carried = principal_of(event);
+    if let Some(principal) = carried.as_ref().or(principal) {
         entry = entry.with(PRINCIPAL_KEY, principal.as_str());
     }
     entry = entry
