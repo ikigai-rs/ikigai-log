@@ -78,6 +78,12 @@ pub const CAPABILITY_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#Capabili
 /// its subject column means `log:refused` and a reasoner reads every refused
 /// authority as one class; a query WITHOUT a reasoner names both.
 pub const ENDPOINT_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#EndpointDenied";
+/// `log:DepthExceeded` — a sub-request refused for nesting past the kernel's
+/// budget ([`ikigai_core::DEPTH_NOTE`]). Nothing at that depth ran, so it is not
+/// a [`RESOLUTION_CLASS`]; it lands at `log:warn`, because a runaway tree is
+/// always a defect and produces exactly one, but it is not always-land, because
+/// no authority was refused. Its subject column means `log:refused`.
+pub const DEPTH_EXCEEDED_CLASS: &str = "https://ikigai-rs.dev/ns/log#DepthExceeded";
 /// The `key=` column `log:failureKind` is bound to: core's
 /// [`FAILED_NOTE`](ikigai_core::FAILED_NOTE), the same string, so the note key
 /// and the log's column cannot drift into two spellings of one fact.

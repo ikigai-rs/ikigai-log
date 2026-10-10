@@ -5928,3 +5928,427 @@ fn a_caller_cannot_write_a_failure_or_an_endpoint_refusal() {
         );
     }
 }
+
+// =====================================================================================
+// Ledger #1103: every note core reports has a term, no rdfs:domain types an entry
+// into a family it is not in, and urn:log:write attributes its entry
+// =====================================================================================
+
+use ikigai_core::{
+    ALIAS_MISS_NOTE, ALIAS_NOTE, ANSWERED_NOTE, DEPTH_NOTE, LEVEL_NOTE, LIMITED_NOTE,
+    SCOPE_CLOCK_NOTE, SCOPE_MISS_NOTE, SCOPE_NOTE, SEALED_NOTE, UNCACHED_NOTE,
+};
+
+use crate::vocabulary::{DEPTH_EXCEEDED_CLASS, LEVEL_CHANGE_REJECTED_CLASS, VOCABULARY_TTL};
+
+const COMPOSITE_IRI: &str = "urn:traced:composite";
+const ASKER_IRI: &str = "urn:traced:asker";
+const DEEP_IRI: &str = "urn:traced:deep";
+
+/// Every `TraceEvent::notes` key core 0.1.93 defines beside `denied` and `failed`
+/// (which have had terms since 0.1.62 and ledger #1062), each with a value shaped
+/// as core's own doc comment shapes it. Named through core's constants, so a key
+/// spelled differently here than there cannot pass.
+const CORE_NOTES: [(&str, &str); 11] = [
+    (DEPTH_NOTE, "65"),
+    (ALIAS_NOTE, "urn:fn:toUpper -> urn:iki:fn:toUpper"),
+    (ALIAS_MISS_NOTE, "urn:iki:fn:toUpper"),
+    (SCOPE_NOTE, "urn:ctx:doc:7 severed"),
+    (SCOPE_MISS_NOTE, "urn:traced:thing"),
+    (LIMITED_NOTE, "urn:personal:calendar"),
+    (ANSWERED_NOTE, "urn:example:space:personal"),
+    (
+        SEALED_NOTE,
+        "urn:x is sealed by urn:example:level:owner and answered in urn:example:level:other",
+    ),
+    (
+        LEVEL_NOTE,
+        "urn:example:level:inner urn:example:level:outer",
+    ),
+    (UNCACHED_NOTE, "dependency urn:tags:overlay; declared"),
+    (SCOPE_CLOCK_NOTE, "1000000"),
+];
+
+/// Each of [`CORE_NOTES`] on its own event, recorded through a real tracer into a
+/// segment running at `trace`, so nothing is filtered.
+fn noted_segment(tag: &str) -> String {
+    let home = Scratch::new(tag);
+    let (handle, captured) = open_handle(home.path(), None, "trace");
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    for (span, (key, value)) in CORE_NOTES.iter().enumerate() {
+        tracer.record(TraceEvent {
+            notes: vec![(key.to_string(), value.to_string())],
+            ..resolution(TRACED_IRI, span as u64 + 1, 1_700_000_000_000)
+        });
+    }
+    captured.text()
+}
+
+#[test]
+fn every_note_core_reports_transrepts_to_a_declared_term() {
+    // ★ The claim of ledger #1103 (1), reproduced: before this, eleven of core's
+    // note keys had no `log:keyName`, so each landed as `log:{key}` flagged
+    // `log:undeclaredKey` — and `uncached=` rides on EVERY uncacheable
+    // resolution, so the hygiene signal was noise by construction.
+    let text = noted_segment("notes-declared");
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let undeclared: Vec<String> = triples
+        .iter()
+        .filter(|t| t.predicate.as_str() == log("undeclaredKey"))
+        .map(|t| t.object.to_string())
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "every core note has a term: {undeclared:?}"
+    );
+    for (key, _) in CORE_NOTES {
+        assert!(
+            Vocabulary::builtin().key(key).is_some(),
+            "{key}= is bound by a log:keyName"
+        );
+    }
+}
+
+#[test]
+fn each_note_lands_as_the_kind_of_value_it_is() {
+    // An integer is an integer, a name is an IRI (so it joins), and the rest is a
+    // string. A name as a string would join to nothing: `answered-by` is the datum
+    // a cache keyed on the corridors consulted would key on.
+    let text = noted_segment("notes-ranged");
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let integer = "http://www.w3.org/2001/XMLSchema#integer";
+    for (key, value) in CORE_NOTES {
+        let property = Vocabulary::builtin()
+            .key(key)
+            .expect("bound")
+            .property
+            .clone();
+        let object = triples
+            .iter()
+            .find(|t| t.predicate.as_str() == property)
+            .map(|t| t.object.clone())
+            .unwrap_or_else(|| panic!("{key}= transrepts to {property}"));
+        let expected = match key {
+            k if k == DEPTH_NOTE || k == SCOPE_CLOCK_NOTE => typed(value, integer),
+            k if k == ALIAS_MISS_NOTE
+                || k == SCOPE_MISS_NOTE
+                || k == LIMITED_NOTE
+                || k == ANSWERED_NOTE =>
+            {
+                node(value)
+            }
+            _ => string(value),
+        };
+        assert_eq!(object, expected, "{key}=");
+    }
+}
+
+/// The `rdfs:domain` (or `rdfs:range`) of every property the vocabulary types
+/// with one of its own classes.
+fn declared_classes(predicate: &str) -> BTreeMap<String, String> {
+    RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(VOCABULARY_TTL.as_bytes())
+        .map(|quad| quad.expect("the vocabulary parses"))
+        .filter(|quad| quad.predicate.as_str() == predicate)
+        .filter_map(|quad| match (&quad.subject, &quad.object) {
+            (NamedOrBlankNode::NamedNode(s), OxTerm::NamedNode(o))
+                if o.as_str().starts_with(LOG_NS) =>
+            {
+                Some((s.as_str().to_string(), o.as_str().to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What an RDFS reasoner would infer from `triples` that is FALSE.
+///
+/// `rdfs:domain D` on a property says "whatever has this property IS a D", so a
+/// column written on an entry outside `D`'s family types that entry into it: a
+/// log:CapabilityDenied carrying `span=` became a log:Resolution, the trap the
+/// field guide calls the rdfs:domain family. Judged against each node's ASSERTED
+/// types: a node that asserts none (a successor segment named but not described
+/// here) cannot be contradicted, only described.
+fn family_traps(triples: &[Triple]) -> Vec<String> {
+    let vocab = Vocabulary::builtin();
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+    let domains = declared_classes(&format!("{rdfs}domain"));
+    let ranges = declared_classes(&format!("{rdfs}range"));
+    let types = |node: &str| -> Vec<String> {
+        triples
+            .iter()
+            .filter(|t| t.predicate.as_str() == RDF_TYPE)
+            .filter(|t| matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == node))
+            .filter_map(|t| match &t.object {
+                OxTerm::NamedNode(n) => Some(n.as_str().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut traps = Vec::new();
+    for t in triples {
+        let p = t.predicate.as_str();
+        if let (Some(domain), NamedOrBlankNode::NamedNode(subject)) = (domains.get(p), &t.subject) {
+            let held = types(subject.as_str());
+            if !held.is_empty() && !held.iter().any(|c| vocab.is_a(c, domain)) {
+                traps.push(format!("{p} domain ⇒ a {held:?} is a {domain}"));
+            }
+        }
+        if let (Some(range), OxTerm::NamedNode(object)) = (ranges.get(p), &t.object) {
+            let held = types(object.as_str());
+            if !held.is_empty() && !held.iter().any(|c| vocab.is_a(c, range)) {
+                traps.push(format!("{p} range ⇒ a {held:?} is a {range}"));
+            }
+        }
+    }
+    traps.sort();
+    traps.dedup();
+    traps
+}
+
+/// [`traced_space`] and [`failing_space`] together, plus the three shapes that put
+/// a refusal under a parent: a composite that propagates its child's own refusal,
+/// one that swallows a floor refusal, and one that asks for itself until the
+/// depth budget refuses it.
+fn family_space() -> EndpointSpace {
+    let text = |body: &'static str| {
+        Representation::new(ReprType::new("text/plain"), body.as_bytes().to_vec())
+    };
+    let composite = AsyncFnEndpoint::new("tracedComposite", move |inv| {
+        Box::pin(async move {
+            inv.issue(get(REFUSING_IRI)).await?;
+            Ok(text("unreachable"))
+        })
+    });
+    let asker = AsyncFnEndpoint::new("tracedAsker", move |inv| {
+        Box::pin(async move {
+            let _swallowed = inv.issue(get(GATED_IRI)).await;
+            Ok(text("asked"))
+        })
+    });
+    let deep = AsyncFnEndpoint::new("tracedDeep", move |inv| {
+        Box::pin(async move {
+            inv.issue(get(DEEP_IRI)).await?;
+            Ok(text("unreachable"))
+        })
+    });
+    let space = failing_space()
+        .bind(Exact::new(COMPOSITE_IRI), composite)
+        .bind(Exact::new(ASKER_IRI), asker)
+        .bind(Exact::new(DEEP_IRI), deep);
+    // The cacheable thing and the gated one, from the tracer tests' own space.
+    let thing = FnEndpoint::new("tracedThing", move |_inv| Ok(text("thing").cacheable()));
+    let gated = FnEndpoint::new("tracedGated", move |_inv| Ok(text("gated"))).with_description(
+        Description::new("tracedGated").action(ActionSpec::new(Verb::Source).requires(CAP_TRACED)),
+    );
+    space
+        .bind(Exact::new(TRACED_IRI), thing)
+        .bind(Exact::new(GATED_IRI), gated)
+}
+
+/// Every class the TRACER writes, through a real kernel: a resolution, a cache
+/// hit, a floor refusal under a parent, an endpoint refusal under a composite that
+/// propagates it, a depth refusal under the invocation that asked once too often,
+/// and every core note.
+fn traced_family_segment(tag: &str, level: &str) -> (String, Captured) {
+    let home = Scratch::new(tag);
+    let (handle, captured) = open_handle(home.path(), None, level);
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = Kernel::new(Arc::new(family_space()))
+        .with_clock(Arc::new(Fixed(1_700_000_000_000)))
+        .with_max_depth(3);
+    kernel.set_tracer(tracer.clone());
+    let unprivileged = Capability::scoped(Vec::<String>::new());
+    for iri in [TRACED_IRI, TRACED_IRI, ASKER_IRI, COMPOSITE_IRI, DEEP_IRI] {
+        let _ = futures::executor::block_on(kernel.issue(get(iri), &unprivileged));
+    }
+    for (span, (key, value)) in CORE_NOTES.iter().enumerate() {
+        tracer.record(TraceEvent {
+            notes: vec![(key.to_string(), value.to_string())],
+            ..resolution(TRACED_IRI, 1_000 + span as u64, 1_700_000_000_000)
+        });
+    }
+    (captured.text(), captured)
+}
+
+#[test]
+fn no_column_the_tracer_writes_types_an_entry_into_a_family_it_is_not_in() {
+    // ★ The claim of ledger #1103 (2), reproduced on what the tracer actually
+    // writes: `span`, `parent` and `worker` were rdfs:domain log:Resolution, and a
+    // refusal carries all three, so a reasoner concluded every log:CapabilityDenied
+    // and log:EndpointDenied was a log:Resolution. `log:invoked` had the same trap
+    // at both ends, because the parent→child edge is materialized to a refused
+    // child as readily as to one that ran.
+    let (text, captured) = traced_family_segment("family-traced", "trace");
+    for class in [
+        RESOLUTION_CLASS,
+        CACHE_HIT_CLASS,
+        CAPABILITY_DENIED_CLASS,
+        ENDPOINT_DENIED_CLASS,
+        DEPTH_EXCEEDED_CLASS,
+    ] {
+        assert!(
+            !of_class(&captured, class).is_empty(),
+            "the fixture writes a {class}: {:#?}",
+            entries(&captured)
+        );
+    }
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    assert!(
+        triples
+            .iter()
+            .any(|t| t.predicate.as_str() == log("invoked")),
+        "the fixture materializes call-tree edges"
+    );
+    let traps = family_traps(&triples);
+    assert!(traps.is_empty(), "{traps:#?}");
+}
+
+#[test]
+fn no_column_the_writer_or_the_config_door_writes_types_an_entry_into_a_family_it_is_not_in() {
+    // The same instrument over the always-land markers the writer and
+    // `urn:log:config` write: `file=` on a log:ConfigChange, `to=` on a
+    // log:LevelChangeRejected, `configured=` on a log:ProcessStart.
+    let home = Scratch::new("family-config");
+    let (handle, captured) = open_handle(home.path(), Some("serve"), "error");
+    let kernel = kernel(handle);
+    let config = Capability::scoped([CAP_CONFIG]);
+    futures::executor::block_on(
+        kernel.issue(sink_request(CONFIG_IRI, &[("level", "debug")]), &config),
+    )
+    .expect("a level change lands");
+    let _rejected = futures::executor::block_on(
+        kernel.issue(sink_request(CONFIG_IRI, &[("level", "loud")]), &config),
+    );
+    assert!(
+        !of_class(&captured, LEVEL_CHANGE_REJECTED_CLASS).is_empty(),
+        "the fixture writes a rejection: {:#?}",
+        entries(&captured)
+    );
+    let triples =
+        to_triples(&captured.text(), Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let traps = family_traps(&triples);
+    assert!(traps.is_empty(), "{traps:#?}");
+
+    // And a second process under a held name, whose ProcessStart says which name
+    // it asked for.
+    let scratch = Scratch::new("family-start");
+    let config = LogConfig::default()
+        .with_destination(Destination::File)
+        .with_directory(scratch.path())
+        .with_instance("serve");
+    let _first = Writer::open(&config, Vocabulary::shared_builtin(), at(1_700_000_000_000))
+        .expect("opens")
+        .expect("a writer");
+    let second = Writer::open(&config, Vocabulary::shared_builtin(), at(1_700_000_060_000))
+        .expect("opens")
+        .expect("a writer");
+    assert!(second.configured_instance().is_some(), "disambiguated");
+    let text = std::fs::read_to_string(second.path().expect("a file")).expect("the segment");
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    assert!(
+        triples
+            .iter()
+            .any(|t| t.predicate.as_str() == log("configuredInstance")),
+        "the fixture writes configured="
+    );
+    let traps = family_traps(&triples);
+    assert!(traps.is_empty(), "{traps:#?}");
+}
+
+#[test]
+fn a_write_under_a_principal_bearing_capability_is_attributed_to_it() {
+    // ★ The claim of ledger #1103 (3), reproduced: a door mints the principal into
+    // the capability (core 0.1.93), the tracer reads it back for every resolution
+    // — and the one entry a caller writes ON PURPOSE was the one left
+    // unattributed. `principal=` is reserved, so the caller could not state it
+    // either: the capability is the only honest source, and now it is read.
+    let home = Scratch::new("write-principal");
+    let (handle, captured) = open_handle(home.path(), None, "info");
+    let kernel = kernel(handle);
+    let alice = Capability::scoped([CAP_WRITE])
+        .with_principal(ALICE)
+        .expect("carried");
+    futures::executor::block_on(
+        kernel.issue(sink_request(WRITE_IRI, &[("msg", "for alice")]), &alice),
+    )
+    .expect("written");
+    futures::executor::block_on(kernel.issue(
+        sink_request(WRITE_IRI, &[("msg", "for nobody")]),
+        &Capability::scoped([CAP_WRITE]),
+    ))
+    .expect("written");
+
+    let messages = of_class(&captured, MESSAGE_CLASS);
+    let by_text = |text: &str| {
+        messages
+            .iter()
+            .find(|e| e.get("msg") == Some(text))
+            .unwrap_or_else(|| panic!("{text}: {messages:#?}"))
+            .clone()
+    };
+    assert_eq!(by_text("for alice").get(PRINCIPAL_KEY), Some(ALICE));
+    assert_eq!(
+        by_text("for nobody").get(PRINCIPAL_KEY),
+        None,
+        "no principal is no column, never an empty one"
+    );
+}
+
+#[test]
+fn a_depth_refusal_is_its_own_class_and_lands_at_the_default_level_but_not_at_error() {
+    // Ledger #1103 (1), the decision: a depth refusal never RAN, so it is not a
+    // log:Resolution (log:resolved is a sub-property of prov:used). It is not a
+    // refused authority either, so it is not always-land; it is a defect that a
+    // runaway tree produces exactly once, so it sits at `warn` and lands at the
+    // default `info`.
+    let (_, at_info) = traced_family_segment("depth-info", "info");
+    // The fixture also records each core note on a synthetic event, `depth=`
+    // among them; the kernel's own refusal is the one about the runaway.
+    let refused: Vec<Entry> = of_class(&at_info, DEPTH_EXCEEDED_CLASS)
+        .into_iter()
+        .filter(|entry| entry.subject == DEEP_IRI)
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "one runaway, one refusal: {:#?}",
+        entries(&at_info)
+    );
+    let refusal = &refused[0];
+    assert_eq!(refusal.subject, DEEP_IRI);
+    assert_eq!(refusal.get(DEPTH_NOTE), Some("4"), "one past a budget of 3");
+    assert!(
+        refusal.get("parent").is_some(),
+        "it hangs under the invocation that asked"
+    );
+    assert_eq!(refusal.get("dur"), None, "it never ran, so it took no time");
+    assert!(
+        of_class(&at_info, RESOLUTION_CLASS).is_empty(),
+        "the levels above it that ran and failed are resolutions, filtered at info"
+    );
+
+    let (_, at_error) = traced_family_segment("depth-error", "error");
+    assert!(
+        of_class(&at_error, DEPTH_EXCEEDED_CLASS).is_empty(),
+        "not a security fact, so not always-land: {:#?}",
+        entries(&at_error)
+    );
+    assert!(
+        !of_class(&at_error, CAPABILITY_DENIED_CLASS).is_empty(),
+        "while the floor's refusal in the same fixture still lands"
+    );
+
+    let event = TraceEvent {
+        started: None,
+        ended: None,
+        notes: vec![(DEPTH_NOTE.to_string(), "65".to_string())],
+        ..resolution(DEEP_IRI, 9, 1_700_000_000_000)
+    };
+    assert_eq!(class_for(&event), DEPTH_EXCEEDED_CLASS);
+    assert_eq!(
+        Vocabulary::builtin().subject_predicate(DEPTH_EXCEEDED_CLASS),
+        Some(log("refused").as_str()),
+        "a refusal's subject column means what every refusal's does"
+    );
+}
