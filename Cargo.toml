@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-log"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
