@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-log"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
@@ -33,7 +33,9 @@ rust-version = "1.89"
 # ⚠ This floor is the LIBRARY's, and it is deliberately below what the tests
 # build against: the conformance dev-dependency (0.6.0) needs core 0.1.89, so the
 # test graph never resolves below that, and no CI job compiles this crate at
-# 0.1.62. Raising the pin would not make the floor tested — it would only make a
+# 0.1.62. Checked by hand for 0.2.0 (2026-10-10): a fresh resolve of the
+# library alone, dev-dependencies stripped and this pin made `=0.1.62`, passes
+# `cargo check --lib` (with ikigai-sign 0.2.3). Raising the pin would not make the floor tested — it would only make a
 # consumer's resolve stricter than anything in src needs (rule 5: a pin states the
 # true minimum API used). A dev-dependency never enters a consumer's resolve.
 ikigai-core = "0.1.62"
