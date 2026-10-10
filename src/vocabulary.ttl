@@ -103,7 +103,7 @@ log:keyName a rdf:Property ;
     rdfs:domain rdf:Property ;
     rdfs:range xsd:string ;
     rdfs:label "keyName" ;
-    rdfs:comment "The bare key as it appears in a line's key=value column. This binding plus the property's rdfs:range IS the term table. A key no property claims is still recorded losslessly — as log:{key} with a plain literal — and flagged log:undeclaredKey, so drift is measurable rather than silent: the same posture as log:Message, and for the same reason." .
+    rdfs:comment "The bare key as it appears in a line's key=value column. This binding plus the property's rdfs:range IS the term table. A key no property claims is still recorded losslessly — with a plain literal, on <https://ikigai-rs.dev/ns/log/key#{key}>, a namespace reserved for exactly this and never on a log: term, so an undeclared column named like a declared property cannot be read as it and inherit its domain and range — and flagged log:undeclaredKey, so drift is measurable rather than silent: the same posture as log:Message, and for the same reason. Before ikigai-log 0.5 such a key was stated as log:{key}. A segment is transrepted on every read, so only a graph exported or stored from an older transreption keeps that form; the log:undeclaredKey flag (unchanged) names every such key, which is how a reader of an old graph tells a fallback from a declared term." .
 
 log:undeclaredKey a rdf:Property ;
     rdfs:domain log:Entry ;
@@ -223,7 +223,7 @@ log:durationMs a rdf:Property ;
 # Every column below is spelled exactly as ikigai_core spells the note key (the
 # `*_NOTE` constants), so the mapping stays identity: the tracer copies notes
 # into columns, and this table is what gives each one a meaning. Before these
-# were declared, each landed as log:{key} flagged log:undeclaredKey, and
+# were declared, each landed as an undeclared key flagged log:undeclaredKey, and
 # `uncached=` rides on EVERY uncacheable resolution, so the hygiene signal was
 # noise by construction (ledger #1103). Every domain is log:Entry: a note rides
 # on whatever event the kernel attaches it to, refusals included, and a

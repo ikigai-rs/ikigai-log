@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::config::ConfigError;
 use crate::line::{Entry, Header, Line, ParseError, Prev, Seal, Timestamp};
-use crate::vocabulary::{Vocabulary, DEFAULT_MIN_LEVEL, ENTRY_CLASS, LOG_NS};
+use crate::vocabulary::{Vocabulary, DEFAULT_MIN_LEVEL, ENTRY_CLASS, LOG_KEY_NS, LOG_NS};
 
 fn log(term: &str) -> String {
     format!("{LOG_NS}{term}")
@@ -1924,9 +1924,9 @@ fn an_undeclared_key_lands_losslessly_and_flagged() {
     let triples = reparse(&to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap());
     let entry = format!("{segment}:2");
 
-    // Lossless: both values, on log:{key}, as plain literals — never guessed
+    // Lossless: both values, on logkey:{key}, as plain literals — never guessed
     // into a range nobody declared.
-    let values = objects(&triples, &entry, &log("nonesuch"));
+    let values = objects(&triples, &entry, &format!("{LOG_KEY_NS}nonesuch"));
     assert_eq!(values.len(), 2, "{values:?}");
     assert!(values.contains(&&string("42")) && values.contains(&&string("43")));
 
@@ -6094,11 +6094,21 @@ fn family_traps(triples: &[Triple]) -> Vec<String> {
                 traps.push(format!("{p} domain ⇒ a {held:?} is a {domain}"));
             }
         }
-        if let (Some(range), OxTerm::NamedNode(object)) = (ranges.get(p), &t.object) {
-            let held = types(object.as_str());
-            if !held.is_empty() && !held.iter().any(|c| vocab.is_a(c, range)) {
-                traps.push(format!("{p} range ⇒ a {held:?} is a {range}"));
+        match (ranges.get(p), &t.object) {
+            (Some(range), OxTerm::NamedNode(object)) => {
+                let held = types(object.as_str());
+                if !held.is_empty() && !held.iter().any(|c| vocab.is_a(c, range)) {
+                    traps.push(format!("{p} range ⇒ a {held:?} is a {range}"));
+                }
             }
+            // A range that is one of the vocabulary's own classes says the
+            // object is an individual of it, which a literal cannot be: the
+            // shape the undeclared-key fallback produced when it landed on a
+            // declared property's name (ledger #1114).
+            (Some(range), OxTerm::Literal(literal)) => {
+                traps.push(format!("{p} range ⇒ the literal {literal} is a {range}"));
+            }
+            _ => {}
         }
     }
     traps.sort();
@@ -6254,6 +6264,68 @@ fn no_column_the_writer_or_the_config_door_writes_types_an_entry_into_a_family_i
     );
     let traps = family_traps(&triples);
     assert!(traps.is_empty(), "{traps:#?}");
+}
+
+#[test]
+fn an_undeclared_key_named_like_a_declared_property_is_not_read_as_it() {
+    // ★ The claim of ledger #1114, reproduced: the undeclared-key fallback was
+    // `log:{key}`, so a column no property claims but whose NAME is the local name
+    // of an existing `log:` property was stated AS that property and inherited its
+    // rdfs:domain and rdfs:range. `resolved=` on a message made it a
+    // log:Resolution, `destination=` made it a log:Config, `firstSequence=` a
+    // log:Seal, and `segment=`/`invoked=` stated a plain literal where the range is
+    // a log: class. None of these keys is claimed via log:keyName, so each is a
+    // column some future writer may well emit.
+    let colliding = [
+        "resolved",
+        "destination",
+        "firstSequence",
+        "segment",
+        "invoked",
+    ];
+    let vocab = Vocabulary::builtin();
+    for key in colliding {
+        assert!(vocab.key(key).is_none(), "{key}= is undeclared");
+    }
+    let (segment, text) = written_segment("info", |writer| {
+        let entry = colliding.iter().fold(
+            Entry::new(at(1_700_000_001_000), log("Message"), "urn:agent:calendar"),
+            |entry, key| entry.with(*key, "x"),
+        );
+        writer.write(entry).expect("a message at info");
+    });
+    let triples = to_triples(&text, vocab, &Options::all()).expect("transrepts");
+    let traps = family_traps(&triples);
+    assert!(traps.is_empty(), "{traps:#?}");
+
+    // Still lossless and still flagged, each key once — in the reserved fallback
+    // namespace, never on the declared property of the same name.
+    let entry = format!("{segment}:2");
+    let turtle = to_turtle(&text, vocab, &Options::all()).expect("transrepts");
+    let reparsed = reparse(&turtle);
+    for key in colliding {
+        let fallback = format!("{LOG_KEY_NS}{key}");
+        assert_eq!(
+            objects(&reparsed, &entry, &fallback),
+            vec![&string("x")],
+            "{key}= lands on {fallback}"
+        );
+        // `log:segment` IS on every entry — the segment's IRI, stated by the
+        // transreptor — so the claim is about the column's value, not the
+        // predicate's absence.
+        assert!(
+            !objects(&reparsed, &entry, &log(key)).contains(&&string("x")),
+            "{key}= is not stated as log:{key}"
+        );
+    }
+    let mut flags: Vec<_> = objects(&reparsed, &entry, &log("undeclaredKey"))
+        .into_iter()
+        .cloned()
+        .collect();
+    flags.sort_by_key(|t| t.to_string());
+    let mut expected: Vec<_> = colliding.iter().map(|k| string(k)).collect();
+    expected.sort_by_key(|t| t.to_string());
+    assert_eq!(flags, expected);
 }
 
 #[test]

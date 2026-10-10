@@ -60,7 +60,16 @@ oxrdfio = "0.2"
 # nothing here signs anything. It compiles clean on wasm32 and needs no
 # `.cargo/config.toml` (checked), but a `sig:`-tag crate, or features on
 # ikigai-sign, would be the honest shape of this dependency.
-ikigai-sign = "0.2"
+#
+# ⚠ A RANGE, not a caret, because a 0.x caret is a ceiling: the old `"0.2"` was
+# `<0.3.0` and held every consumer of this crate at sign 0.2.x once 0.3.0 shipped
+# (ledger #1123). 0.3.0 changed nothing this crate uses — it added `SPACE_ID` and
+# a self-named `space()`, and raised its own core floor to 0.1.89, which the core
+# pin above already exceeds; `HASH_ALG_SHA256` is `"sha256"` from 0.2.0 through
+# 0.3.0. So the floor stays 0.2.0 and the range admits both lines, which lets a
+# consumer on either one link a SINGLE ikigai-sign. The ceiling `<0.4` is
+# deliberate: 0.4 is unread, so widen it by reading it, not by default.
+ikigai-sign = ">=0.2.0, <0.4"
 
 # SHA-256 for the hash chain (RustCrypto, pure Rust, wasm-clean) — the same
 # implementation ikigai-sign digests with, which is not a coincidence worth
@@ -86,7 +95,12 @@ futures = "0.3" # block_on, for the endpoint tests
 # Turtle at your own IRI BUYS — so asserting it needs the real consumer, and a
 # hand-rolled stand-in would prove nothing. Dev-only: a host mounts whichever
 # SPARQL space it wants, and this crate depends on none of them at runtime.
-ikigai-sparql = "0.1.6"
+#
+# ⚠ `"0.2.1"` is `>=0.2.1, <0.3.0`; the old `"0.1.6"` was `<0.2.0` and tested
+# against a SPARQL line the hosts had left (ledger #1123). `space()` is unchanged,
+# and 0.2.1 is the floor because it sizes the SPARQL thread for the build, so the
+# debug build this test runs in agrees with release. Never reaches a consumer.
+ikigai-sparql = "0.2.1"
 
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
 # crate binds, every action each declares, every checkable rule at once.

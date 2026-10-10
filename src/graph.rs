@@ -38,9 +38,13 @@
 //! entry types with `rdfs:subClassOf` transrepts correctly with no change here,
 //! which is the entire reason the table is data.
 //!
-//! **A key the table does not claim lands as `log:{key}` with a plain literal
+//! **A key the table does not claim lands as `logkey:{key}` with a plain literal
 //! and a `log:undeclaredKey` flag.** Never guessed, never dropped: the flag is
-//! the hygiene signal, and it only works if nothing papers over it.
+//! the hygiene signal, and it only works if nothing papers over it. `logkey:` is
+//! [`LOG_KEY_NS`], a namespace of its own and not a `log:`
+//! local name, so an undeclared column can never be read as a declared property
+//! of the same name (ledger #1114; before 0.5 the fallback was `log:{key}`,
+//! which only an exported or stored graph from that era still carries).
 //!
 //! ## Skolemized, never blank
 //!
@@ -92,7 +96,7 @@ use oxrdf::{Literal, NamedNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
 use crate::line::{Entry, Header, Line, ParseError, Prev, Seal, Timestamp, TIMESTAMP_WIDTH};
-use crate::vocabulary::{Vocabulary, LOG_NS, PROCESS_START_CLASS, PROV_NS};
+use crate::vocabulary::{Vocabulary, LOG_KEY_NS, LOG_NS, PROCESS_START_CLASS, PROV_NS};
 
 /// The media type of a segment, and the `from` side of the transreption.
 ///
@@ -484,13 +488,16 @@ pub fn to_triples(
                     // Lossless AND flagged. Never guess a range: the flag is the
                     // design's hygiene signal, counted by the same standing
                     // CONSTRUCT that counts log:Message, and it only works if
-                    // nothing papers over it.
+                    // nothing papers over it. In the RESERVED namespace, never
+                    // `log:{key}`: a column named like a declared property
+                    // (`resolved=`, `segment=`) would otherwise be read AS that
+                    // property and inherit its domain and range (ledger #1114).
                     push_unique(
                         &mut out,
                         first,
                         triple(
                             &node,
-                            &format!("{LOG_NS}{key}"),
+                            &format!("{LOG_KEY_NS}{key}"),
                             Term::Literal(Literal::new_simple_literal(value)),
                         ),
                     );
@@ -787,12 +794,24 @@ fn triple(subject: &NamedNode, predicate: &str, object: Term) -> Triple {
 /// Only the prefixes the output uses are bound. `rdf:` and `rdfs:` are not among
 /// them: `a` is the only rdf: term emitted and Turtle spells it `a`, and an
 /// unused `@prefix` line is noise in an artifact whose value is being diffable.
+/// `logkey:` is bound only when an undeclared key is present, so a segment with
+/// none serializes byte-for-byte as it did before that namespace existed.
 pub(crate) fn serialize(triples: &[Triple]) -> Result<String, GraphError> {
+    let undeclared = triples
+        .iter()
+        .any(|t| t.predicate.as_str().starts_with(LOG_KEY_NS));
     let mut serializer = RdfSerializer::from_format(RdfFormat::Turtle)
         .with_prefix("log", LOG_NS)
         .and_then(|s| s.with_prefix("prov", PROV_NS))
         .and_then(|s| s.with_prefix("sig", SIG_NS))
         .and_then(|s| s.with_prefix("xsd", XSD_NS))
+        .and_then(|s| {
+            if undeclared {
+                s.with_prefix("logkey", LOG_KEY_NS)
+            } else {
+                Ok(s)
+            }
+        })
         .map_err(|e| GraphError::Serialize(e.to_string()))?
         .for_writer(Vec::new());
     for triple in triples {

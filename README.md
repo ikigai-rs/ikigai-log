@@ -197,8 +197,17 @@ already shipped.
   property's `rdfs:range` — an XSD datatype makes a typed literal, any other
   range makes an **IRI**, which is what lets `cap=urn:cap:fs:read` join to
   anything;
-* a key no property claims lands as `log:{key}` with a plain literal **and** a
-  `log:undeclaredKey` flag — lossless, never guessed, and measurable;
+* a key no property claims lands as `logkey:{key}` (`LOG_KEY_NS`,
+  `https://ikigai-rs.dev/ns/log/key#`) with a plain literal **and** a
+  `log:undeclaredKey` flag — lossless, never guessed, and measurable. The
+  fallback has a namespace of its own so that a column named like a declared
+  property (`resolved=`, `segment=`) is never read as that property and typed
+  into its family. Before 0.5 it was `log:{key}`. A segment is text and is
+  transrepted on every read, so an old segment re-read here gets the new IRI;
+  only Turtle already exported or loaded into a store keeps the old one, and the
+  flag, unchanged, is how a query over both copes: `?e log:undeclaredKey ?k`
+  names each one, and its value sits on `logkey:{k}` or, in an old graph,
+  `log:{k}`;
 * `log:invoked` (parent → child) is materialized from `parent=`/`span=` where
   both lines sit in one segment **and one process run** — spans restart with the
   process, so the join is scoped between `log:ProcessStart` markers. Where it
