@@ -92,7 +92,8 @@ The door is narrower than the grammar, on purpose. **A caller cannot speak for
 anyone**, so `urn:log:write` refuses, with `InvalidArgument`:
 
 * the columns the log writes itself — `seq` (the writer's numbering), `principal`
-  (the host's, through `Principal::new` and a per-tenant tracer), `cap` and
+  (the host's: minted into the capability at its door, or named through
+  `Principal::new` and a per-tenant tracer), `cap` and
   `denied` (the kernel's: the authority a resolution held, the scope a refusal
   lacked), and `pid`, `configured` and `next` (the writer's markers'). The list
   is `RESERVED_COLUMNS`. A tenant that could write `principal=` could attribute
@@ -482,12 +483,32 @@ tracer.
 
 ### One process, several principals
 
-The global tracer slot holds exactly one collector. That is right for a daemon
-logging its own work and wrong for a server handling several tenants at once, so
-`LogTracer::on_behalf_of` derives a tracer that attributes every entry to a
-`Principal` and shares the base's handle, clock and drop ledger. Hand it to
-`Kernel::issue_traced` — the per-call form, which the kernel isolates and which
-threads its own span-id space across `fan_out` — never to `set_tracer`:
+**The principal comes from the capability.** A door that authenticated a party
+mints it into the capability the request runs under (core 0.1.93):
+
+```rust
+let session = ceiling.with_principal("urn:agent:alice")?; // at the door
+kernel.issue(request, &session).await?;                    // any LogTracer attributes it
+```
+
+The kernel hands every `TraceEvent` the capability its invocation ran under, and
+`principal_of` reads that capability's one `urn:cap:principal:<iri>` scope back,
+by core's own rule (`Capability::principal`): **root names nobody, a capability
+carrying two principals names nobody, and a held wildcard is never an identity.**
+So the one tracer a host installed with `set_tracer` attributes each request, with
+no name supplied out of band. It is per INVOCATION, not per tree: a sub-request an
+endpoint issues with `issue_attenuated` to scopes that do not name the principal
+(core's escape from the per-principal cache partition) ran anonymous and is
+logged anonymous. The scope stays in its `cap=` column too, verbatim.
+
+**A host that names its tenant out of band** derives a per-call tracer instead:
+`LogTracer::on_behalf_of` attributes every entry whose capability names no
+principal to a `Principal` and shares the base's handle, clock and drop ledger.
+Hand it to `Kernel::issue_traced` — the per-call form, which the kernel isolates
+and which threads its own span-id space across `fan_out` — never to `set_tracer`.
+Where the capability names a principal too, **the capability wins**: it is what
+the kernel enforced for that invocation, and the tracer's name is the host's label
+for the whole tree.
 
 ```rust
 let base = LogTracer::new(handle, clock);
@@ -519,7 +540,10 @@ Three things are load-bearing about that column:
   survives and the value was written *bare*. One that would have to be quoted is
   refused, not escaped — escaping is lossless and still wrong, because
   `grep 'principal=urn:agent:alice'` is half of why the format is what it is. The
-  refusal happens once, when a connection's tracer is built.
+  refusal happens once, when a connection's tracer is built. Its bound,
+  `MAX_PRINCIPAL_LEN` (512 bytes), IS core's constant, and the tests probe core's
+  minting rule against this one, so a principal a door can mint is one the log
+  can write.
 
 **N tracers, one segment, one hash chain.** `LogHandle` holds its writer behind
 one lock and holds it across the whole of an append — sequence number, render,
@@ -746,7 +770,8 @@ entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
   "validate" in a rotation is the structural walk, not shapes, and this README
   will not let that word carry more than it does.
 * **A principal is recorded, never authenticated, and never correlated.** The
-  host names it; nothing here checks that the name is the one that authenticated,
+  host names it (at its door, in the capability, or per call); nothing here checks
+  that the name is the one that authenticated,
   and there is no index from a principal to its entries — finding one tenant's
   work is still `grep`, or a transreption of the whole segment.
 

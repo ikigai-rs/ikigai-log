@@ -100,12 +100,16 @@
 //! ones: nobody is composing prose, so the target is an IRI because a `Request`
 //! holds an IRI.
 //!
-//! ★ **One process, several principals.** The global tracer slot holds exactly
-//! one collector, which is right for a daemon logging its own work and wrong for
-//! a server handling several tenants at once. [`LogTracer::on_behalf_of`] derives
-//! a tracer that attributes every entry to a [`Principal`] and shares the base's
-//! handle, clock and drop ledger; hand it to `Kernel::issue_traced`, which is the
-//! only form the kernel isolates per call. N of them through one [`LogHandle`]
+//! ★ **One process, several principals.** A door that authenticated a party
+//! mints `urn:cap:principal:<iri>` into the capability the request runs under
+//! (core 0.1.93), and every `LogTracer`, the one global `set_tracer` slot
+//! included, reads it back per event ([`principal_of`]) into a `principal=`
+//! column. Root names nobody, and a capability carrying two principals names
+//! nobody. A host that names its tenant out of band instead derives a per-call
+//! tracer with [`LogTracer::on_behalf_of`], which attributes every entry the
+//! capability names no one for to a [`Principal`] and shares the base's handle,
+//! clock and drop ledger; hand it to `Kernel::issue_traced`, which is the only
+//! form the kernel isolates per call. N of them through one [`LogHandle`]
 //! cannot interleave a line or fold the chain out of order, because the writer
 //! lives behind one lock that is held across the whole append — and `Writer` is
 //! not `Sync`, so there is no other way to reach it.
@@ -173,8 +177,8 @@ pub use segments::{
 };
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
 pub use tracer::{
-    class_for, entry_for, entry_for_principal, LogTracer, Principal, PrincipalError, DROP_REASONS,
-    MAX_PRINCIPAL_LEN,
+    class_for, entry_for, entry_for_principal, principal_of, LogTracer, Principal, PrincipalError,
+    DROP_REASONS, MAX_PRINCIPAL_LEN,
 };
 pub use vocabulary::{
     ClassDef, KeyDef, VocabError, Vocabulary, CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS,

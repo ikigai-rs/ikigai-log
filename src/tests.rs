@@ -5482,3 +5482,281 @@ fn a_rotation_never_stamps_a_successor_before_its_predecessor_started() {
         "and the chain verifies in the order the file names give"
     );
 }
+
+// =====================================================================================
+// ledger #1077 — the principal comes from the capability the request ran under
+// =====================================================================================
+
+use ikigai_core::AsyncFnEndpoint;
+
+const ALICE: &str = "urn:agent:alice";
+const BOB: &str = "urn:agent:bob";
+const PARENT_IRI: &str = "urn:traced:parent";
+const KEPT_IRI: &str = "urn:traced:kept";
+const SHED_IRI: &str = "urn:traced:shed";
+
+/// [`traced_space`] plus a parent that issues two sub-requests: one under its own
+/// capability (`issue`, which passes it verbatim, principal included) and one
+/// attenuated to nothing (`issue_attenuated`, the documented way a sub-request that
+/// does not depend on identity sheds the principal).
+fn principal_space() -> EndpointSpace {
+    let plain = |name: &'static str| {
+        FnEndpoint::new(name, |_inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"x".to_vec(),
+            ))
+        })
+    };
+    let parent = AsyncFnEndpoint::new("tracedParent", |inv| {
+        Box::pin(async move {
+            inv.issue(get(KEPT_IRI)).await?;
+            inv.issue_attenuated(get(SHED_IRI), Vec::<String>::new())
+                .await?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"parent".to_vec(),
+            ))
+        })
+    });
+    traced_space()
+        .bind(Exact::new(PARENT_IRI), parent)
+        .bind(Exact::new(KEPT_IRI), plain("tracedKept"))
+        .bind(Exact::new(SHED_IRI), plain("tracedShed"))
+}
+
+/// A kernel over [`principal_space`] whose GLOBAL tracer is `tracer`: the
+/// single-tenant slot, where a principal could only ever come from the request.
+fn principal_kernel(tracer: Arc<LogTracer>) -> Kernel {
+    let kernel =
+        Kernel::new(Arc::new(principal_space())).with_clock(Arc::new(Fixed(1_700_000_000_000)));
+    kernel.set_tracer(tracer);
+    kernel
+}
+
+/// `scopes` as a door would hand them out, carrying `who` as the principal.
+fn session(scopes: &[&str], who: &str) -> Capability {
+    Capability::scoped(scopes.iter().copied())
+        .with_principal(who)
+        .expect("a principal core will carry")
+}
+
+/// The one entry for `target` of `class`.
+fn the_entry(captured: &Captured, class: &str, target: &str) -> Entry {
+    let found: Vec<Entry> = of_class(captured, class)
+        .into_iter()
+        .filter(|entry| entry.subject == target)
+        .collect();
+    assert_eq!(found.len(), 1, "{target}: {:#?}", entries(captured));
+    found.into_iter().next().expect("one")
+}
+
+#[test]
+fn a_request_under_a_principal_bearing_capability_is_attributed_with_no_separate_argument() {
+    // ★ The claim of ledger #1077, reproduced: a door mints the principal into the
+    // capability, and the PROCESS tracer (the one `set_tracer` slot, no per-call
+    // tracer, no name supplied out of band) attributes the work to it.
+    let home = Scratch::new("cap-principal");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = principal_kernel(tracer_for(handle, 1_700_000_000_000));
+
+    futures::executor::block_on(kernel.issue(get(GATED_IRI), &session(&[CAP_TRACED], ALICE)))
+        .expect("it resolves");
+
+    let entry = the_entry(&captured, RESOLUTION_CLASS, GATED_IRI);
+    assert_eq!(entry.get(PRINCIPAL_KEY), Some(ALICE), "{entry:?}");
+    assert!(
+        entry
+            .all("cap")
+            .any(|scope| scope == format!("urn:cap:principal:{ALICE}")),
+        "and the scope it came from is still in the cap= columns, verbatim: {entry:?}"
+    );
+}
+
+#[test]
+fn root_authority_logs_no_principal() {
+    // Root holds every principal and names none: it is the host's own authority,
+    // not a party's.
+    let home = Scratch::new("cap-principal-root");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = principal_kernel(tracer_for(handle, 1_700_000_000_000));
+
+    futures::executor::block_on(kernel.issue(get(GATED_IRI), &Capability::root()))
+        .expect("it resolves");
+
+    let entry = the_entry(&captured, RESOLUTION_CLASS, GATED_IRI);
+    assert_eq!(entry.get(PRINCIPAL_KEY), None, "{entry:?}");
+}
+
+#[test]
+fn an_ambiguous_capability_logs_no_principal() {
+    // Two principal scopes, reachable through `Capability::scoped` or a
+    // deserialized peer capability: core reads that as NOBODY, and the log's one
+    // column must not pick one of the two.
+    let home = Scratch::new("cap-principal-ambiguous");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = principal_kernel(tracer_for(handle, 1_700_000_000_000));
+    let both = Capability::scoped([
+        CAP_TRACED.to_string(),
+        format!("urn:cap:principal:{ALICE}"),
+        format!("urn:cap:principal:{BOB}"),
+    ]);
+    assert_eq!(both.principal(), None, "core's own answer");
+
+    futures::executor::block_on(kernel.issue(get(GATED_IRI), &both)).expect("it resolves");
+
+    let entry = the_entry(&captured, RESOLUTION_CLASS, GATED_IRI);
+    assert_eq!(entry.get(PRINCIPAL_KEY), None, "{entry:?}");
+}
+
+#[test]
+fn a_wildcard_principal_scope_is_never_an_identity() {
+    let home = Scratch::new("cap-principal-wildcard");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = principal_kernel(tracer_for(handle, 1_700_000_000_000));
+    let wildcard = Capability::scoped([CAP_TRACED, "urn:cap:principal:*"]);
+
+    futures::executor::block_on(kernel.issue(get(GATED_IRI), &wildcard)).expect("it resolves");
+
+    let entry = the_entry(&captured, RESOLUTION_CLASS, GATED_IRI);
+    assert_eq!(entry.get(PRINCIPAL_KEY), None, "{entry:?}");
+}
+
+#[test]
+fn a_refusal_is_attributed_to_the_principal_that_was_refused() {
+    // A denial is the entry an audit most wants attributed, and the kernel hands
+    // the refused capability to the tracer with it.
+    let home = Scratch::new("cap-principal-denied");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = principal_kernel(tracer_for(handle, 1_700_000_000_000));
+
+    let refused = futures::executor::block_on(
+        kernel.issue(get(GATED_IRI), &session(&["urn:cap:other:read"], ALICE)),
+    );
+    assert!(
+        matches!(refused, Err(ikigai_core::Error::Denied(_))),
+        "{refused:?}"
+    );
+
+    let entry = the_entry(&captured, CAPABILITY_DENIED_CLASS, GATED_IRI);
+    assert_eq!(entry.get(PRINCIPAL_KEY), Some(ALICE), "{entry:?}");
+    assert_eq!(entry.get(DENIED_NOTE), Some(CAP_TRACED));
+}
+
+#[test]
+fn a_sub_request_is_attributed_while_it_carries_the_principal_and_not_after_it_sheds_it() {
+    // Per NODE, not per tree: `issue` passes the capability verbatim, so the child
+    // carries alice; `issue_attenuated` to scopes that do not name her is ordinary
+    // narrowing, and the child runs (and is logged) anonymous. That is core's
+    // documented escape from the per-principal cache partition, and the log states
+    // what actually ran.
+    let home = Scratch::new("cap-principal-tree");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let kernel = principal_kernel(tracer_for(handle, 1_700_000_000_000));
+
+    futures::executor::block_on(kernel.issue(get(PARENT_IRI), &session(&[], ALICE)))
+        .expect("it resolves");
+
+    for (target, expected) in [
+        (PARENT_IRI, Some(ALICE)),
+        (KEPT_IRI, Some(ALICE)),
+        (SHED_IRI, None),
+    ] {
+        let entry = the_entry(&captured, RESOLUTION_CLASS, target);
+        assert_eq!(entry.get(PRINCIPAL_KEY), expected, "{target}: {entry:?}");
+    }
+}
+
+#[test]
+fn the_explicit_principal_still_attributes_what_the_capability_does_not_name() {
+    // The path for a host that has not moved: a per-call tracer built with
+    // `on_behalf_of`. It keeps attributing every entry its capability does not
+    // name a principal for — including the shed sub-request, which it attributes
+    // to the tree's tenant as it always did.
+    let home = Scratch::new("cap-principal-explicit");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let base = LogTracer::new(handle, Arc::new(Fixed(1_700_000_000_000)));
+    let bob: Arc<dyn Tracer> = Arc::new(base.on_behalf_of(Principal::new(BOB).expect("writable")));
+    let kernel =
+        Kernel::new(Arc::new(principal_space())).with_clock(Arc::new(Fixed(1_700_000_000_000)));
+
+    futures::executor::block_on(kernel.issue_traced(
+        get(PARENT_IRI),
+        &Capability::scoped(Vec::<String>::new()),
+        bob,
+    ))
+    .expect("it resolves");
+
+    for target in [PARENT_IRI, KEPT_IRI, SHED_IRI] {
+        let entry = the_entry(&captured, RESOLUTION_CLASS, target);
+        assert_eq!(entry.get(PRINCIPAL_KEY), Some(BOB), "{target}: {entry:?}");
+    }
+}
+
+#[test]
+fn where_both_name_one_the_capability_wins_over_the_explicit_principal() {
+    // The capability is what the kernel enforced for THIS invocation; the explicit
+    // name is the host's label for the whole tree. Where they disagree the entry
+    // states what the request ran as.
+    let home = Scratch::new("cap-principal-precedence");
+    let (handle, captured) = open_handle(home.path(), None, "debug");
+    let base = LogTracer::new(handle, Arc::new(Fixed(1_700_000_000_000)));
+    let bob: Arc<dyn Tracer> = Arc::new(base.on_behalf_of(Principal::new(BOB).expect("writable")));
+    let kernel =
+        Kernel::new(Arc::new(principal_space())).with_clock(Arc::new(Fixed(1_700_000_000_000)));
+
+    futures::executor::block_on(kernel.issue_traced(get(PARENT_IRI), &session(&[], ALICE), bob))
+        .expect("it resolves");
+
+    for (target, expected) in [(PARENT_IRI, ALICE), (KEPT_IRI, ALICE), (SHED_IRI, BOB)] {
+        let entry = the_entry(&captured, RESOLUTION_CLASS, target);
+        assert_eq!(
+            entry.get(PRINCIPAL_KEY),
+            Some(expected),
+            "{target}: {entry:?}"
+        );
+    }
+}
+
+#[test]
+fn the_principal_bound_is_cores_bound() {
+    // Every principal a door can mint is one this crate can write: one constant,
+    // not two that agree today.
+    assert_eq!(MAX_PRINCIPAL_LEN, ikigai_core::MAX_PRINCIPAL_LEN);
+    assert_eq!(MAX_PRINCIPAL_LEN, 512);
+
+    let longest = format!(
+        "urn:agent:{}",
+        "x".repeat(MAX_PRINCIPAL_LEN - "urn:agent:".len())
+    );
+    assert_eq!(longest.len(), MAX_PRINCIPAL_LEN);
+    assert!(Principal::new(&longest).is_ok());
+    assert!(ikigai_core::principal_scope(&longest).is_ok());
+    let over = format!("{longest}x");
+    assert!(Principal::new(&over).is_err());
+    assert!(ikigai_core::principal_scope(&over).is_err());
+}
+
+#[test]
+fn every_principal_core_will_mint_is_one_the_log_can_write() {
+    // Probe the edges of the two rules against each other. Where core mints a
+    // principal the log refuses, the entry would land unattributed (the cap= column
+    // still carries the scope), so any such shape is pinned here by name.
+    for iri in [
+        ALICE,
+        "https://example.org/people/brian#me",
+        "urn:iki:gonk:passkey:AbC-_x",
+        "urn:iki:gonk:client:30a7775e510d048d2344a8a8c48c067e3283cb1573b43155d5f9d0d073a400c9",
+        "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+        "urn:agent:a=b",
+        "urn:agent:%20encoded",
+        "urn:agent:{brace}",
+        "urn:agent:caf\u{e9}",
+        "mailto:someone@example.org",
+        "urn:agent:#seal",
+    ] {
+        let core = ikigai_core::principal_scope(iri).is_ok();
+        let log = Principal::new(iri).is_ok();
+        assert_eq!(core, log, "{iri}: core mints = {core}, log writes = {log}");
+    }
+}
