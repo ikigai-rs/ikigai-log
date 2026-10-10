@@ -107,19 +107,21 @@ pub const WRITE_IRI: &str = "urn:log:write";
 ///   per-tenant [`crate::LogTracer`]. A caller stating it would be one tenant
 ///   attributing work to another, with a `prov:Delegation` in the graph to
 ///   prove it.
-/// * `cap`, `denied` — the kernel's: the authority a resolution ran under and
-///   the scope a refusal lacked. A caller holding only [`CAP_WRITE`] must not
-///   be able to say it ran under `urn:cap:root`.
+/// * `cap`, `denied`, `failed` — the kernel's: the authority a resolution ran
+///   under, the scope a refusal lacked, and the kind of error an invocation that
+///   ran returned. A caller holding only [`CAP_WRITE`] must not be able to say
+///   it ran under `urn:cap:root`, or that something failed or was refused.
 /// * `pid`, `configured`, `next` — the writer's own markers': which process,
 ///   which name it was asked for, which segment a rotation rolled into.
 ///
 /// Refused rather than stripped: a write that silently lost a column it was
 /// given would be a quieter lie than the one it prevents.
-pub const RESERVED_COLUMNS: [&str; 7] = [
+pub const RESERVED_COLUMNS: [&str; 8] = [
     "seq",
     crate::vocabulary::PRINCIPAL_KEY,
     "cap",
     ikigai_core::DENIED_NOTE,
+    ikigai_core::FAILED_NOTE,
     "pid",
     "configured",
     "next",
@@ -965,7 +967,7 @@ pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
                  Returns the IRI of the entry in the segment it landed in, or says so when the \
                  class was below the segment's level or no segment is open. The log's own \
                  markers (every always-land class: stops, rotations, level changes, seals, \
-                 denials) and the columns it writes itself (seq, principal, cap, denied, pid, \
+                 refusals) and the columns it writes itself (seq, principal, cap, denied, failed, pid, \
                  configured, next) are refused. The segment's level is fixed for its whole life, \
                  so a level change takes effect at the next segment.",
             )
@@ -1023,7 +1025,7 @@ pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
                                 "the typed columns, in a line's own tail syntax: \
                                  `dur=12 tag=a tag=b msg=\"two words\"`. Same scanner as the \
                                  file, so quoting, escaping and repeated keys behave identically. \
-                                 The log's own columns (seq, principal, cap, denied, pid, \
+                                 The log's own columns (seq, principal, cap, denied, failed, pid, \
                                  configured, next) are refused",
                             )
                             .class(XSD_STRING)

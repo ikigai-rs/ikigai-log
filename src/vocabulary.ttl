@@ -369,6 +369,19 @@ log:deniedScope a rdf:Property ;
     rdfs:label "deniedScope" ;
     rdfs:comment "The capability scope the caller did not hold. The column is spelled `denied` because that is exactly ikigai_core::DENIED_NOTE's key: the kernel's note key and the log's column are one string, so the mapping is identity and neither side can drift into a second spelling of the same fact." .
 
+log:EndpointDenied a rdfs:Class ;
+    rdfs:subClassOf log:CapabilityDenied ;
+    log:minLevel log:always ;
+    rdfs:label "EndpointDenied" ;
+    rdfs:comment "An endpoint that RAN and refused with its own Error::Denied: a module's parameterized ACL (an fs path rule, a net host rule), which is the real gate for those modules. The kernel reports it as failed=denied on a timed event (ikigai_core::FAILED_NOTE, core 0.1.92), not as the floor's DENIED_NOTE, so the entry carries log:failureKind and a duration and no log:deniedScope: no floor scope was lacking. A subclass of log:CapabilityDenied because a refused authority is the same security fact whichever gate refused it; its subject column is log:refused by inheritance. A query without a reasoner names both classes. A composite that propagates its child's refusal fails with failed=denied as well, so one refusal under a composite lands once per refusing level; the deepest (no child of its own that refused) is where it originated." .
+
+log:failureKind a rdf:Property ;
+    log:keyName "failed" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "failureKind" ;
+    rdfs:comment "The kind of error an invocation that RAN returned: ikigai_core::Error::kind, one stable lowercase word (not-found, denied, invalid-argument, timeout, …) and nothing from the error's message, which may carry a path or a host. The column is spelled `failed` because that is exactly ikigai_core::FAILED_NOTE's key. Only `denied` changes the entry's class (log:EndpointDenied); every other kind stays a log:Resolution at its usual level." .
+
 log:KeyChange a rdfs:Class ;
     rdfs:subClassOf log:Entry ;
     log:minLevel log:always ;

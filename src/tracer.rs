@@ -21,6 +21,7 @@
 //! | `capability` | `cap=` per scope; absent = full authority |
 //! | `notes` | `key=value` columns, through the vocabulary's term table |
 //! | `notes[DENIED_NOTE]` | **the CLASS**: `log:CapabilityDenied`, plus `denied=` |
+//! | `notes[FAILED_NOTE]` | `failed=` → `log:failureKind`; `denied` is **the CLASS** `log:EndpointDenied` |
 //! | the `capability`'s one `urn:cap:principal:<iri>` | `principal=` → `log:onBehalfOf` |
 //!
 //! `principal=` is the one column read OUT of another: a door that authenticated
@@ -207,12 +208,15 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use ikigai_core::{Capability, Clock, TraceEvent, Tracer, DENIED_NOTE, PRINCIPAL_SCOPE_PREFIX};
+use ikigai_core::{
+    Capability, Clock, TraceEvent, Tracer, DENIED_NOTE, FAILED_NOTE, PRINCIPAL_SCOPE_PREFIX,
+};
 
 use crate::endpoints::LogHandle;
 use crate::line::{Entry, Timestamp};
 use crate::vocabulary::{
-    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DROPPED_CLASS, PRINCIPAL_KEY, RESOLUTION_CLASS,
+    CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DROPPED_CLASS, ENDPOINT_DENIED_CLASS, PRINCIPAL_KEY,
+    RESOLUTION_CLASS,
 };
 
 /// The `reason=` token on each `log:Dropped` entry, one per way this tracer can
@@ -715,9 +719,22 @@ pub fn principal_of(event: &TraceEvent) -> Option<Principal> {
 /// kernel sets `cache_hit` to `false` on a denial, so the two cannot collide
 /// today — but reading the note first states the priority rather than relying on
 /// a field of an event that never ran.
+///
+/// Two refusals, two classes, by the key alone (core's rule): the FLOOR's
+/// ([`DENIED_NOTE`], an event that never ran) is `log:CapabilityDenied`, and an
+/// endpoint's own `Error::Denied` (`failed=denied`, [`FAILED_NOTE`], an event
+/// that ran) is `log:EndpointDenied`. Both land at every level. The floor's is
+/// read first, the more specific fact should both ever appear. Every other
+/// failure kind keeps its ordinary class and carries `failed=` as a column.
 pub fn class_for(event: &TraceEvent) -> &'static str {
     if event.notes.iter().any(|(key, _)| key == DENIED_NOTE) {
         CAPABILITY_DENIED_CLASS
+    } else if event
+        .notes
+        .iter()
+        .any(|(key, value)| key == FAILED_NOTE && value == "denied")
+    {
+        ENDPOINT_DENIED_CLASS
     } else if event.cache_hit {
         CACHE_HIT_CLASS
     } else {
