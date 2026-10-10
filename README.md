@@ -586,6 +586,22 @@ encoding and the RDF serializer — so a directory holding any character a path 
 hold still reads back: Rust's `{:?}` looks like a TOML string and is not one, and
 it once wrote a `log.toml` the log could not read.
 
+A change arrives through either of two doors, or both. The named arguments
+(`level=`, `destination=`, `seal_every_entries=` and the rest) state one key each;
+`content` takes a whole layer file, the same TOML `log.toml` holds, which is where
+a pipe and a `sink`'s body land:
+
+```
+cat ops.log.toml | sink urn:log:config               # the file, as a write
+cat ops.log.toml | sink urn:log:config level=debug   # the file, but at debug
+```
+
+The body is judged whole, by the rule a config file meets: a key the schema does
+not define, or a value that is present and wrong, refuses the write as
+`content` even where a named argument restates that key. The named arguments are
+then applied over it key by key, inside `[seal]` and `[rotation]` too, in the
+order the layers themselves merge.
+
 A change is **recorded now and takes effect at a boundary, never inside a
 segment**. A segment has exactly one level for its whole life, which is what lets
 a verifier reason per sealed segment — "this ran at `info`, so absent resolutions
