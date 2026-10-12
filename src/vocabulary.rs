@@ -117,8 +117,18 @@ pub const ENDPOINT_DENIED_CLASS: &str = "https://ikigai-rs.dev/ns/log#EndpointDe
 /// budget ([`ikigai_core::DEPTH_NOTE`]). Nothing at that depth ran, so it is not
 /// a [`RESOLUTION_CLASS`]; it lands at `log:warn`, because a runaway tree is
 /// always a defect and produces exactly one, but it is not always-land, because
-/// no authority was refused. Its subject column means `log:refused`.
+/// no authority was refused. Its subject column means `log:refused`. A subclass
+/// of [`NOT_RESOLVED_CLASS`], the family of events that never ran.
 pub const DEPTH_EXCEEDED_CLASS: &str = "https://ikigai-rs.dev/ns/log#DepthExceeded";
+/// `log:NotResolved` — a request the kernel recorded that never ran: a limiter's
+/// hit, a rewrite onto nothing, a miss inside a non-empty chain, a seal breach
+/// (core's `limited`, `alias-unresolved`, `scope-unresolved` and `sealed` notes,
+/// [`crate::NOT_RESOLVED_NOTES`]), and by subclass a depth refusal. NOT a
+/// [`RESOLUTION_CLASS`]: `log:resolved` is a sub-property of `prov:used`, and
+/// nothing was used. Lands at `log:debug`, where these events were written as
+/// resolutions before ledger #1115. Declares no subject predicate, so its subject
+/// column is `log:subject` alone.
+pub const NOT_RESOLVED_CLASS: &str = "https://ikigai-rs.dev/ns/log#NotResolved";
 /// The `key=` column `log:failureKind` is bound to: core's
 /// [`FAILED_NOTE`](ikigai_core::FAILED_NOTE), the same string, so the note key
 /// and the log's column cannot drift into two spellings of one fact.

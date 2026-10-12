@@ -498,6 +498,17 @@ The mapping is nearly one-to-one, and two pieces of it are load-bearing:
   with `depth=` and its subject read as `log:refused`, not a resolution. It is not
   always-land, because no authority was refused; it lands at the default level,
   because a runaway tree is always a defect and produces exactly one.
+* **A request that never ran is not a resolution.** A limiter's hit (`limited=`),
+  a rewrite onto nothing (`alias-unresolved=`), a miss inside a non-empty chain
+  (`scope-unresolved=`) and a seal breach (`sealed=`) are events core records with
+  no start and no end. They are one family, `log:NotResolved`, with the note's own
+  column saying which kind; `log:DepthExceeded` is a member, with its own class and
+  level. Not `log:Resolution`, whose `log:resolved` is a sub-property of
+  `prov:used`: until 0.6 these were filed as resolutions and so claimed their
+  target was used. Same level as before (`debug`), and a segment written by an
+  older version keeps its lines and still verifies, because the chain is over the
+  bytes. A refused authority (`log:CapabilityDenied`) also never ran and is not in
+  this family: it is always-land, and its subclass `log:EndpointDenied` did run.
 * **Every other note core reports has a term**, spelled as core spells the key:
   `alias=` / `alias-unresolved=`, `scope=` / `scope-unresolved=` / `scope-clock=`,
   `limited=`, `answered-by=`, `sealed=`, `level=` (the scope levels an endpoint ran

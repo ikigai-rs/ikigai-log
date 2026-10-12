@@ -6529,3 +6529,309 @@ fn an_endpoints_own_denial_is_attributed_to_the_principal_that_was_refused() {
         assert_eq!(entry.get(PRINCIPAL_KEY), Some(ALICE), "{entry:#?}");
     }
 }
+
+// =====================================================================================
+// Ledger #1115: an event that never ran is not a resolution
+// =====================================================================================
+//
+// limited=, alias-unresolved=, scope-unresolved= and sealed= each ride on an event core
+// records for a resolution that never HAPPENED (`started`/`ended` both `None`). They
+// were filed as log:Resolution, whose subject predicate log:resolved is a sub-property
+// of prov:used, so every one claimed its target was used.
+
+use ikigai_core::{AliasTable, Limit, Scope};
+
+use crate::tracer::NOT_RESOLVED_NOTES;
+use crate::vocabulary::NOT_RESOLVED_CLASS;
+
+const LIMITED_PREFIX: &str = "urn:limited:";
+const LIMITED_IRI: &str = "urn:limited:calendar";
+const ALIASED_IRI: &str = "urn:old:thing";
+
+/// The never-ran notes the kernel actually writes, each through a real kernel where
+/// one can be built in a test: a limiter's hit, a rewrite onto nothing, and a miss
+/// inside a severed chain. A seal breach needs a space the build-time seal check
+/// cannot see into, so it is recorded on the event core's own code shapes
+/// (`kernel.rs`, the `Err(breach)` arm: the note, the alias and chain notes, no
+/// start, no end).
+fn never_ran_segment(tag: &str, level: &str) -> (String, Captured) {
+    let home = Scratch::new(tag);
+    let (handle, captured) = open_handle(home.path(), None, level);
+    let tracer = tracer_for(handle, 1_700_000_000_000);
+    let kernel = Kernel::new(Arc::new(Fallback::new(vec![
+        Arc::new(Limit::new(LIMITED_PREFIX)),
+        Arc::new(traced_space()),
+    ])))
+    .with_clock(Arc::new(Fixed(1_700_000_000_000)))
+    .with_aliases(Arc::new(AliasTable::new().prefix("urn:old:", "urn:gone:")));
+    kernel.set_tracer(tracer.clone());
+    let root = Capability::root();
+    for iri in [LIMITED_IRI, ALIASED_IRI] {
+        let missed = futures::executor::block_on(kernel.issue(get(iri), &root));
+        assert!(
+            matches!(missed, Err(Error::Unresolved(_))),
+            "{iri}: {missed:?}"
+        );
+    }
+    // Bound in the root, and the chain is severed from it.
+    let confined = Scope::empty().with(Arc::new(EndpointSpace::new())).sever();
+    let missed = futures::executor::block_on(kernel.issue_in(get(TRACED_IRI), &root, confined));
+    assert!(matches!(missed, Err(Error::Unresolved(_))), "{missed:?}");
+    tracer.record(TraceEvent {
+        started: None,
+        ended: None,
+        notes: vec![(
+            SEALED_NOTE.to_string(),
+            "urn:x is sealed by urn:example:level:owner and answered in urn:example:level:other"
+                .to_string(),
+        )],
+        ..resolution("urn:x", 77, 1_700_000_000_000)
+    });
+    (captured.text(), captured)
+}
+
+/// The keys that mark an event as never having run, and the entry of each.
+fn never_ran_entries(captured: &Captured) -> Vec<(&'static str, Entry)> {
+    let all = entries(captured);
+    [LIMITED_NOTE, ALIAS_MISS_NOTE, SCOPE_MISS_NOTE, SEALED_NOTE]
+        .into_iter()
+        .map(|key| {
+            let found: Vec<Entry> = all
+                .iter()
+                .filter(|entry| entry.get(key).is_some())
+                .cloned()
+                .collect();
+            assert_eq!(found.len(), 1, "one {key}= entry: {all:#?}");
+            (key, found[0].clone())
+        })
+        .collect()
+}
+
+#[test]
+fn an_event_that_never_ran_claims_no_use_of_its_target() {
+    // ★ The claim of ledger #1115, reproduced through a real kernel.
+    let (text, captured) = never_ran_segment("never-ran", "trace");
+    let segment = Header::parse(&text).expect("a segment").0.name;
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let resolved = log("resolved");
+    for (key, entry) in never_ran_entries(&captured) {
+        assert_eq!(entry.get("dur"), None, "{key}=: it never ran");
+        assert_eq!(entry.class, NOT_RESOLVED_CLASS, "{key}=: {entry:?}");
+        assert!(
+            !Vocabulary::builtin().is_a(&entry.class, RESOLUTION_CLASS),
+            "{key}=: {} is not in the resolution family",
+            entry.class
+        );
+        let entry_iri = format!("{segment}:{}", entry.get("seq").expect("a sequence"));
+        assert!(
+            states(&triples, &entry_iri, RDF_TYPE, node(NOT_RESOLVED_CLASS)),
+            "{key}=: {entry_iri} is typed log:NotResolved"
+        );
+        assert!(
+            states(&triples, &entry_iri, &log("subject"), node(&entry.subject)),
+            "{key}=: the subject column still lands, as log:subject"
+        );
+        assert!(
+            objects(&triples, &entry_iri, &resolved).is_empty(),
+            "{key}=: no log:resolved on {entry_iri}"
+        );
+        assert!(
+            objects(&triples, &entry_iri, &prov("used")).is_empty(),
+            "{key}=: no prov:used on {entry_iri}"
+        );
+        // And the note's own column, which says WHY it never ran, still lands
+        // under its declared term.
+        let property = &Vocabulary::builtin().key(key).expect("bound").property;
+        assert_eq!(
+            objects(&triples, &entry_iri, property).len(),
+            1,
+            "{key}= → {property}"
+        );
+    }
+    let traps = family_traps(&triples);
+    assert!(traps.is_empty(), "{traps:#?}");
+}
+
+#[test]
+fn the_class_rule_files_every_never_ran_note_as_not_resolved() {
+    // The rule on the event alone, for every key, and each beside the notes core
+    // attaches to it: the alias hop, the chain, the answering space.
+    let never_ran = |notes: Vec<(&str, &str)>| TraceEvent {
+        started: None,
+        ended: None,
+        notes: notes
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..resolution(TRACED_IRI, 5, 1_700_000_000_000)
+    };
+    for key in NOT_RESOLVED_NOTES {
+        let event = never_ran(vec![
+            (ALIAS_NOTE, "urn:fn:toUpper -> urn:iki:fn:toUpper"),
+            (SCOPE_NOTE, "urn:ctx:doc:7 severed"),
+            (ANSWERED_NOTE, "urn:example:space:personal"),
+            (key, TRACED_IRI),
+        ]);
+        assert_eq!(class_for(&event), NOT_RESOLVED_CLASS, "{key}=");
+    }
+    // The refusals keep their own classes, read first.
+    let denied = never_ran(vec![(LIMITED_NOTE, TRACED_IRI), (DENIED_NOTE, CAP_TRACED)]);
+    assert_eq!(class_for(&denied), CAPABILITY_DENIED_CLASS);
+    let depth = never_ran(vec![(ALIAS_MISS_NOTE, TRACED_IRI), (DEPTH_NOTE, "65")]);
+    assert_eq!(class_for(&depth), DEPTH_EXCEEDED_CLASS);
+    // ★ What did NOT move: a resolution that ran, through a rewrite and in a
+    // chain, is still a resolution. The alias and scope notes ride on every event
+    // of such a request; only the MISS keys mark one that never ran.
+    let ran = TraceEvent {
+        notes: vec![
+            (
+                ALIAS_NOTE.to_string(),
+                "urn:fn:toUpper -> urn:iki:fn:toUpper".to_string(),
+            ),
+            (SCOPE_NOTE.to_string(), "urn:ctx:doc:7 severed".to_string()),
+        ],
+        ..resolution(TRACED_IRI, 6, 1_700_000_000_000)
+    };
+    assert_eq!(class_for(&ran), RESOLUTION_CLASS);
+    let hit = TraceEvent {
+        cache_hit: true,
+        ..ran.clone()
+    };
+    assert_eq!(class_for(&hit), CACHE_HIT_CLASS);
+}
+
+#[test]
+fn the_family_is_one_class_at_the_level_the_resolutions_were_and_depth_is_in_it() {
+    let vocab = Vocabulary::builtin();
+    assert!(vocab.is_a(NOT_RESOLVED_CLASS, ENTRY_CLASS));
+    assert!(!vocab.is_a(NOT_RESOLVED_CLASS, RESOLUTION_CLASS));
+    assert_eq!(
+        vocab.min_level(NOT_RESOLVED_CLASS),
+        vocab.min_level(RESOLUTION_CLASS),
+        "the move changed the class, not the volume"
+    );
+    assert_eq!(
+        vocab.subject_predicate(NOT_RESOLVED_CLASS),
+        None,
+        "log:subject alone: no PROV property says asked-for-and-not-reached"
+    );
+    // log:DepthExceeded is folded in, and keeps what ledger #1103 gave it.
+    assert!(vocab.is_a(DEPTH_EXCEEDED_CLASS, NOT_RESOLVED_CLASS));
+    assert_eq!(vocab.min_level(DEPTH_EXCEEDED_CLASS), log("warn"));
+    assert_eq!(
+        vocab.subject_predicate(DEPTH_EXCEEDED_CLASS),
+        Some(log("refused").as_str())
+    );
+    // A refused authority is NOT in it: its subclass log:EndpointDenied ran.
+    assert!(!vocab.is_a(CAPABILITY_DENIED_CLASS, NOT_RESOLVED_CLASS));
+    assert!(!vocab.is_a(ENDPOINT_DENIED_CLASS, NOT_RESOLVED_CLASS));
+
+    // And the dial does what the vocabulary says: present at debug, gone at info,
+    // exactly as when these were resolutions.
+    let (_, at_debug) = never_ran_segment("never-ran-debug", "debug");
+    assert_eq!(never_ran_entries(&at_debug).len(), 4);
+    let (_, at_info) = never_ran_segment("never-ran-info", "info");
+    assert!(
+        of_class(&at_info, NOT_RESOLVED_CLASS).is_empty(),
+        "{:#?}",
+        entries(&at_info)
+    );
+}
+
+#[test]
+fn a_real_resolution_still_claims_its_target_was_used() {
+    // The fix must not take log:resolved away from the events that earned it.
+    let (text, captured) = never_ran_segment("never-ran-beside", "trace");
+    let segment = Header::parse(&text).expect("a segment").0.name;
+    let home = Scratch::new("ran-beside");
+    let (handle, ran) = open_handle(home.path(), None, "debug");
+    let kernel = traced_kernel(tracer_for(handle, 1_700_000_000_000), 1_700_000_000_000);
+    futures::executor::block_on(kernel.issue(get(TRACED_IRI), &Capability::root()))
+        .expect("it resolves");
+    let resolutions = of_class(&ran, RESOLUTION_CLASS);
+    assert_eq!(resolutions.len(), 1, "{:#?}", entries(&ran));
+    let text = ran.text();
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let ran_segment = Header::parse(&text).expect("a segment").0.name;
+    let entry_iri = format!(
+        "{ran_segment}:{}",
+        resolutions[0].get("seq").expect("a sequence")
+    );
+    assert!(states(
+        &triples,
+        &entry_iri,
+        &log("resolved"),
+        node(TRACED_IRI)
+    ));
+    // And in the never-ran fixture, nothing that never ran is a resolution.
+    assert!(
+        of_class(&captured, RESOLUTION_CLASS)
+            .iter()
+            .all(|entry| NOT_RESOLVED_NOTES.iter().all(|k| entry.get(k).is_none())),
+        "{segment}: {:#?}",
+        entries(&captured)
+    );
+}
+
+#[test]
+fn a_chain_holding_both_the_old_and_the_new_class_still_verifies() {
+    // A segment written by 0.5 carries a never-ran event as log:Resolution; one
+    // written after carries log:NotResolved. The chain is over the BYTES, so a log
+    // that spans the upgrade verifies, within one segment and across a rotation,
+    // and each line transrepts as what it says. Nothing rewrites a written line.
+    let dir = Scratch::new("never-ran-chain");
+    let handle = chained_handle(dir.path(), "bug:upgrade", "debug", 1_700_000_000_000);
+    let tracer = tracer_for(handle.clone(), 1_700_000_002_000);
+    let old = || {
+        Entry::new(at(1_700_000_001_000), RESOLUTION_CLASS, LIMITED_IRI)
+            .with("worker", "w")
+            .with("span", "1")
+            .with(LIMITED_NOTE, LIMITED_IRI)
+    };
+    let new = || TraceEvent {
+        started: None,
+        ended: None,
+        notes: vec![(LIMITED_NOTE.to_string(), LIMITED_IRI.to_string())],
+        ..resolution(LIMITED_IRI, 2, 1_700_000_002_000)
+    };
+    // The first segment: the old shape, then the new one.
+    let (first, _) = handle.open_segment().expect("a segment is open");
+    handle.write(old()).expect("the old shape writes");
+    tracer.record(new());
+    handle
+        .rotate(at(1_700_000_060_000))
+        .expect("rotates")
+        .expect("a successor");
+    // The second: the new shape alone.
+    tracer.record(new());
+    handle
+        .close(at(1_700_000_120_000))
+        .expect("an orderly close");
+
+    let on_disk = segments_on_disk(dir.path());
+    assert_eq!(on_disk.len(), 2, "{on_disk:#?}");
+    let report = verify_chain(&on_disk, Vocabulary::builtin());
+    assert!(report.ok(), "{}", report.render());
+    for (name, text) in &on_disk {
+        let segment = verify_segment(text, Vocabulary::builtin(), None);
+        assert!(segment.ok(), "{name}: {}", segment.render_findings());
+    }
+
+    let text = &on_disk
+        .iter()
+        .find(|(n, _)| *n == first)
+        .expect("the first")
+        .1;
+    let triples = to_triples(text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    let (old_node, new_node) = (format!("{first}:2"), format!("{first}:3"));
+    assert!(
+        states(&triples, &old_node, RDF_TYPE, node(RESOLUTION_CLASS)),
+        "{text}"
+    );
+    assert!(
+        states(&triples, &new_node, RDF_TYPE, node(NOT_RESOLVED_CLASS)),
+        "{text}"
+    );
+    assert_eq!(objects(&triples, &old_node, &log("resolved")).len(), 1);
+    assert!(objects(&triples, &new_node, &log("resolved")).is_empty());
+}
