@@ -23,6 +23,7 @@
 //! | `notes[DENIED_NOTE]` | **the CLASS**: `log:CapabilityDenied`, plus `denied=` |
 //! | `notes[FAILED_NOTE]` | `failed=` → `log:failureKind`; `denied` is **the CLASS** `log:EndpointDenied` |
 //! | `notes[DEPTH_NOTE]` | **the CLASS**: `log:DepthExceeded`, plus `depth=` → `log:depth` |
+//! | `notes[LIMITED_NOTE \| ALIAS_MISS_NOTE \| SCOPE_MISS_NOTE \| SEALED_NOTE]` | **the CLASS**: `log:NotResolved` (it never ran, so it used nothing), plus the note's own column |
 //! | every other core note | its own column, spelled as core spells the key: `alias=`, `scope=`, `uncached=`, … (see `vocabulary.ttl`) |
 //! | the `capability`'s one `urn:cap:principal:<iri>` | `principal=` → `log:onBehalfOf` |
 //!
@@ -211,16 +212,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ikigai_core::{
-    Capability, Clock, TraceEvent, Tracer, DENIED_NOTE, DEPTH_NOTE, FAILED_NOTE,
-    PRINCIPAL_SCOPE_PREFIX,
+    Capability, Clock, TraceEvent, Tracer, ALIAS_MISS_NOTE, DENIED_NOTE, DEPTH_NOTE, FAILED_NOTE,
+    LIMITED_NOTE, PRINCIPAL_SCOPE_PREFIX, SCOPE_MISS_NOTE, SEALED_NOTE,
 };
 
 use crate::endpoints::LogHandle;
 use crate::line::{Entry, Timestamp};
 use crate::vocabulary::{
     CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DEPTH_EXCEEDED_CLASS, DROPPED_CLASS,
-    ENDPOINT_DENIED_CLASS, PRINCIPAL_KEY, RESOLUTION_CLASS,
+    ENDPOINT_DENIED_CLASS, NOT_RESOLVED_CLASS, PRINCIPAL_KEY, RESOLUTION_CLASS,
 };
+
+/// The [`TraceEvent::notes`] keys that mark an event core recorded for a request
+/// that never RAN and was not refused an authority: a limiter's hit
+/// ([`LIMITED_NOTE`]), a rewrite onto nothing ([`ALIAS_MISS_NOTE`]), a miss inside
+/// a non-empty chain ([`SCOPE_MISS_NOTE`]) and a seal breach ([`SEALED_NOTE`]).
+/// Any one of them makes the entry `log:NotResolved` ([`class_for`]). Named
+/// through core's own constants, so they cannot drift from core's spelling.
+///
+/// The rule keys on the NOTES and not on a missing `started`, because a kernel
+/// built without a clock reports every event with no start, the ones that ran
+/// included.
+pub const NOT_RESOLVED_NOTES: [&str; 4] =
+    [LIMITED_NOTE, ALIAS_MISS_NOTE, SCOPE_MISS_NOTE, SEALED_NOTE];
 
 /// The `reason=` token on each `log:Dropped` entry, one per way this tracer can
 /// lose a fact. Fixed tokens, not composed prose: the entries the kernel writes
@@ -735,11 +749,44 @@ pub fn principal_of(event: &TraceEvent) -> Option<Principal> {
 /// authority was refused, so it lands at `warn` rather than at every level. The
 /// invocations above it that ran and failed keep `log:Resolution` with
 /// `failed=depth-exceeded`.
+///
+/// Every other event that never ran is `log:NotResolved`, the family
+/// `log:DepthExceeded` belongs to: a limiter's hit, a rewrite onto nothing, a
+/// miss inside a non-empty chain and a seal breach ([`NOT_RESOLVED_NOTES`]).
+/// Before ledger #1115 each was a `log:Resolution`, whose `log:resolved` is a
+/// sub-property of `prov:used`, so each claimed its target was used. Same level
+/// as before (`debug`), so no segment's volume moved.
+///
+/// ```
+/// use ikigai_core::{TraceEvent, LIMITED_NOTE};
+/// use ikigai_log::{class_for, NOT_RESOLVED_CLASS, RESOLUTION_CLASS};
+///
+/// let limited = TraceEvent {
+///     target: "urn:personal:calendar".into(),
+///     thread: "w".into(),
+///     started: None,
+///     ended: None,
+///     cache_hit: false,
+///     span: 0,
+///     parent: None,
+///     capability: None,
+///     notes: vec![(LIMITED_NOTE.into(), "urn:personal:calendar".into())],
+/// };
+/// assert_eq!(class_for(&limited), NOT_RESOLVED_CLASS);
+/// let ran = TraceEvent { notes: Vec::new(), ..limited };
+/// assert_eq!(class_for(&ran), RESOLUTION_CLASS);
+/// ```
 pub fn class_for(event: &TraceEvent) -> &'static str {
     if event.notes.iter().any(|(key, _)| key == DENIED_NOTE) {
         CAPABILITY_DENIED_CLASS
     } else if event.notes.iter().any(|(key, _)| key == DEPTH_NOTE) {
         DEPTH_EXCEEDED_CLASS
+    } else if event
+        .notes
+        .iter()
+        .any(|(key, _)| NOT_RESOLVED_NOTES.contains(&key.as_str()))
+    {
+        NOT_RESOLVED_CLASS
     } else if event
         .notes
         .iter()
