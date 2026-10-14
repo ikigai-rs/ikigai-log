@@ -92,6 +92,23 @@
 //! walked kernel is built over the SAME `Arc` the suite is handed for `space`,
 //! so the declaration is about the space under test rather than a twin of it.
 //!
+//! ## REQUIRED reaches one input, and the mutating verbs reach none
+//!
+//! `REQUIRED` (conformance 0.8.0) drops each input an action declares required,
+//! by value and with no default, and wants the call refused typed. Over these six
+//! endpoints exactly ONE input qualifies: `logTransrept`'s `content` (its `as`
+//! has a default, and `logSegment`'s `segment` is a template binding, not a value).
+//! The walk drops it and the transreptor refuses with `MissingArgument`, so the
+//! check is not vacuous here, though it is narrow. Every input of the two Sinks
+//! (`logWrite`, `logConfig`) is declared optional, because no single one is
+//! needed (a write's prose arrives as `msg` OR a piped `content`; a config write
+//! names any subset of its keys, by argument or in a `content` layer), so
+//! `Suite::required_on_mutating()` would reach nothing and
+//! `DECLARATIONS` would report it as inert. It is not declared.
+//! [`required_reaches_exactly_the_inputs_this_file_names`] holds both facts to the
+//! descriptions, so the day a Sink gains a required input this file says to
+//! declare `required_on_mutating`.
+//!
 //! ## Names
 //!
 //! The six ids (`logWrite`, `logConfig`, `logSegments`, `logVerify`,
@@ -106,7 +123,8 @@ use std::sync::Arc;
 
 use ikigai_conformance::{rdf, Check, Checks, Fixture, Report, Suite};
 use ikigai_core::{
-    ArgRef, Capability, Clock, EndpointSpace, Iri, Kernel, Representation, Request, Time, Verb,
+    ArgRef, Capability, Clock, EndpointSpace, InputSource, Iri, Kernel, Representation, Request,
+    Time, Verb,
 };
 use ikigai_log::{
     Destination, LogConfig, LogHandle, SealPolicy, Timestamp, Vocabulary, CAP_READ, CONFIG_IRI,
@@ -654,6 +672,69 @@ fn the_faces_emit_only_terms_the_vocabulary_defines() {
                 "a sealed segment's face carries the seal's digest: {terms:?}"
             );
         }
+    }
+}
+
+/// `REQUIRED` drops what an action declares required, by value, with no default,
+/// and is skipped on a Sink unless the suite declares `required_on_mutating`. The
+/// report does not print what it dropped, so the reach is held here against the
+/// descriptions: exactly `logTransrept`'s `content` on the read side, nothing on
+/// the mutating side (the module docs say why `required_on_mutating` is therefore
+/// not declared). And the one drop, by hand: refused as `MissingArgument`, the
+/// typed refusal the check accepts.
+#[test]
+fn required_reaches_exactly_the_inputs_this_file_names() {
+    let log = Log::new(false);
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for iri in [
+        WRITE_IRI,
+        TRANSREPT_IRI,
+        CONFIG_IRI,
+        SEGMENTS_IRI,
+        VERIFY_IRI,
+        log.iri.as_str(),
+    ] {
+        let description = log
+            .kernel
+            .describe(&Iri::parse(iri).unwrap())
+            .unwrap_or_else(|| panic!("{iri} describes itself"));
+        for spec in description.action_specs() {
+            for input in &spec.inputs {
+                if input.required
+                    && input.source == InputSource::Argument
+                    && input.default.is_none()
+                {
+                    let entry = (description.id.clone(), spec.verb, input.name.clone());
+                    if spec.verb.is_mutating() {
+                        writes.push(entry);
+                    } else {
+                        reads.push(entry);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        reads,
+        [(TRANSREPT.to_string(), Verb::Source, "content".to_string())],
+        "what REQUIRED drops on Source/Exists"
+    );
+    assert!(
+        writes.is_empty(),
+        "a Sink declares a required by-value input, so REQUIRED would reach it under \
+         `Suite::required_on_mutating()`: declare it in `suite` and update the module docs: \
+         {writes:?}"
+    );
+
+    match futures::executor::block_on(log.kernel.issue(
+        request(Verb::Source, TRANSREPT_IRI, &[]),
+        &Capability::root(),
+    )) {
+        Err(ikigai_core::Error::MissingArgument(detail)) => {
+            assert!(detail.starts_with("content"), "names the input: {detail}")
+        }
+        other => panic!("a transrept without `content` is a typed MissingArgument: {other:?}"),
     }
 }
 

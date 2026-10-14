@@ -105,12 +105,12 @@ ikigai-sparql = "0.2.1"
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
 # crate binds, every action each declares, every checkable rule at once.
 #
-# ⚠ Under Cargo's 0.x rules this pin is a CEILING as well as a floor: `"0.6.0"`
-# means `>=0.6.0, <0.7.0`. The previous `"0.2.0"` pin froze this crate out of
-# 0.3 (AUTHORITY), 0.4 (request-memoized firing), 0.5 (own-name purity) and 0.6
-# (SPACE-NAME) while the suite kept reporting green against the old definition
-# of "done". 0.6.0 is the floor because the suite declares both space
-# constructors host-named (`Suite::host_named_space`, new there); it pulls
-# ikigai-core 0.1.89, which the library caret above admits. Raise this pin
-# deliberately when 0.7 ships, and read what it checks.
-ikigai-conformance = "0.6.0"
+# ⚠ Under Cargo's 0.x rules this pin is a CEILING as well as a floor: `"0.8.0"`
+# means `>=0.8.0, <0.9.0`. The earlier `"0.2.0"` and `"0.6.0"` pins each froze
+# this crate out of later checks (AUTHORITY, request-memoized firing, own-name
+# purity, SPACE-NAME; then VALIDATE and REQUIRED) while the suite kept reporting
+# green against the old definition of "done". 0.8.0 is the floor because the
+# test asserts the walk ran REQUIRED (new there) and `Check::ALL` has fourteen
+# checks; it pulls ikigai-core 0.1.100, which the library caret above admits.
+# Raise this pin deliberately when 0.9 ships, and read what it checks.
+ikigai-conformance = "0.8.0"
