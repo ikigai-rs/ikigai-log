@@ -6980,3 +6980,90 @@ fn an_empty_content_is_no_body_not_a_blank_argument() {
     ))
     .expect("an empty body beside level= is a config change");
 }
+
+// =====================================================================================
+// The vocabulary is a published document: its ontology header (ledger #162)
+// =====================================================================================
+
+/// The ontology IRI: the document as https://ikigai-rs.dev/ns/log serves it.
+const ONTOLOGY_IRI: &str = "https://ikigai-rs.dev/ns/log";
+const OWL_ONTOLOGY: &str = "http://www.w3.org/2002/07/owl#Ontology";
+const OWL_VERSION_INFO: &str = "http://www.w3.org/2002/07/owl#versionInfo";
+
+/// The deployed /ns/log is a copy of [`VOCABULARY_TTL`], and `owl:versionInfo` is
+/// how one deploy is told apart from the last: devtools' `ns-drift` prints it for
+/// the live and the repo side. It is the crate version, so the release bump must
+/// move it. Read twice, because two kinds of reader depend on it: as RDF (exactly
+/// one plain-string value on the ontology), and as the one text line the drift
+/// scan's regex finds.
+#[test]
+fn ontology_version_is_the_crate_version() {
+    let ontology = NamedNodeRef::new(ONTOLOGY_IRI).expect("an IRI");
+    let triples: Vec<Triple> = RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(VOCABULARY_TTL.as_bytes())
+        .map(|quad| Triple::from(quad.expect("the vocabulary parses")))
+        .filter(|t| matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_ref() == ontology))
+        .collect();
+
+    assert!(
+        triples.iter().any(|t| t.predicate.as_str() == RDF_TYPE
+            && matches!(&t.object, OxTerm::NamedNode(n) if n.as_str() == OWL_ONTOLOGY)),
+        "{ONTOLOGY_IRI} is declared an owl:Ontology"
+    );
+    let versions: Vec<&OxTerm> = triples
+        .iter()
+        .filter(|t| t.predicate.as_str() == OWL_VERSION_INFO)
+        .map(|t| &t.object)
+        .collect();
+    let [OxTerm::Literal(version)] = versions.as_slice() else {
+        panic!("the ontology declares exactly one owl:versionInfo literal: {versions:?}");
+    };
+    assert_eq!(
+        version.datatype().as_str(),
+        "http://www.w3.org/2001/XMLSchema#string",
+        "a plain string, as core's is"
+    );
+    assert_eq!(
+        version.value(),
+        env!("CARGO_PKG_VERSION"),
+        "vocabulary.ttl's owl:versionInfo must be bumped with the crate version"
+    );
+
+    let lines: Vec<&str> = VOCABULARY_TTL
+        .lines()
+        .filter(|l| l.trim_start().starts_with("owl:versionInfo"))
+        .collect();
+    assert_eq!(
+        lines,
+        [format!(
+            "    owl:versionInfo \"{}\" .",
+            env!("CARGO_PKG_VERSION")
+        )],
+        "one owl:versionInfo line, in the form ns-drift reads"
+    );
+}
+
+/// The term table reads classes, levels, ranges and key bindings out of the same
+/// file, so a new subject must not become a term: the ontology is no class, binds
+/// no key, and leaves the class set exactly the `log:` terms it was.
+#[test]
+fn the_ontology_header_is_not_a_term() {
+    let vocab = Vocabulary::builtin();
+    assert!(
+        vocab.class(ONTOLOGY_IRI).is_none(),
+        "the ontology is not a class"
+    );
+    assert!(
+        vocab.classes().all(|c| c.iri.starts_with(LOG_NS)),
+        "every class the table holds is a log: term: {:?}",
+        vocab.classes().map(|c| &c.iri).collect::<Vec<_>>()
+    );
+    assert!(
+        vocab.keys().all(|k| k.property != ONTOLOGY_IRI),
+        "the ontology binds no key= column"
+    );
+    assert!(
+        vocab.levels().all(|(iri, _)| iri != ONTOLOGY_IRI),
+        "the ontology is not a level"
+    );
+}

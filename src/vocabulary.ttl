@@ -15,14 +15,22 @@
 # transreptor changes. That is the whole extension story.
 #
 # Namespace note: self-contained under `https://ikigai-rs.dev/ns/log#`, the
-# `sig:` precedent from ikigai-sign. NOT part of the published ikigai-rs.dev/ns
-# vocabulary and needing no /ns deploy — a term is promoted into
-# `vocabulary.ttl` when it earns a second consumer, and log-specific classes
-# are expected to stay here.
+# `sig:` precedent from ikigai-sign, and SEPARATE from the core vocabulary at
+# https://ikigai-rs.dev/ns — a term is promoted into core's `vocabulary.ttl`
+# when it earns a second consumer, and log-specific classes are expected to
+# stay here.
+#
+# This file IS the published document: it is served at
+# https://ikigai-rs.dev/ns/log, deployed by hand, and checked daily against
+# this repo's main by ikigai-devtools' `ns-drift`, which reads the
+# `owl:versionInfo` below on both sides. That line is the crate version
+# (test-pinned), so redeploy /ns/log after every release that changes this
+# file, or the live copy claims the previous one.
 
 @prefix log:  <https://ikigai-rs.dev/ns/log#> .
 @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
 @prefix prov: <http://www.w3.org/ns/prov#> .
 @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
 # The signature terms a `#seal` line transrepts to are ikigai-sign's, not
@@ -30,6 +38,14 @@
 # rather than minting parallel terms is what makes ikigai-log the second
 # consumer that crate names as its own promotion trigger.
 @prefix sig:  <https://ikigai-rs.dev/ns/sign#> .
+
+# The ontology is the DOCUMENT, named as it is served. Typed owl:Ontology, not
+# rdfs:Class, so the term table (`Vocabulary::extend`, which reads only
+# classes, levels, ranges and key bindings) never takes it for a term.
+<https://ikigai-rs.dev/ns/log> a owl:Ontology ;
+    rdfs:label "ikigai-log vocabulary" ;
+    rdfs:comment "The log's own terms: entry classes under log:Entry (a prov:Activity), the level ladder, and the key bindings that make the line format's key= columns into RDF. Also the transreptor's term table and the level dial's threshold table, embedded in the ikigai-log crate." ;
+    owl:versionInfo "0.7.0" .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The spine
