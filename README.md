@@ -66,7 +66,9 @@ nothing: `log:capability` above all, the authority an entry ran under, which is 
 large part of why this log is worth more than a trace.
 
 The vocabulary is self-contained under `https://ikigai-rs.dev/ns/log#` (the `sig:`
-precedent), so nothing here waits on a `/ns` deploy.
+precedent), so nothing here waits on a deploy of core's `/ns`. The file is published
+on its own at <https://ikigai-rs.dev/ns/log>: its `owl:versionInfo` is the crate
+version (test-pinned), and it is redeployed by hand after each release that changes it.
 
 ## Born structured — there is no parse step
 
