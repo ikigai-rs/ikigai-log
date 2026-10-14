@@ -853,11 +853,48 @@ fn now(inv: &Invocation<'_>) -> Result<Timestamp> {
         })
 }
 
-/// An optional inline argument, absent when empty.
-fn opt<'a>(inv: &'a Invocation<'a>, name: &str) -> Option<&'a str> {
+/// An optional inline argument, trimmed: `None` when it was not stated.
+///
+/// ★ **A stated-but-blank argument is REFUSED, never read as unstated** (Brian,
+/// 2026-10-10, ledger #1080). `directory=` with an empty variable interpolated
+/// into it is a caller's mistake, and reading it as absent turns that mistake
+/// into a different answer — a default, another input's value, or a
+/// `MissingArgument` naming an argument list instead of the one argument that was
+/// wrong. Blank means empty or whitespace only, since every value is trimmed.
+/// A value that is not inline UTF-8 is refused too, by the same name, rather than
+/// read as absent.
+///
+/// `content` does not come through here: the engine sends an EMPTY `content` for
+/// a `sink` that carries no body, so for that one argument empty is how "no body"
+/// arrives. [`body`] reads it.
+pub(crate) fn opt<'a>(inv: &'a Invocation<'a>, name: &str) -> Result<Option<&'a str>> {
     match inv.inline_str(name) {
-        Ok(value) if !value.trim().is_empty() => Some(value.trim()),
-        _ => None,
+        Err(Error::MissingArgument(_)) => Ok(None),
+        Err(e) => Err(e),
+        Ok(value) if value.trim().is_empty() => Err(blank(name)),
+        Ok(value) => Ok(Some(value.trim())),
+    }
+}
+
+/// The refusal for a stated-but-blank argument: one wording on every endpoint.
+pub(crate) fn blank(name: &str) -> Error {
+    Error::InvalidArgument {
+        name: name.to_string(),
+        detail: format!("`{name}=` is stated but blank; give it a value or leave it out"),
+    }
+}
+
+/// The `content` body, trimmed: `None` when there is none, and an EMPTY body is
+/// none. Not [`opt`], on purpose: the engine fills `content` with the empty
+/// string for a `sink` that carries no body (`sink urn:log:write msg=…` typed at
+/// the REPL), so refusing a blank one would refuse every write that names its
+/// prose with `msg=`.
+fn body<'a>(inv: &'a Invocation<'a>) -> Result<Option<&'a str>> {
+    match inv.inline_str("content") {
+        Err(Error::MissingArgument(_)) => Ok(None),
+        Err(e) => Err(e),
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value.trim())),
     }
 }
 
@@ -904,8 +941,11 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
     // Deliberate, not a concession — banning prose only drives it into one
     // field of a typed class where it is invisible, whereas its own class makes
     // the unstructured ratio per module one standing CONSTRUCT away.
-    let prose = opt(inv, "msg").or_else(|| opt(inv, "content"));
-    let class = match opt(inv, "class") {
+    let prose = match opt(inv, "msg")? {
+        Some(msg) => Some(msg),
+        None => body(inv)?,
+    };
+    let class = match opt(inv, "class")? {
         Some(token) => {
             expand(token)
                 .filter(|iri| rdf_iri(iri))
@@ -935,7 +975,7 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
     }
 
     let config = handle.config();
-    let subject = match opt(inv, "subject") {
+    let subject = match opt(inv, "subject")? {
         // `is_iri` is the line grammar's test, and it is looser than RDF's: a
         // subject like `urn:x:{a}` writes a line that parses and a graph that
         // will not. Refused here, at the door, rather than accepted into a
@@ -961,7 +1001,7 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
     // One grammar, not two: the `fields` argument is a line's TAIL, scanned by
     // the same code that reads it back out of the file. Quoting, escaping and
     // repeated keys therefore behave identically — not "the same as", the same.
-    if let Some(tail) = opt(inv, "fields") {
+    if let Some(tail) = opt(inv, "fields")? {
         for (key, value) in parse_fields(tail).map_err(|e| Error::InvalidArgument {
             name: "fields".to_string(),
             detail: e.to_string(),
@@ -1108,11 +1148,11 @@ fn config_source(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Repres
     }
     let config = handle.config();
     let open = handle.open_segment();
-    let face = match inv.inline_str("as").map(str::trim) {
-        Err(_) | Ok("") => TEXT_PLAIN,
-        Ok(t) if t == TURTLE => TURTLE,
-        Ok(t) if t.starts_with("text/plain") => TEXT_PLAIN,
-        Ok(other) => {
+    let face = match opt(inv, "as")? {
+        None => TEXT_PLAIN,
+        Some(t) if t == TURTLE => TURTLE,
+        Some(t) if t.starts_with("text/plain") => TEXT_PLAIN,
+        Some(other) => {
             return Err(Error::InvalidArgument {
                 name: "as".to_string(),
                 detail: format!("expected one of {TEXT_PLAIN}|{TURTLE}, got {other:?}"),
@@ -1202,7 +1242,7 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     // Then the named arguments ON TOP, key-wise — the order the config layers
     // themselves merge in, so `cat base.toml | sink urn:log:config level=debug`
     // means "this file, but at debug".
-    let level = match opt(inv, "level") {
+    let level = match opt(inv, "level")? {
         Some(level) => Some((level.to_string(), "level")),
         None => change.level.clone().map(|level| (level, "content")),
     };
@@ -1248,7 +1288,7 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
         }
         change.level = Some(level);
     }
-    if let Some(destination) = opt(inv, "destination") {
+    if let Some(destination) = opt(inv, "destination")? {
         change.destination =
             Some(
                 Destination::parse(destination).ok_or_else(|| Error::InvalidArgument {
@@ -1257,10 +1297,10 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
                 })?,
             );
     }
-    if let Some(directory) = opt(inv, "directory") {
+    if let Some(directory) = opt(inv, "directory")? {
         change.directory = Some(directory.to_string());
     }
-    if let Some(instance) = opt(inv, "instance") {
+    if let Some(instance) = opt(inv, "instance")? {
         change.instance = Some(instance.to_string());
     }
     // The cadences. A request has no tables, so the arg is the nested key
@@ -1305,7 +1345,9 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
         let name = match &e {
             ConfigError::BadValue { key, .. } => {
                 let arg = key.replace('.', "_");
-                if opt(inv, &arg).is_some() {
+                // Every named argument was read above, so a blank one has
+                // already been refused and this cannot be an error.
+                if matches!(opt(inv, &arg), Ok(Some(_))) {
                     arg
                 } else {
                     "content".to_string()
@@ -1482,7 +1524,7 @@ fn effective(key: &str) -> &'static str {
 /// message.
 #[cfg(not(target_family = "wasm"))]
 fn bound(inv: &Invocation<'_>, name: &str) -> Result<Option<crate::config::Bound>> {
-    let Some(value) = opt(inv, name) else {
+    let Some(value) = opt(inv, name)? else {
         return Ok(None);
     };
     Ok(Some(match value.trim().parse::<i64>() {

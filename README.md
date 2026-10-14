@@ -119,6 +119,15 @@ anyone**, so `urn:log:write` refuses, with `InvalidArgument`:
 The IRI a write returns names the segment the entry **landed** in, even when the
 write rolled the segment over before it returned.
 
+**A blank argument is a mistake, not an omission.** On every endpoint here, a
+named argument stated with nothing in it (`directory=`, `since=   `) is refused
+with `InvalidArgument` naming it, never read as if it had not been stated. An
+empty shell variable interpolated into `directory=` would otherwise become a
+default, another input's value, or a `MissingArgument` that names a list instead
+of the one argument that was wrong. The exception is `content`: the engine sends
+an empty `content` for a `sink` that carries no body, so for that argument empty
+is how "no body" arrives.
+
 ## Queryable across segments — and the segment IS the named graph
 
 This is the release where "CONSTRUCT over the log" stops being a property of the

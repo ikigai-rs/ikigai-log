@@ -79,6 +79,7 @@ use ikigai_core::{
     ArgSpec, Description, Endpoint, Error, Invocation, ReprType, Representation, Result, Verb,
 };
 
+use crate::endpoints::opt;
 #[cfg(not(target_family = "wasm"))]
 use crate::endpoints::{LogHandle, CAP_READ};
 use crate::graph::{to_turtle, Options, LOG_MEDIA_TYPE, TURTLE_MEDIA_TYPE};
@@ -168,10 +169,12 @@ impl Endpoint for TransreptEndpoint {
         // `as` is honored rather than ignored: the kernel's transreption plan
         // sets it on every step, and an endpoint that accepted `as=text/html`
         // and returned Turtle would make the plan silently wrong.
-        match inv.inline_str("as").map(str::trim) {
-            Err(_) | Ok("") => {}
-            Ok(t) if t == TURTLE_MEDIA_TYPE => {}
-            Ok(other) => {
+        // A blank `as=` is refused like any blank argument (ledger #1080); the
+        // kernel's plan always states a media type.
+        match opt(inv, "as")? {
+            None => {}
+            Some(t) if t == TURTLE_MEDIA_TYPE => {}
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "as".to_string(),
                     detail: format!("this transreptor produces {TURTLE_MEDIA_TYPE}, not {other:?}"),
@@ -299,11 +302,11 @@ impl Endpoint for SegmentEndpoint {
         let thread = format!("urn:file:{}", path.display());
         let finished = self.is_finished(&iri, &text);
 
-        let face = match inv.inline_str("as").map(str::trim) {
-            Err(_) | Ok("") => TURTLE_MEDIA_TYPE,
-            Ok(t) if t == TURTLE_MEDIA_TYPE => TURTLE_MEDIA_TYPE,
-            Ok(t) if t == LOG_MEDIA_TYPE => LOG_MEDIA_TYPE,
-            Ok(other) => {
+        let face = match opt(inv, "as")? {
+            None => TURTLE_MEDIA_TYPE,
+            Some(t) if t == TURTLE_MEDIA_TYPE => TURTLE_MEDIA_TYPE,
+            Some(t) if t == LOG_MEDIA_TYPE => LOG_MEDIA_TYPE,
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "as".to_string(),
                     detail: format!(
@@ -504,9 +507,9 @@ impl SegmentEndpoint {
 /// The window an invocation asks for.
 fn window(inv: &Invocation<'_>) -> Result<Options> {
     let stamp = |name: &str| -> Result<Option<Timestamp>> {
-        match inv.inline_str(name).map(str::trim) {
-            Err(_) | Ok("") => Ok(None),
-            Ok(value) => Timestamp::parse(value)
+        match opt(inv, name)? {
+            None => Ok(None),
+            Some(value) => Timestamp::parse(value)
                 .map(Some)
                 .map_err(|e| Error::InvalidArgument {
                     name: name.to_string(),
@@ -515,9 +518,9 @@ fn window(inv: &Invocation<'_>) -> Result<Options> {
         }
     };
     let seq = |name: &str| -> Result<Option<u64>> {
-        match inv.inline_str(name).map(str::trim) {
-            Err(_) | Ok("") => Ok(None),
-            Ok(value) => value
+        match opt(inv, name)? {
+            None => Ok(None),
+            Some(value) => value
                 .parse::<u64>()
                 .map(Some)
                 .map_err(|_| Error::InvalidArgument {
@@ -788,14 +791,8 @@ impl Endpoint for VerifyEndpoint {
 
         let directory = crate::writer::resolve_directory(&self.handle.config())
             .ok_or_else(|| Error::Endpoint(crate::writer::WriteError::NoDirectory.to_string()))?;
-        let wanted_segment = match inv.inline_str("segment").map(str::trim) {
-            Err(_) | Ok("") => None,
-            Ok(iri) => Some(iri.to_string()),
-        };
-        let wanted_instance = match inv.inline_str("instance").map(str::trim) {
-            Err(_) | Ok("") => None,
-            Ok(iri) => Some(iri.to_string()),
-        };
+        let wanted_segment = opt(inv, "segment")?.map(str::to_string);
+        let wanted_instance = opt(inv, "instance")?.map(str::to_string);
 
         let mut body = String::new();
         let mut chains = 0usize;

@@ -1569,9 +1569,10 @@ fn a_refused_config_write_names_the_input_that_stated_the_bad_value() {
 
     for (args, blamed, says) in [
         (&[("instance", "has a space")][..], "instance", "instance"),
-        // No `directory=` row: a blank directory is the only one `validate`
-        // refuses, and a blank named argument reads as unstated, so that
-        // door cannot carry a bad directory. The body can (below).
+        // A blank directory is the only one `validate` refuses, and a blank
+        // named argument never reaches it: it is refused at the door, by name,
+        // as stated-but-blank (ledger #1080). The body can carry one (below).
+        (&[("directory", "  ")][..], "directory", "blank"),
         (
             &[("seal_every_entries", "0")][..],
             "seal_every_entries",
@@ -6834,4 +6835,148 @@ fn a_chain_holding_both_the_old_and_the_new_class_still_verifies() {
     );
     assert_eq!(objects(&triples, &old_node, &log("resolved")).len(), 1);
     assert!(objects(&triples, &new_node, &log("resolved")).is_empty());
+}
+
+// =====================================================================================
+// A stated-but-blank argument is refused (ledger #1080)
+// =====================================================================================
+
+/// Every optional named argument of every endpoint, stated blank, is refused as
+/// `InvalidArgument` naming it — never read as if it had not been stated. A blank
+/// that reads as absent turns a caller's mistake (an empty variable interpolated
+/// into `directory=`) into a different answer: a default, another input's value,
+/// or a `MissingArgument` that names an argument list instead of the one argument
+/// that was wrong (Brian, 2026-10-10).
+///
+/// `content` is the one exception and is not in the table: the engine sends an
+/// EMPTY `content` for a `sink` that carries no body, so an empty body is how "no
+/// body" arrives, not a blank the caller typed. The test after this one pins that.
+#[test]
+fn a_stated_but_blank_argument_is_refused_by_name_on_every_endpoint() {
+    let dir = Scratch::new("blank-arguments");
+    let handle = file_handle(dir.path(), "info");
+    let (segment, _) = handle.open_segment().expect("a segment is open");
+    handle
+        .write(Entry::new(
+            at(1_700_000_001_000),
+            MESSAGE_CLASS,
+            "urn:agent:calendar",
+        ))
+        .expect("a message at info");
+    let (_, piped) = written_segment("info", |writer| {
+        writer
+            .write(Entry::new(
+                at(1_700_000_001_000),
+                MESSAGE_CLASS,
+                "urn:agent:calendar",
+            ))
+            .unwrap();
+    });
+    let kernel = kernel(handle);
+
+    // (verb, target, the argument stated blank, the other arguments the call
+    // needs to reach it). Every optional input each endpoint declares, except
+    // `content` (above) and the `{segment}` template binding, which is part of
+    // the IRI and cannot be stated blank.
+    type Case<'a> = (Verb, &'a str, &'a str, Vec<(&'a str, &'a str)>);
+    let cases: Vec<Case> = vec![
+        // urn:log:write
+        (Verb::Sink, WRITE_IRI, "msg", vec![]),
+        (Verb::Sink, WRITE_IRI, "class", vec![("msg", "hello")]),
+        (Verb::Sink, WRITE_IRI, "subject", vec![("msg", "hello")]),
+        (Verb::Sink, WRITE_IRI, "fields", vec![("msg", "hello")]),
+        // urn:log:config, Source
+        (Verb::Source, CONFIG_IRI, "as", vec![]),
+        // urn:log:config, Sink
+        (Verb::Sink, CONFIG_IRI, "level", vec![]),
+        (Verb::Sink, CONFIG_IRI, "destination", vec![]),
+        (Verb::Sink, CONFIG_IRI, "directory", vec![]),
+        (Verb::Sink, CONFIG_IRI, "instance", vec![]),
+        (Verb::Sink, CONFIG_IRI, "seal_every_entries", vec![]),
+        (Verb::Sink, CONFIG_IRI, "seal_every_millis", vec![]),
+        (Verb::Sink, CONFIG_IRI, "rotation_max_entries", vec![]),
+        (Verb::Sink, CONFIG_IRI, "rotation_max_age_millis", vec![]),
+        // A blank beside a good argument is still refused: the good one does not
+        // make the blank one mean "unstated".
+        (
+            Verb::Sink,
+            CONFIG_IRI,
+            "directory",
+            vec![("level", "debug")],
+        ),
+        // urn:log:transrept
+        (Verb::Source, TRANSREPT_IRI, "as", vec![("content", &piped)]),
+        // urn:log:{segment}
+        (Verb::Source, &segment, "as", vec![]),
+        (Verb::Source, &segment, "since", vec![]),
+        (Verb::Source, &segment, "until", vec![]),
+        (Verb::Source, &segment, "from_seq", vec![]),
+        (Verb::Source, &segment, "to_seq", vec![]),
+        // urn:log:verify
+        (Verb::Source, VERIFY_IRI, "segment", vec![]),
+        (Verb::Source, VERIFY_IRI, "instance", vec![]),
+    ];
+
+    // Every case is tried before anything is asserted, so a failure lists the
+    // whole set of doors that still read a blank as unstated.
+    let mut wrong = Vec::new();
+    for (verb, target, blank_arg, others) in &cases {
+        for blank in ["", "   ", "\t\n"] {
+            let mut request = Request::new(*verb, Iri::parse(*target).expect("a valid IRI"));
+            for (name, value) in others {
+                request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+            }
+            request = request.with_arg(*blank_arg, ArgRef::Inline(blank.as_bytes().to_vec()));
+            let outcome = futures::executor::block_on(kernel.issue(request, &Capability::root()));
+            match outcome {
+                Err(Error::InvalidArgument { name, detail })
+                    if name == *blank_arg && detail.contains("blank") => {}
+                other => wrong.push(format!(
+                    "{verb:?} <{target}> {blank_arg}={blank:?}: {}",
+                    match other {
+                        Ok(repr) => format!("answered {:?}", text(&repr)),
+                        Err(e) => format!("{e:?}"),
+                    }
+                )),
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a stated-but-blank argument must be refused as InvalidArgument naming it and \
+         saying it is blank; {} were not:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    assert!(
+        !dir.path().join("log.toml").exists(),
+        "a refused config change writes no layer"
+    );
+}
+
+/// The exception, pinned: an empty `content` is the engine's "no body", so a
+/// write or a config change that carries one alongside its named arguments is
+/// read exactly as if no body had been sent.
+#[test]
+fn an_empty_content_is_no_body_not_a_blank_argument() {
+    let dir = Scratch::new("empty-content");
+    let handle = file_handle(dir.path(), "info");
+    let kernel = kernel(handle);
+
+    let written = futures::executor::block_on(kernel.issue(
+        sink_request(WRITE_IRI, &[("content", ""), ("msg", "hello")]),
+        &Capability::root(),
+    ))
+    .expect("an empty body beside msg= is a write");
+    assert!(
+        text(&written).starts_with("urn:log:bug:seg:"),
+        "{}",
+        text(&written)
+    );
+
+    futures::executor::block_on(kernel.issue(
+        sink_request(CONFIG_IRI, &[("content", ""), ("level", "debug")]),
+        &Capability::root(),
+    ))
+    .expect("an empty body beside level= is a config change");
 }
