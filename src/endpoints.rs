@@ -1047,8 +1047,8 @@ fn write_error(e: WriteError) -> Error {
 
 /// `urn:log:write` — append one entry to this process's segment.
 pub fn write(handle: Arc<LogHandle>) -> FnEndpoint {
-    FnEndpoint::new("logWrite", move |inv| write_impl(&handle, inv)).with_description(
-        Description::new("logWrite")
+    FnEndpoint::new("log-write", move |inv| write_impl(&handle, inv)).with_description(
+        Description::new("log-write")
             .title("Append a log entry")
             .summary(
                 "Append one entry to this process's segment: a class, a subject and key=value \
@@ -1555,8 +1555,8 @@ fn display_dir(config: &LogConfig) -> String {
 /// `urn:log:config` — the effective configuration, and the door to change it.
 #[cfg(not(target_family = "wasm"))]
 pub fn config(handle: Arc<LogHandle>) -> FnEndpoint {
-    FnEndpoint::new("logConfig", move |inv| config_impl(&handle, inv)).with_description(
-        Description::new("logConfig")
+    FnEndpoint::new("log-config", move |inv| config_impl(&handle, inv)).with_description(
+        Description::new("log-config")
             .title("The log's effective configuration")
             .summary(
                 "The merged log settings for this process — level, destination, directory, \

@@ -96,11 +96,11 @@
 //!
 //! `REQUIRED` (conformance 0.8.0) drops each input an action declares required,
 //! by value and with no default, and wants the call refused typed. Over these six
-//! endpoints exactly ONE input qualifies: `logTransrept`'s `content` (its `as`
-//! has a default, and `logSegment`'s `segment` is a template binding, not a value).
+//! endpoints exactly ONE input qualifies: `log-transrept`'s `content` (its `as`
+//! has a default, and `log-segment`'s `segment` is a template binding, not a value).
 //! The walk drops it and the transreptor refuses with `MissingArgument`, so the
 //! check is not vacuous here, though it is narrow. Every input of the two Sinks
-//! (`logWrite`, `logConfig`) is declared optional, because no single one is
+//! (`log-write`, `log-config`) is declared optional, because no single one is
 //! needed (a write's prose arrives as `msg` OR a piped `content`; a config write
 //! names any subset of its keys, by argument or in a `content` layer), so
 //! `Suite::required_on_mutating()` would reach nothing and
@@ -111,11 +111,12 @@
 //!
 //! ## Names
 //!
-//! The six ids (`logWrite`, `logConfig`, `logSegments`, `logVerify`,
-//! `logSegment`, `logTransrept`) are camelCase, and NAMES says so. They are live
-//! MCP tool names, renamed in one coordinated pass across every module (wave
-//! two — see `ikigai-core-PENDING.md` §1), so NAMES is skipped here rather than
-//! six ids renamed out of step. No opt-outs.
+//! The six ids (`log-write`, `log-config`, `log-segments`, `log-verify`,
+//! `log-segment`, `log-transrept`) are kebab-case nouns, so NAMES runs here like
+//! every other check. They were camelCase (`logWrite` and so on) until 0.8.0,
+//! renamed in the ecosystem's naming wave (ledger #11); they are live MCP tool
+//! names, so the rename is a breaking change for anyone matching on them. No
+//! check is skipped and there are no opt-outs.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -134,12 +135,12 @@ use ikigai_log::{
 /// The six endpoints `space()` binds, by description id — pinned against the
 /// kernel in [`the_fixture_ids_are_the_description_ids`], because a `Fixture`
 /// is matched BY ID and one that drifts is silently never applied.
-const WRITE: &str = "logWrite";
-const TRANSREPT: &str = "logTransrept";
-const CONFIG: &str = "logConfig";
-const SEGMENTS: &str = "logSegments";
-const VERIFY: &str = "logVerify";
-const SEGMENT: &str = "logSegment";
+const WRITE: &str = "log-write";
+const TRANSREPT: &str = "log-transrept";
+const CONFIG: &str = "log-config";
+const SEGMENTS: &str = "log-segments";
+const VERIFY: &str = "log-verify";
+const SEGMENT: &str = "log-segment";
 
 /// What `SPACE-NAME` findings and the report's `space:` lines call the two
 /// constructors — the call, as the conformance README asks.
@@ -350,7 +351,7 @@ fn reader() -> Capability {
 /// function declared as such, and both space constructors declared host-named.
 fn suite(log: &Log) -> Suite {
     Suite::new()
-        .checks(Checks::all() - Checks::NAMES)
+        .checks(Checks::all())
         .namespace(LOG_NS)
         .namespace(SIG_NS)
         .fixture(Fixture::new(TRANSREPT, Verb::Source).arg("content", log.text()))
@@ -364,7 +365,7 @@ fn suite(log: &Log) -> Suite {
 }
 
 /// The walk saw the six endpoints and their eight actions (config and the
-/// segment declare two each), and skipped NAMES and nothing else. A seventh
+/// segment declare two each), and skipped nothing. A seventh
 /// endpoint bound without a line here would be held to a weaker standard; a
 /// declared action that binds nothing is a stale list.
 fn assert_shape(report: &Report) {
@@ -377,10 +378,9 @@ fn assert_shape(report: &Report) {
         "one action each, two for config (Source/Sink) and the segment (Exists/Source): {report}"
     );
     let skipped: Vec<Check> = report.checks.skipped().collect();
-    assert_eq!(
-        skipped,
-        [Check::Names],
-        "wave two, and nothing else: {report}"
+    assert!(
+        skipped.is_empty(),
+        "no check is skipped, found {skipped:?}: {report}"
     );
     // Both constructors reached SPACE-NAME (a declaration that reached nothing
     // would be a DECLARATIONS finding, but a report that silently dropped the
@@ -516,7 +516,7 @@ fn a_finished_segment_conforms_and_caches_under_its_file() {
     // the one finding is Exists — the per-endpoint limit, shown rather than
     // worked around.
     let report = suite(&log).cacheable(SEGMENT).run_blocking(&log.kernel);
-    eprintln!("[finished segment, logSegment declared cacheable]\n{report}");
+    eprintln!("[finished segment, log-segment declared cacheable]\n{report}");
     let findings: Vec<(&str, Option<Verb>, Check)> = report
         .findings
         .iter()
@@ -678,7 +678,7 @@ fn the_faces_emit_only_terms_the_vocabulary_defines() {
 /// `REQUIRED` drops what an action declares required, by value, with no default,
 /// and is skipped on a Sink unless the suite declares `required_on_mutating`. The
 /// report does not print what it dropped, so the reach is held here against the
-/// descriptions: exactly `logTransrept`'s `content` on the read side, nothing on
+/// descriptions: exactly `log-transrept`'s `content` on the read side, nothing on
 /// the mutating side (the module docs say why `required_on_mutating` is therefore
 /// not declared). And the one drop, by hand: refused as `MissingArgument`, the
 /// typed refusal the check accepts.

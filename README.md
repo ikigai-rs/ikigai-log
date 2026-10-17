@@ -804,10 +804,10 @@ faces and requires every `log:` term they emit to be a subject of that file — 
 `sig:` (`https://ikigai-rs.dev/ns/sign#`), `ikigai-sign`'s, defined in that
 crate's README and held to the three terms a seal carries.
 
-One check is skipped, suite-wide: **NAMES**. The six ids (`logWrite`, `logConfig`,
-`logSegments`, `logVerify`, `logSegment`, `logTransrept`) are camelCase, and they
-are live MCP tool names — renamed in one coordinated pass across every module,
-not six ids out of step. What the suite cannot see is pinned by hand in the same
+No check is skipped. The six ids (`log-write`, `log-config`, `log-segments`,
+`log-verify`, `log-segment`, `log-transrept`) are kebab-case nouns, so **NAMES**
+runs like the rest; they were camelCase (`logWrite` and so on) until 0.8.0 (see
+[CHANGELOG.md](CHANGELOG.md)). What the suite cannot see is pinned by hand in the same
 file: declared outputs against served media types in both directions with `as`
 omitted, the finished segment's Source cached and its Exists live (the suite's
 `cacheable` is per endpoint, and holds both), and that the walk's one write is the

@@ -199,11 +199,11 @@ impl Endpoint for TransreptEndpoint {
     }
 
     fn name(&self) -> &str {
-        "logTransrept"
+        "log-transrept"
     }
 
     fn describe(&self) -> Description {
-        Description::new("logTransrept")
+        Description::new("log-transrept")
             .title("Segment → graph")
             .summary(
                 "Transrept a log segment (text/x-ikigai-log — the `# ikigai-log v1` line \
@@ -347,11 +347,11 @@ impl Endpoint for SegmentEndpoint {
     }
 
     fn name(&self) -> &str {
-        "logSegment"
+        "log-segment"
     }
 
     fn describe(&self) -> Description {
-        Description::new("logSegment")
+        Description::new("log-segment")
             .title("A log segment")
             .summary(
                 "One segment of this process's log, resolved at its own IRI. The DEFAULT face \
@@ -846,11 +846,11 @@ impl Endpoint for VerifyEndpoint {
     }
 
     fn name(&self) -> &str {
-        "logVerify"
+        "log-verify"
     }
 
     fn describe(&self) -> Description {
-        Description::new("logVerify")
+        Description::new("log-verify")
             .title("Verify the log")
             .summary(
                 "Walk the hash chain and report what it finds, one `segment <iri> OK|BROKEN` \
@@ -1142,11 +1142,11 @@ impl Endpoint for SegmentsEndpoint {
     }
 
     fn name(&self) -> &str {
-        "logSegments"
+        "log-segments"
     }
 
     fn describe(&self) -> Description {
-        Description::new("logSegments")
+        Description::new("log-segments")
             .title("The segments there are")
             .summary(
                 "Every segment IRI in this process's log directory, newline-separated and \
