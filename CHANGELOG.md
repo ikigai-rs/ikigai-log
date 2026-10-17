@@ -3,7 +3,7 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
-## Unreleased (0.8.0)
+## 0.8.0
 
 A **breaking** change under 0.x, so a minor bump: anything that matches on an endpoint id, a
 catalog label or an MCP tool name derived from one must move with it.
