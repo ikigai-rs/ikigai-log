@@ -105,12 +105,12 @@ ikigai-sparql = "0.2.1"
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
 # crate binds, every action each declares, every checkable rule at once.
 #
-# ⚠ Under Cargo's 0.x rules this pin is a CEILING as well as a floor: `"0.8.0"`
-# means `>=0.8.0, <0.9.0`. The earlier `"0.2.0"` and `"0.6.0"` pins each froze
-# this crate out of later checks (AUTHORITY, request-memoized firing, own-name
-# purity, SPACE-NAME; then VALIDATE and REQUIRED) while the suite kept reporting
-# green against the old definition of "done". 0.8.0 is the floor because the
-# test asserts the walk ran REQUIRED (new there) and `Check::ALL` has fourteen
-# checks; it pulls ikigai-core 0.1.100, which the library caret above admits.
-# Raise this pin deliberately when 0.9 ships, and read what it checks.
-ikigai-conformance = "0.8.0"
+# ⚠ Under Cargo's 0.x rules this pin is a CEILING as well as a floor: `"0.10.0"`
+# means `>=0.10.0, <0.11.0`. The earlier `"0.2.0"`, `"0.6.0"` and `"0.8.0"` pins each
+# froze this crate out of later checks while the suite kept reporting green against
+# the old definition of "done". 0.9.0 added core 0.1.105's contract-shape checks
+# (REQUIRED probes input groups, OUTPUTS honors output_from, PIPELINE's named-only
+# line, VALIDATE refuses a default on a binding) and RECOMPUTE; 0.10.0 adds FAILURES,
+# OFF unless a suite opts in (`check_failures()`), so one skipped line is expected.
+# It floors ikigai-core at 0.1.108, which the library caret above admits.
+ikigai-conformance = "0.10.0"
