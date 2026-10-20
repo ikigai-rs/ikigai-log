@@ -116,7 +116,8 @@
 //! every other check. They were camelCase (`logWrite` and so on) until 0.8.0,
 //! renamed in the ecosystem's naming wave (ledger #11); they are live MCP tool
 //! names, so the rename is a breaking change for anyone matching on them. No
-//! check is skipped and there are no opt-outs.
+//! check but FAILURES (off until a suite opts in) is skipped and there are
+//! no opt-outs.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -377,10 +378,13 @@ fn assert_shape(report: &Report) {
         report.actions, 8,
         "one action each, two for config (Source/Sink) and the segment (Exists/Source): {report}"
     );
-    let skipped: Vec<Check> = report.checks.skipped().collect();
-    assert!(
-        skipped.is_empty(),
-        "no check is skipped, found {skipped:?}: {report}"
+    // FAILURES is off unless a suite opts in (`check_failures()`, the next wave);
+    // it is the only check allowed to be skipped.
+    let skipped: Vec<String> = report.checks.skipped().map(|c| c.to_string()).collect();
+    assert_eq!(
+        skipped,
+        ["FAILURES"],
+        "every check but FAILURES runs: {report}"
     );
     // Both constructors reached SPACE-NAME (a declaration that reached nothing
     // would be a DECLARATIONS finding, but a report that silently dropped the
