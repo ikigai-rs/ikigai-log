@@ -17,7 +17,9 @@ rust-version = "1.89"
 
 [dependencies]
 # The published kernel, consumed from crates.io — the SAME version the hosts
-# use, so a host links exactly one `ikigai-core`. 0.1.93 is the true minimum:
+# use, so a host links exactly one `ikigai-core`. 0.1.108 is the true minimum:
+# bounded segment reads refuse oversized input with `Error::OverBudget`, added
+# there. The attribution seam below requires 0.1.93:
 # the principal a tracer attributes an entry to is read from the capability the
 # request ran under (`Capability::principal`, `PRINCIPAL_SCOPE_PREFIX`), and this
 # crate's `MAX_PRINCIPAL_LEN` IS core's constant (ledger #1077) — all three
@@ -29,9 +31,9 @@ rust-version = "1.89"
 # `Error::Denied`, `Invocation::now`, and `Kernel::issue_traced`/`TraceScope`
 # (0.1.48, the per-call tracer seam the per-tenant `LogTracer` is handed to).
 #
-# ⚠ Read the caret as a RANGE: `"0.1.93"` is `>=0.1.93, <0.2.0`. Core is still
+# ⚠ Read the caret as a RANGE: `"0.1.108"` is `>=0.1.108, <0.2.0`. Core is still
 # on the 0.1 line, so the ceiling binds nothing today; it will on core 0.2.
-ikigai-core = "0.1.93"
+ikigai-core = "0.1.108"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
 # they carry a vocabulary and a handle — and `Endpoint::invoke` is `async_trait`.

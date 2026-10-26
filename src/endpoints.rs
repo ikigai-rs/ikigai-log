@@ -471,24 +471,34 @@ impl LogHandle {
         // Bounded at two on purpose: walking all of history on every rotation
         // would make rotation cost grow with the log. The full walk is
         // `urn:log:verify`.
-        let sealed = closed
-            .path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok());
-        let verdict = sealed.map(|sealed| {
+        let verdict = closed.path.as_ref().map(|sealed_path| {
             let mut walk = Vec::new();
+            let mut unreadable = Vec::new();
             if let Some(Predecessor {
                 name,
                 path: Some(path),
                 ..
             }) = &before
             {
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    walk.push((name.clone(), text));
+                match crate::segments::read_segment(path) {
+                    Ok(text) => walk.push((name.clone(), text)),
+                    Err(e) => {
+                        unreadable.push(crate::chain::unreadable(name.clone(), e.to_string()))
+                    }
                 }
             }
-            walk.push((closed.segment.clone(), sealed));
-            crate::chain::verify_chain(&walk, &vocabulary)
+            match crate::segments::read_segment(sealed_path) {
+                Ok(text) => walk.push((closed.segment.clone(), text)),
+                Err(e) => unreadable.push(crate::chain::unreadable(
+                    closed.segment.clone(),
+                    e.to_string(),
+                )),
+            }
+            let mut report = crate::chain::verify_chain(&walk, &vocabulary);
+            // Rotation remains best-effort, but an unreadable or over-budget
+            // segment must leave a ChainBroken entry rather than vanish.
+            report.segments.extend(unreadable);
+            report
         });
 
         let options = WriterOptions {
