@@ -379,6 +379,25 @@ gap is bracketed by an always-land marker**:
   truncating a chain at its head would otherwise be free, and the head is the
   recent past.
 
+### Segment read budgets
+
+Segment Source reads (both raw log and Turtle), piped transreption, and piped
+verification accept at most **16 MiB (16,777,216 bytes)** of segment input.
+`urn:log:verify` over a directory also caps the combined segment input at
+**64 MiB (67,108,864 bytes)**, across all instances, before applying instance or
+segment filters. These limits apply before parsing and window filtering. Exceeding
+a limit returns `OverBudget`; no truncated segment or partial verification verdict
+is returned. Exactly the limit is accepted. The directory verifier still holds
+whole segments, with its retained input bounded by the total budget; this is not
+a streaming verifier or a cap on parsed output size.
+
+Rotation's best-effort verification uses the same per-segment bound for each of
+its two inputs. An unreadable or over-budget input is recorded as `log:ChainBroken`
+in the successor, while rotation completes. These budgets do not change writer
+rotation settings or limit the pure parsing/verification functions over strings
+already held by their caller.
+
+
 ### What `urn:log:verify` proves, and what it cannot
 
 Said plainly, because a verifier that implies more than it checks is worse than

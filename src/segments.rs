@@ -119,6 +119,43 @@ const SEGMENT_EXTENSION: &str = "log";
 #[cfg(not(target_family = "wasm"))]
 const HEADER_PROBE_BYTES: usize = 8 * 1024;
 
+/// Maximum UTF-8 input size of one segment (16 MiB), before parsing or filtering.
+/// Oversized segments are refused with `Error::OverBudget`, never truncated.
+pub const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum total segment input retained by a directory verification (64 MiB).
+/// This bounds the whole-file verifier until a streaming implementation replaces it.
+#[cfg(not(target_family = "wasm"))]
+pub const MAX_VERIFY_BYTES: usize = 64 * 1024 * 1024;
+
+fn check_segment_size(size: usize, limit: usize) -> Result<()> {
+    if size > limit {
+        return Err(Error::OverBudget {
+            detail: format!("log input exceeds its {limit}-byte read budget"),
+        });
+    }
+    Ok(())
+}
+
+/// Read at most the budget plus one sentinel byte, including files that grow
+/// after opening. The sentinel detects overflow; no prefix is ever returned.
+#[cfg(not(target_family = "wasm"))]
+fn read_segment_with_budget(path: &Path, limit: usize) -> Result<String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))?;
+    check_segment_size(bytes.len(), limit)?;
+    String::from_utf8(bytes).map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn read_segment(path: &Path) -> Result<String> {
+    read_segment_with_budget(path, MAX_SEGMENT_BYTES)
+}
+
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 #[cfg(not(target_family = "wasm"))]
 const RDFS_RESOURCE: &str = "http://www.w3.org/2000/01/rdf-schema#Resource";
@@ -184,6 +221,7 @@ impl Endpoint for TransreptEndpoint {
         let bytes = inv.inline_arg("content").map_err(|_| {
             Error::MissingArgument("content: pipe a segment in (text/x-ikigai-log)".to_string())
         })?;
+        check_segment_size(bytes.len(), MAX_SEGMENT_BYTES)?;
         let text = std::str::from_utf8(bytes).map_err(|e| Error::InvalidArgument {
             name: "content".to_string(),
             detail: format!("a segment is UTF-8 text: {e}"),
@@ -212,7 +250,8 @@ impl Endpoint for TransreptEndpoint {
                  Every key becomes the property the vocabulary binds it to, typed by that \
                  property's rdfs:range; a key no property claims lands as log:{key} with a \
                  plain literal and a log:undeclaredKey flag. Seals are STATED, never \
-                 verified. O(segment): every line is parsed on every read.",
+                 verified. O(segment): every line is parsed on every read. Input above 16 MiB \
+                 is refused with OverBudget; input is never truncated.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -293,8 +332,7 @@ impl Endpoint for SegmentEndpoint {
         let path = locate(&directory, tail, &iri).ok_or_else(|| {
             Error::NotFound(format!("no segment <{iri}> in {}", directory.display()))
         })?;
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))?;
+        let text = read_segment(&path)?;
 
         // The golden thread is declared rather than acquired: this read did not
         // go through `urn:file:`, but what the kernel needs from it is the
@@ -363,7 +401,8 @@ impl Endpoint for SegmentEndpoint {
                  — a rotated segment is as immutable as a stopped one, and it is the common \
                  case) is cacheable under a golden thread on its file; a live one is not, and no watcher pretends \
                  otherwise. Transreption is \
-                 O(segment) — narrow it with since/until/from_seq/to_seq rather than \
+                 O(segment), with a 16 MiB input limit (OverBudget, never truncated), \
+                 applied before filtering — narrow it with since/until/from_seq/to_seq rather than \
                  filtering a year of entries in SPARQL.",
             )
             .verb(Verb::Source)
@@ -681,7 +720,12 @@ fn stated_head_of_file(path: &Path, header: &Header) -> Option<String> {
     let start = length.saturating_sub(TAIL_PROBE_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
+    file.take(TAIL_PROBE_BYTES + 1)
+        .read_to_end(&mut tail)
+        .ok()?;
+    if tail.len() as u64 > TAIL_PROBE_BYTES {
+        return None;
+    }
     let text = String::from_utf8_lossy(&tail);
     // The first line of a probe that started mid-file may be a fragment; a
     // fragment that happens to start `#seal` is still parsed in full, so it is
@@ -701,7 +745,7 @@ fn stated_head_of_file(path: &Path, header: &Header) -> Option<String> {
         return Some(crate::chain::Chain::open(header).head().to_string());
     }
     // A long tail with no seal in it: read the rest rather than guess.
-    crate::chain::head_of(&std::fs::read_to_string(path).ok()?)
+    crate::chain::head_of(&read_segment(path).ok()?)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -776,6 +820,7 @@ impl Endpoint for VerifyEndpoint {
         // to be checked against. Reported by the absence of a PrevMismatch
         // rather than by asserting a link that was never examined.
         if let Ok(bytes) = inv.inline_arg("content") {
+            check_segment_size(bytes.len(), MAX_SEGMENT_BYTES)?;
             let text = std::str::from_utf8(bytes).map_err(|e| Error::InvalidArgument {
                 name: "content".to_string(),
                 detail: format!("a segment is UTF-8 text: {e}"),
@@ -796,7 +841,7 @@ impl Endpoint for VerifyEndpoint {
 
         let mut body = String::new();
         let mut chains = 0usize;
-        let (walks, damaged) = chains_in(&directory);
+        let (walks, damaged) = chains_in(&directory)?;
         for (instance, chain) in walks {
             if wanted_instance
                 .as_ref()
@@ -853,7 +898,9 @@ impl Endpoint for VerifyEndpoint {
         Description::new("log-verify")
             .title("Verify the log")
             .summary(
-                "Walk the hash chain and report what it finds, one `segment <iri> OK|BROKEN` \
+                "Walk the hash chain (16 MiB per segment, 64 MiB total directory input; \
+                 OverBudget refuses the whole request, never a partial verdict) and report \
+                 what it finds, one `segment <iri> OK|BROKEN` \
                  line per segment with its findings indented beneath — greppable like \
                  everything else here. Checks FOUR things, not one: that each entry hashes \
                  into the seal that covers it (so tampering localizes to `between seal K and \
@@ -929,9 +976,18 @@ type InstanceChain = (String, Vec<(String, String)>);
 /// the instance, so a damaged header leaves it in no chain — and a walk that
 /// dropped it would report "0 broken" over a directory holding a damaged
 /// segment, which is the verifier vouching for exactly what it could not check.
-fn chains_in(directory: &Path) -> (Vec<InstanceChain>, Vec<(PathBuf, String)>) {
+type DirectoryChains = (Vec<InstanceChain>, Vec<(PathBuf, String)>);
+
+#[cfg(not(target_family = "wasm"))]
+fn chains_in(directory: &Path) -> Result<DirectoryChains> {
+    chains_in_with_budget(directory, MAX_VERIFY_BYTES)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn chains_in_with_budget(directory: &Path, budget: usize) -> Result<DirectoryChains> {
+    let mut remaining = budget;
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let mut by_instance: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
@@ -943,15 +999,17 @@ fn chains_in(directory: &Path) -> (Vec<InstanceChain>, Vec<(PathBuf, String)>) {
         .collect();
     found.sort();
     for path in found {
-        let header = match read_header(&path) {
-            Ok(header) => header,
-            Err(why) => {
-                damaged.push((path, why));
+        let text = match read_segment_with_budget(&path, MAX_SEGMENT_BYTES.min(remaining)) {
+            Ok(text) => text,
+            Err(e @ Error::OverBudget { .. }) => return Err(e),
+            Err(e) => {
+                damaged.push((path, e.to_string()));
                 continue;
             }
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        remaining -= text.len();
+        let header = match Header::parse(&text) {
+            Ok((header, _)) => header,
             Err(e) => {
                 damaged.push((path, e.to_string()));
                 continue;
@@ -966,7 +1024,7 @@ fn chains_in(directory: &Path) -> (Vec<InstanceChain>, Vec<(PathBuf, String)>) {
         let ordered = std::mem::take(chain);
         *chain = in_chain_order(ordered);
     }
-    (by_instance.into_iter().collect(), damaged)
+    Ok((by_instance.into_iter().collect(), damaged))
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1164,5 +1222,77 @@ impl Endpoint for SegmentsEndpoint {
                     .requires(CAP_READ)
                     .output(TEXT_PLAIN),
             )
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod budget_tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ikigai-log-read-budget-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn bounded_read_accepts_exact_bytes_and_refuses_one_more() {
+        let dir = Scratch::new();
+        let path = dir.0.join("input.log");
+        // A byte budget, including multibyte UTF-8; never return a truncated codepoint.
+        std::fs::write(&path, "éé").unwrap();
+        assert_eq!(read_segment_with_budget(&path, 4).unwrap(), "éé");
+        assert!(matches!(
+            read_segment_with_budget(&path, 3),
+            Err(Error::OverBudget { .. })
+        ));
+        assert!(matches!(
+            read_segment_with_budget(&path, 0),
+            Err(Error::OverBudget { .. })
+        ));
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_segment_with_budget(&path, 0).unwrap(), "");
+    }
+
+    #[test]
+    fn directory_budget_is_shared_across_segments_and_instances() {
+        let dir = Scratch::new();
+        let mut total = 0;
+        for i in 0..2 {
+            let text = Header {
+                version: 1,
+                prefixes: Default::default(),
+                name: format!("urn:log:test:{i}"),
+                instance: format!("urn:instance:{i}"),
+                level: "https://ikigai-rs.dev/ns/log#info".into(),
+                started: Timestamp::from_millis(0),
+                prev: Prev::Genesis,
+            }
+            .render()
+            .unwrap();
+            total += text.len();
+            std::fs::write(dir.0.join(format!("{i}.log")), text).unwrap();
+        }
+        let (chains, damaged) = chains_in_with_budget(&dir.0, total).unwrap();
+        assert_eq!(chains.len(), 2);
+        assert!(damaged.is_empty());
+        // Individually within budget, together exactly one byte above it.
+        assert!(matches!(
+            chains_in_with_budget(&dir.0, total - 1),
+            Err(Error::OverBudget { .. })
+        ));
     }
 }

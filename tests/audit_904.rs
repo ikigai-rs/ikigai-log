@@ -1419,3 +1419,70 @@ fn h8_segment_and_lock_files_are_created_owner_only() {
     }
     assert_eq!(checked, 3, "two segments and the lock");
 }
+
+// Ledger #2294: whole-file reads must refuse oversized input, never serve a prefix.
+#[test]
+fn segment_one_byte_over_read_budget_is_refused() {
+    let dir = Scratch::new("2294-segment");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    handle.close(at(T0 + 1)).unwrap();
+    let path = segment_files(dir.path()).pop().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (header, _) = ikigai_log::Header::parse(&text).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let k = kernel(handle);
+    file.set_len(16 * 1024 * 1024).unwrap();
+    let exact = issue(
+        &k,
+        req(Verb::Source, &header.name, &[("as", "text/x-ikigai-log")]),
+        &Capability::root(),
+    )
+    .unwrap();
+    assert_eq!(exact.len(), 16 * 1024 * 1024);
+    assert!(exact.starts_with(&text));
+    file.set_len(16 * 1024 * 1024 + 1).unwrap();
+    for target in [&header.name[..], VERIFY_IRI] {
+        let result = issue(&k, req(Verb::Source, target, &[]), &Capability::root());
+        assert!(
+            matches!(result, Err(ikigai_core::Error::OverBudget { .. })),
+            "{target} must refuse a segment one byte over 16 MiB"
+        );
+    }
+}
+
+#[test]
+fn rotation_records_an_over_budget_predecessor() {
+    let dir = Scratch::new("2294-rotation");
+    let handle = LogHandle::new(None, None, file_config(dir.path(), "info"));
+    handle.open(Vocabulary::shared_builtin(), at(T0)).unwrap();
+    handle.rotate(at(T0 + 1_000)).unwrap();
+    let predecessor = segment_files(dir.path()).remove(0);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(predecessor)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    handle.rotate(at(T0 + 2_000)).unwrap();
+    handle.close(at(T0 + 3_000)).unwrap();
+    let latest = segment_files(dir.path()).pop().unwrap();
+    let text = std::fs::read_to_string(latest).unwrap();
+    assert!(text.contains("log:ChainBroken"), "{text}");
+    assert!(text.contains("over budget"), "{text}");
+}
+
+#[test]
+fn piped_segment_one_byte_over_read_budget_is_refused() {
+    let dir = Scratch::new("2294-piped");
+    let handle = Arc::new(LogHandle::new(None, None, file_config(dir.path(), "info")));
+    let k = kernel(handle);
+    for target in [VERIFY_IRI, ikigai_log::TRANSREPT_IRI] {
+        let request = Request::new(Verb::Source, Iri::parse(target).unwrap())
+            .with_arg("content", ArgRef::Inline(vec![b' '; 16 * 1024 * 1024 + 1]));
+        assert!(matches!(
+            issue(&k, request, &Capability::root()),
+            Err(ikigai_core::Error::OverBudget { .. })
+        ));
+    }
+}
