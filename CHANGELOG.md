@@ -3,6 +3,18 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
+## 0.9.0
+
+### Changed
+
+- Move to `ikigai-core` 0.2.0, the streams release (ledger #2261). Core types
+  appear in the public API, so consumers must upgrade together; the old 0.1
+  requirement excluded 0.2.0 under Cargo's 0.x rules.
+- Update `ikigai-sign` to 0.4.0 and the development dependency `ikigai-sparql`
+  to 0.3.0 so the entire dependency graph shares core 0.2.0.
+- Update `ikigai-conformance` to 0.11.0, running DATATYPES and FAILURES by
+  default. Require every check to run in both live and finished segment walks.
+
 ## 0.8.0
 
 A **breaking** change under 0.x, so a minor bump: anything that matches on an endpoint id, a
