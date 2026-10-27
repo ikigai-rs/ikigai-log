@@ -142,9 +142,12 @@ pub mod chain;
 pub mod config;
 pub mod endpoints;
 pub mod graph;
+mod graph_stream;
 mod line;
 #[cfg(not(target_family = "wasm"))]
 pub mod load;
+#[cfg(not(target_family = "wasm"))]
+mod segment_body;
 pub mod segments;
 pub mod tracer;
 mod vocabulary;

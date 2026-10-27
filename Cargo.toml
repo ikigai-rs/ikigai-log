@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-log"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
@@ -18,11 +18,14 @@ rust-version = "1.89"
 [dependencies]
 # 0.2.0 is the streams release (ledger #2261). The old 0.1 pin meant
 # <0.2.0 under Cargo's 0.x rules, preventing hosts from sharing core's API types.
-ikigai-core = "0.2.0"
+# 0.2.1 supplies the shared content-body and stream-budget helpers used here.
+ikigai-core = "0.2.1"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
 # they carry a vocabulary and a handle — and `Endpoint::invoke` is `async_trait`.
 async-trait = "0.1"
+# Runtime-free stream composition; also builds on wasm32.
+futures-util = "0.3"
 
 # The layered `log.toml`. `deny_unknown_fields` on every layer is what makes a
 # misspelled key loud; pure Rust, so the config half stays wasm-clean.

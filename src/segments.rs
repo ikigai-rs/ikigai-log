@@ -54,6 +54,11 @@
 //! segment is the common case for analysis, it is immutable, and it caches; the
 //! live tail is the one you were going to `grep` anyway.
 //!
+//! The timings above measure the historical buffered graph cache. A file-backed
+//! body caches a replay recipe instead: opening a Turtle replay parses and
+//! serializes again, trading that hot-cache speed for bounded retained memory.
+//! Its raw face seeks directly after the initial validation/hash scan.
+//!
 //! ## Reading: `std::fs`, with the thread declared explicitly
 //!
 //! The module recipe says read through the kernel, and this is the one place
@@ -196,6 +201,43 @@ impl TransreptEndpoint {
 
 #[async_trait]
 impl Endpoint for TransreptEndpoint {
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<ikigai_core::Body>> {
+        if inv.request.verb != Verb::Source {
+            return self.invoke(inv).await.map(Representation::into_body);
+        }
+        if let Some(other) = opt(inv, "as")? {
+            if other != TURTLE_MEDIA_TYPE {
+                return Err(Error::InvalidArgument {
+                    name: "as".into(),
+                    detail: format!("this transreptor produces {TURTLE_MEDIA_TYPE}, not {other:?}"),
+                });
+            }
+        }
+        let source = inv.content_body("content").await?;
+        let memory = inv
+            .memory_budget()
+            .map_or(ikigai_core::DEFAULT_STREAM_MEMORY, |b| b.remaining());
+        let body = crate::graph_stream::body(
+            source,
+            self.vocabulary.clone(),
+            Options::all(),
+            usize::try_from(memory).unwrap_or(usize::MAX),
+        )
+        .await?;
+        // A bounded cache admits a replay only with a known output length.
+        // Measure by draining chunks, never by collecting source or output.
+        let body = if matches!(body, ikigai_core::Body::Replay(_)) {
+            crate::graph_stream::measured(body).await?
+        } else {
+            body
+        };
+        Ok(Representation::from_body(
+            ReprType::new(TURTLE_MEDIA_TYPE).with_param("charset", "utf-8"),
+            body,
+        )
+        .cacheable())
+    }
+
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
@@ -251,11 +293,23 @@ impl Endpoint for TransreptEndpoint {
                  property's rdfs:range; a key no property claims lands as log:{key} with a \
                  plain literal and a log:undeclaredKey flag. Seals are STATED, never \
                  verified. O(segment): every line is parsed on every read. Input above 16 MiB \
-                 is refused with OverBudget; input is never truncated.",
+                 is refused with OverBudget; input is never truncated. The body path reads \
+                 lines incrementally. Replays use a prefix probe; one-shot inputs defer \
+                 triples until the conditional logkey prefix is known, under the run's \
+                 working memory bound. Deferred joins and seals are bounded too.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .transreptor([LOG_MEDIA_TYPE], [TURTLE_MEDIA_TYPE])
+            .incremental()
+            .fails(ikigai_core::FailureClass::OverBudget)
+            .fails(ikigai_core::FailureClass::Permanent)
+            .fails(ikigai_core::FailureClass::Unknown)
+            // A referenced producer's failure is preserved, including mid-stream.
+            .fails(ikigai_core::FailureClass::Denied)
+            .fails(ikigai_core::FailureClass::Transient)
+            .fails(ikigai_core::FailureClass::RetryAfter)
+            .fails(ikigai_core::FailureClass::Refused)
             .input(
                 ArgSpec::new("content")
                     .summary("the segment's bytes")
@@ -301,6 +355,71 @@ impl SegmentEndpoint {
 #[cfg(not(target_family = "wasm"))]
 #[async_trait]
 impl Endpoint for SegmentEndpoint {
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<ikigai_core::Body>> {
+        // Exists and unsupported verbs retain the bytes path's behavior.
+        if inv.request.verb != Verb::Source {
+            return self.invoke(inv).await.map(Representation::into_body);
+        }
+        if !inv.capability.allows(CAP_READ) {
+            return Err(Error::Denied(format!(
+                "reading a log segment requires `{CAP_READ}`"
+            )));
+        }
+        let options = window(inv)?;
+        let requested_tail = tail_requested(inv)?;
+        let face = opt(inv, "as")?.unwrap_or(TURTLE_MEDIA_TYPE);
+        if face != TURTLE_MEDIA_TYPE && face != LOG_MEDIA_TYPE {
+            return self.invoke(inv).await.map(Representation::into_body);
+        }
+        if face == LOG_MEDIA_TYPE && !options.is_all() {
+            return Err(Error::InvalidArgument {
+                name: "since|until|from_seq|to_seq".into(),
+                detail: "a window is only offered on the text/turtle face".into(),
+            });
+        }
+        let tail = inv
+            .bindings
+            .get(SEGMENT_BINDING)
+            .ok_or_else(|| Error::Endpoint("no segment named".into()))?;
+        let iri = inv.request.target.as_str();
+        let directory = self.directory()?;
+        let path = locate(&directory, tail, iri).ok_or_else(|| {
+            Error::NotFound(format!("no segment <{iri}> in {}", directory.display()))
+        })?;
+        let memory = inv
+            .memory_budget()
+            .map_or(ikigai_core::DEFAULT_STREAM_MEMORY, |b| b.remaining());
+        let (body, finished) = crate::segment_body::SegmentBody::prepare(
+            &path,
+            &self.vocabulary,
+            usize::try_from(memory).unwrap_or(usize::MAX),
+        )?;
+        let finished = finished
+            && self
+                .handle
+                .open_segment()
+                .is_none_or(|(open, _)| open != iri);
+        let cacheable = self.tail_cacheable(iri, face, finished, requested_tail)?;
+        let body = if face == TURTLE_MEDIA_TYPE {
+            crate::graph_stream::measured(
+                crate::graph_stream::body(
+                    body.into(),
+                    self.vocabulary.clone(),
+                    options,
+                    usize::try_from(memory).unwrap_or(usize::MAX),
+                )
+                .await?,
+            )
+            .await?
+        } else {
+            body.into()
+        };
+        let repr =
+            Representation::from_body(ReprType::new(face).with_param("charset", "utf-8"), body)
+                .depends_on(format!("urn:file:{}", path.display()));
+        Ok(if cacheable { repr.cacheable() } else { repr })
+    }
+
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if inv.request.verb == Verb::Exists {
             return self.exists(inv);
@@ -353,6 +472,7 @@ impl Endpoint for SegmentEndpoint {
                 })
             }
         };
+        let cacheable = self.tail_cacheable(&iri, face, finished, tail_requested(inv)?)?;
         let repr = if face == TURTLE_MEDIA_TYPE {
             turtle_repr(
                 to_turtle(&text, &self.vocabulary, &options)
@@ -381,7 +501,7 @@ impl Endpoint for SegmentEndpoint {
         // See the module docs. A finished segment is immutable; anything else is
         // live, and a cached live tail is a lie about the one thing a reader
         // came for.
-        Ok(if finished { repr.cacheable() } else { repr })
+        Ok(if cacheable { repr.cacheable() } else { repr })
     }
 
     fn name(&self) -> &str {
@@ -396,7 +516,11 @@ impl Endpoint for SegmentEndpoint {
                  is text/turtle, so `urn:sparql:* graph=urn:log:{name}` loads it as a named \
                  graph named by that IRI — which is the whole of the named-graph story, and \
                  makes cross-segment analysis a matter of listing two graphs. as=\
-                 text/x-ikigai-log serves the segment file itself. A FINISHED segment (its \
+                 text/x-ikigai-log serves the segment file itself, as a seekable file-backed \
+                 replay on the body path, with exact length and content validator. The graph \
+                 body replays from the file too. tail=true opts a raw live snapshot into the \
+                 host's append cuts; it requires this handle's open segment and an installed \
+                 append cutter. A FINISHED segment (its \
                  last entry is log:ProcessStop or log:Rotation, sealed, with nothing after it \
                  — a rotated segment is as immutable as a stopped one, and it is the common \
                  case) is cacheable under a golden thread on its file; a live one is not, and no watcher pretends \
@@ -418,6 +542,10 @@ impl Endpoint for SegmentEndpoint {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("the segment, as a graph or as itself")
+                    .fails(ikigai_core::FailureClass::OverBudget)
+                    .fails(ikigai_core::FailureClass::Permanent)
+                    .fails(ikigai_core::FailureClass::Denied)
+                    .fails(ikigai_core::FailureClass::Unknown)
                     .requires(CAP_READ)
                     .input(segment_binding())
                     .input(
@@ -426,6 +554,13 @@ impl Endpoint for SegmentEndpoint {
                             .class(XSD_STRING)
                             .one_of([TURTLE_MEDIA_TYPE, LOG_MEDIA_TYPE])
                             .default_value(TURTLE_MEDIA_TYPE),
+                    )
+                    .input(
+                        ArgSpec::new("tail")
+                            .summary("cache a live raw snapshot under the host's append cuts; resume with Replay::open_at(last_offset)")
+                            .class("http://www.w3.org/2001/XMLSchema#boolean")
+                            .one_of(["true", "false"])
+                            .default_value("false"),
                     )
                     .input(
                         ArgSpec::new("since")
@@ -478,6 +613,34 @@ fn segment_binding() -> ArgSpec {
 
 #[cfg(not(target_family = "wasm"))]
 impl SegmentEndpoint {
+    fn tail_cacheable(&self, iri: &str, face: &str, finished: bool, tail: bool) -> Result<bool> {
+        if !tail {
+            return Ok(finished);
+        }
+        if face != LOG_MEDIA_TYPE {
+            return Err(Error::InvalidArgument {
+                name: "tail".into(),
+                detail: "tail=true requires as=text/x-ikigai-log".into(),
+            });
+        }
+        if finished {
+            return Ok(true);
+        }
+        if self.handle.has_append_cutter()
+            && self
+                .handle
+                .open_segment()
+                .is_some_and(|(open, _)| open == iri)
+        {
+            return Ok(true);
+        }
+        Err(Error::Unsupported {
+            verb: Some(Verb::Source),
+            detail: "a live tail requires this handle's open segment and a host append cutter"
+                .into(),
+        })
+    }
+
     /// `Exists`: is there a segment here, without paying to read one?
     ///
     /// Answering a chain walk's actual question. `@prev` and `next=` name
@@ -539,6 +702,19 @@ impl SegmentEndpoint {
             return false;
         }
         ends_finally(text, &self.vocabulary)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Whether a raw read opts into the host-connected append tail.
+fn tail_requested(inv: &Invocation<'_>) -> Result<bool> {
+    match opt(inv, "tail")? {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(other) => Err(Error::InvalidArgument {
+            name: "tail".into(),
+            detail: format!("expected true|false, got {other:?}"),
+        }),
     }
 }
 

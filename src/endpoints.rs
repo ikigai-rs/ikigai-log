@@ -146,6 +146,12 @@ fn plain(body: impl Into<Vec<u8>>) -> Representation {
     )
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[path = "append.rs"]
+mod append;
+#[cfg(not(target_family = "wasm"))]
+pub use append::AppendCut;
+
 /// This process's log: its effective configuration, and its segment if one is
 /// open.
 ///
@@ -156,6 +162,10 @@ pub struct LogHandle {
     home: Option<PathBuf>,
     app: Option<String>,
     state: Mutex<State>,
+    #[cfg(not(target_family = "wasm"))]
+    append_cutter: Mutex<Option<append::AppendState>>,
+    #[cfg(not(target_family = "wasm"))]
+    append_cuts_enabled: std::sync::atomic::AtomicBool,
 }
 
 struct State {
@@ -197,6 +207,10 @@ impl LogHandle {
     /// wants the machine's own.
     pub fn new(home: Option<PathBuf>, app: Option<String>, config: LogConfig) -> LogHandle {
         LogHandle {
+            #[cfg(not(target_family = "wasm"))]
+            append_cutter: append::empty(),
+            #[cfg(not(target_family = "wasm"))]
+            append_cuts_enabled: std::sync::atomic::AtomicBool::new(false),
             home,
             app,
             state: Mutex::new(State {
@@ -246,6 +260,8 @@ impl LogHandle {
         vocabulary: Arc<Vocabulary>,
         now: Timestamp,
     ) -> std::result::Result<bool, WriteError> {
+        #[cfg(not(target_family = "wasm"))]
+        let _append = self.append_guard();
         let mut state = self.state.lock().expect("log state");
         if state.writer.is_some() {
             return Ok(true);
@@ -331,6 +347,8 @@ impl LogHandle {
     /// Write `log:ProcessStop` and close the segment. A no-op when nothing is
     /// open.
     pub fn close(&self, now: Timestamp) -> std::result::Result<(), WriteError> {
+        #[cfg(not(target_family = "wasm"))]
+        let _append = self.append_guard();
         let writer = self.state.lock().expect("log state").writer.take();
         let Some(writer) = writer else { return Ok(()) };
         let closed = writer.close(now)?;
@@ -389,6 +407,8 @@ impl LogHandle {
     /// mean discarding the chain rather than continuing it.
     #[cfg(not(target_family = "wasm"))]
     pub fn rotate(&self, now: Timestamp) -> std::result::Result<Option<String>, WriteError> {
+        #[cfg(not(target_family = "wasm"))]
+        let _append = self.append_guard();
         let mut state = self.state.lock().expect("log state");
         let Some(writer) = state.writer.take() else {
             return Ok(None);
@@ -625,6 +645,8 @@ impl LogHandle {
         &self,
         entry: Entry,
     ) -> std::result::Result<Option<(String, u64)>, WriteError> {
+        #[cfg(not(target_family = "wasm"))]
+        let _append = self.append_guard();
         let now = entry.time;
         // Underscored because on wasm there is nothing to rotate INTO — a browser
         // has no segment files — so the whole trigger is `cfg`'d out there and
@@ -667,6 +689,8 @@ impl LogHandle {
     /// entry per write would bury the log in its own complaint.
     #[cfg(not(target_family = "wasm"))]
     fn note_rotation_failure(&self, now: Timestamp, error: &WriteError) {
+        #[cfg(not(target_family = "wasm"))]
+        let _append = self.append_guard();
         let mut state = self.state.lock().expect("log state");
         let first = state.rotation_error.is_none();
         state.rotation_error = Some(error.to_string());
