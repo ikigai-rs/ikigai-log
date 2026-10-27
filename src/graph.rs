@@ -235,7 +235,7 @@ impl Options {
         *self == Options::default()
     }
 
-    fn admits(&self, entry: &Entry, seq: u64) -> bool {
+    pub(crate) fn admits(&self, entry: &Entry, seq: u64) -> bool {
         self.since.is_none_or(|since| entry.time >= since)
             && self.until.is_none_or(|until| entry.time <= until)
             && self.from_seq.is_none_or(|from| seq >= from)
@@ -281,59 +281,91 @@ pub fn to_triples(
         line: 1,
         error,
     })?;
-    let segment = iri(&header.name)?;
-    let instance = iri(&header.instance)?;
-    let level = iri(&header.level)?;
-
-    // ── The header → a log:Segment node ────────────────────────────────────
-    let mut out = vec![
-        triple(&segment, RDF_TYPE, term_iri(LOG_SEGMENT_CLASS)?),
-        triple(&segment, LOG_LEVEL, Term::NamedNode(level)),
-        triple(
-            &segment,
-            PROV_STARTED_AT_TIME,
-            Term::Literal(date_time(header.started)),
-        ),
-        triple(
-            &segment,
-            PROV_WAS_ATTRIBUTED_TO,
-            Term::NamedNode(instance.clone()),
-        ),
-        triple(
-            &segment,
-            LOG_PREV_SEAL,
-            Term::Literal(Literal::new_simple_literal(match &header.prev {
-                // Written as the token it is. `genesis` is stated rather than
-                // left absent so that a missing @prev is unambiguously an error,
-                // and a graph that dropped it would give that distinction away.
-                Prev::Genesis => "genesis".to_string(),
-                Prev::Seal(hash) => hash.clone(),
-            })),
-        ),
-        // Both types, because a consumer of this graph alone has no reasoner and
-        // no copy of the log vocabulary: the subclass axiom lives in
-        // vocabulary.ttl, and nothing loaded that here.
-        triple(&instance, RDF_TYPE, term_iri(LOG_INSTANCE_CLASS)?),
-        triple(&instance, RDF_TYPE, term_iri(PROV_SOFTWARE_AGENT)?),
-    ];
-
-    // ── The entries ────────────────────────────────────────────────────────
     let (rows, seals) = scan(text, offset, &header.prefixes, vocab, options)?;
-
-    // Span → entry IRI, per run and per surviving entry, so `log:invoked` is
-    // materialized only where BOTH ends are in this graph.
-    let mut spans: BTreeMap<(usize, String), NamedNode> = BTreeMap::new();
-    let mut edges: Vec<(usize, String, NamedNode)> = Vec::new();
-
-    // Every principal this segment's entries were written for, so the
-    // per-principal facts (`a prov:Agent`, and the instance's unqualified
-    // delegation to it) land ONCE rather than once per entry.
-    let mut principals: BTreeSet<NamedNode> = BTreeSet::new();
-
+    let mut graph = GraphBuilder::new(header)?;
     for row in &rows {
-        if !options.admits(&row.entry, row.seq) {
-            continue;
+        if options.admits(&row.entry, row.seq) {
+            graph.row(row, vocab)?;
         }
+    }
+    graph.finish(&seals)?;
+    Ok(graph.out)
+}
+
+/// Shared emission state: only cross-entry joins survive a drained row.
+/// The bytes API retains `out`; streamed readers drain it after each row.
+pub(crate) struct GraphBuilder {
+    header: Header,
+    segment: NamedNode,
+    instance: NamedNode,
+    pub(crate) out: Vec<Triple>,
+    spans: BTreeMap<(usize, String), NamedNode>,
+    edges: Vec<(usize, String, NamedNode)>,
+    principals: BTreeSet<NamedNode>,
+    join_bytes: usize,
+}
+
+impl GraphBuilder {
+    pub(crate) fn new(header: Header) -> Result<Self, GraphError> {
+        let segment = iri(&header.name)?;
+        let instance = iri(&header.instance)?;
+        let level = iri(&header.level)?;
+
+        // ── The header → a log:Segment node ────────────────────────────────────
+        let out = vec![
+            triple(&segment, RDF_TYPE, term_iri(LOG_SEGMENT_CLASS)?),
+            triple(&segment, LOG_LEVEL, Term::NamedNode(level)),
+            triple(
+                &segment,
+                PROV_STARTED_AT_TIME,
+                Term::Literal(date_time(header.started)),
+            ),
+            triple(
+                &segment,
+                PROV_WAS_ATTRIBUTED_TO,
+                Term::NamedNode(instance.clone()),
+            ),
+            triple(
+                &segment,
+                LOG_PREV_SEAL,
+                Term::Literal(Literal::new_simple_literal(match &header.prev {
+                    // Written as the token it is. `genesis` is stated rather than
+                    // left absent so that a missing @prev is unambiguously an error,
+                    // and a graph that dropped it would give that distinction away.
+                    Prev::Genesis => "genesis".to_string(),
+                    Prev::Seal(hash) => hash.clone(),
+                })),
+            ),
+            // Both types, because a consumer of this graph alone has no reasoner and
+            // no copy of the log vocabulary: the subclass axiom lives in
+            // vocabulary.ttl, and nothing loaded that here.
+            triple(&instance, RDF_TYPE, term_iri(LOG_INSTANCE_CLASS)?),
+            triple(&instance, RDF_TYPE, term_iri(PROV_SOFTWARE_AGENT)?),
+        ];
+
+        Ok(Self {
+            header,
+            segment,
+            instance,
+            out,
+            spans: BTreeMap::new(),
+            edges: Vec::new(),
+            principals: BTreeSet::new(),
+            join_bytes: 0,
+        })
+    }
+
+    fn row(&mut self, row: &Row, vocab: &Vocabulary) -> Result<(), GraphError> {
+        let Self {
+            header,
+            segment,
+            instance,
+            out,
+            spans,
+            edges,
+            principals,
+            join_bytes,
+        } = self;
         let node = iri(&format!("{}:{}", header.name, row.seq))?;
         // ★ Per entry, never per segment. The line grammar's `is_iri` is looser
         // than RDF's, so a line can parse and still carry a class or subject
@@ -394,7 +426,7 @@ pub fn to_triples(
                 out.push(triple(&node, LOG_SUBJECT, Term::NamedNode(subject.clone())));
                 if let Some(predicate) = vocab.subject_predicate(&row.entry.class) {
                     push_unique(
-                        &mut out,
+                        out,
                         first,
                         triple(&node, predicate, Term::NamedNode(subject)),
                     );
@@ -425,15 +457,19 @@ pub fn to_triples(
             match vocab.key(key) {
                 Some(def) => {
                     push_unique(
-                        &mut out,
+                        out,
                         first,
                         triple(&node, &def.property, value_term(value, &def.range)),
                     );
                     if def.property == LOG_SPAN {
-                        spans.insert((row.run, value.clone()), node.clone());
+                        if let Some(old) = spans.insert((row.run, value.clone()), node.clone()) {
+                            *join_bytes -= value.len() + old.as_str().len() + 128;
+                        }
+                        *join_bytes += value.len() + node.as_str().len() + 128;
                     }
                     if def.property == LOG_PARENT_SPAN {
                         edges.push((row.run, value.clone(), node.clone()));
+                        *join_bytes += value.len() + node.as_str().len() + 128;
                     }
                     if def.property == LOG_ON_BEHALF_OF {
                         // ★ The delegation, in standard terms. `log:onBehalfOf`
@@ -461,7 +497,7 @@ pub fn to_triples(
                                 n => format!("{}:{}:delegation:{n}", header.name, row.seq),
                             })?;
                             out.push(triple(
-                                &instance,
+                                instance,
                                 PROV_QUALIFIED_DELEGATION,
                                 Term::NamedNode(delegation.clone()),
                             ));
@@ -480,7 +516,10 @@ pub fn to_triples(
                                 PROV_HAD_ACTIVITY,
                                 Term::NamedNode(node.clone()),
                             ));
-                            principals.insert(agent);
+                            let bytes = agent.as_str().len() + 128;
+                            if principals.insert(agent) {
+                                *join_bytes += bytes;
+                            }
                         }
                     }
                 }
@@ -493,7 +532,7 @@ pub fn to_triples(
                     // (`resolved=`, `segment=`) would otherwise be read AS that
                     // property and inherit its domain and range (ledger #1114).
                     push_unique(
-                        &mut out,
+                        out,
                         first,
                         triple(
                             &node,
@@ -511,106 +550,150 @@ pub fn to_triples(
                 }
             }
         }
+        Ok(())
     }
 
-    // ── The principals, once each ──────────────────────────────────────────
-    //
-    // `prov:actedOnBehalfOf` is PROV's own unqualified projection of the
-    // qualified delegations above — true, useful on its own ("which principals
-    // did this instance serve?"), and emitted once per principal rather than
-    // once per entry because that is all it can honestly say: without the
-    // activity it is a fact about the segment, not about a line.
-    for agent in principals {
-        out.push(triple(&agent, RDF_TYPE, term_iri(PROV_AGENT_CLASS)?));
-        out.push(triple(
-            &instance,
-            PROV_ACTED_ON_BEHALF_OF,
-            Term::NamedNode(agent),
-        ));
+    /// Conservative payload accounting for deferred joins and emitted triples.
+    /// Stream readers refuse when this state no longer fits their working bound.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let header = self.header.name.len()
+            + self.header.instance.len()
+            + self.header.level.len()
+            + match &self.header.prev {
+                Prev::Genesis => 0,
+                Prev::Seal(hash) => hash.len(),
+            }
+            + self
+                .header
+                .prefixes
+                .iter()
+                .map(|(prefix, iri)| prefix.len() + iri.len() + 128)
+                .sum::<usize>();
+        // Include the input reader's copy of the header and allocation slack.
+        4 * header + 8 * self.join_bytes + triples_bytes(&self.out)
     }
 
-    // ── log:invoked: parent → child, within one run ────────────────────────
-    //
-    // Emitted after the entries so that the whole run's spans are known however
-    // the lines were ordered — a parent's line is written when it COMPLETES, so
-    // its children's lines usually precede it. Where it does not resolve — the
-    // parent is in another segment, another run, or outside the window — the
-    // `log:parentSpan` literal stays and no edge is invented.
-    for (run, parent_span, child) in edges {
-        if let Some(parent) = spans.get(&(run, parent_span)) {
-            if parent != &child {
-                out.push(triple(parent, LOG_INVOKED, Term::NamedNode(child)));
+    pub(crate) fn entry(
+        &mut self,
+        seq: u64,
+        entry: Entry,
+        run: usize,
+        vocab: &Vocabulary,
+    ) -> Result<(), GraphError> {
+        self.row(&Row { seq, entry, run }, vocab)
+    }
+
+    pub(crate) fn finish(&mut self, seals: &[Seal]) -> Result<(), GraphError> {
+        let Self {
+            header,
+            segment,
+            instance,
+            out,
+            spans,
+            edges,
+            principals,
+            ..
+        } = self;
+
+        // ── The principals, once each ──────────────────────────────────────────
+        //
+        // `prov:actedOnBehalfOf` is PROV's own unqualified projection of the
+        // qualified delegations above — true, useful on its own ("which principals
+        // did this instance serve?"), and emitted once per principal rather than
+        // once per entry because that is all it can honestly say: without the
+        // activity it is a fact about the segment, not about a line.
+        for agent in std::mem::take(principals) {
+            out.push(triple(&agent, RDF_TYPE, term_iri(PROV_AGENT_CLASS)?));
+            out.push(triple(
+                instance,
+                PROV_ACTED_ON_BEHALF_OF,
+                Term::NamedNode(agent),
+            ));
+        }
+
+        // ── log:invoked: parent → child, within one run ────────────────────────
+        //
+        // Emitted after the entries so that the whole run's spans are known however
+        // the lines were ordered — a parent's line is written when it COMPLETES, so
+        // its children's lines usually precede it. Where it does not resolve — the
+        // parent is in another segment, another run, or outside the window — the
+        // `log:parentSpan` literal stays and no edge is invented.
+        for (run, parent_span, child) in std::mem::take(edges) {
+            if let Some(parent) = spans.get(&(run, parent_span)) {
+                if parent != &child {
+                    out.push(triple(parent, LOG_INVOKED, Term::NamedNode(child)));
+                }
             }
         }
-    }
 
-    // ── Seals: STATED, never verified ──────────────────────────────────────
-    for seal in seals {
-        let node = iri(&format!(
-            "{}:seal:{}-{}",
-            header.name, seal.first, seal.last
-        ))?;
-        out.push(triple(&node, RDF_TYPE, term_iri(LOG_SEAL_CLASS)?));
-        out.push(triple(&node, LOG_SEGMENT, Term::NamedNode(segment.clone())));
-        out.push(triple(
-            &node,
-            LOG_FIRST_SEQUENCE,
-            Term::Literal(Literal::new_typed_literal(
-                seal.first.to_string(),
-                integer()?,
-            )),
-        ));
-        out.push(triple(
-            &node,
-            LOG_LAST_SEQUENCE,
-            Term::Literal(Literal::new_typed_literal(
-                seal.last.to_string(),
-                integer()?,
-            )),
-        ));
-        // The digest exactly as the line wrote it — tagged (`sha256:…`), which
-        // is this system's boundary convention and the SAME lexical form
-        // `ikigai-sign` writes on `sig:contentHash` since 0.2.0. Sharing a
-        // predicate while writing two spellings of one value would mean the two
-        // producers never join in a query, which is a silent failure and not a
-        // loud one; that is why the tag exists at both ends.
-        out.push(triple(
-            &node,
-            SIG_CONTENT_HASH,
-            Term::Literal(Literal::new_simple_literal(&seal.hash)),
-        ));
-        if let Some(token) = &seal.signature {
-            // SPLIT, not restated whole: the `#seal` line packs
-            // `{algorithm}:{base64}` into one column because a line has columns
-            // and a graph does not, and a graph that kept the packing would make
-            // `sig:value` mean something different here than in a signature-graph
-            // — which is exactly the join this vocabulary reuse exists to buy.
-            match crate::chain::split_signature(token) {
-                Some((algorithm, value)) => {
-                    out.push(triple(
-                        &node,
-                        SIG_ALGORITHM,
-                        Term::Literal(Literal::new_simple_literal(algorithm)),
-                    ));
-                    out.push(triple(
+        // ── Seals: STATED, never verified ──────────────────────────────────────
+        for seal in seals {
+            let node = iri(&format!(
+                "{}:seal:{}-{}",
+                header.name, seal.first, seal.last
+            ))?;
+            out.push(triple(&node, RDF_TYPE, term_iri(LOG_SEAL_CLASS)?));
+            out.push(triple(&node, LOG_SEGMENT, Term::NamedNode(segment.clone())));
+            out.push(triple(
+                &node,
+                LOG_FIRST_SEQUENCE,
+                Term::Literal(Literal::new_typed_literal(
+                    seal.first.to_string(),
+                    integer()?,
+                )),
+            ));
+            out.push(triple(
+                &node,
+                LOG_LAST_SEQUENCE,
+                Term::Literal(Literal::new_typed_literal(
+                    seal.last.to_string(),
+                    integer()?,
+                )),
+            ));
+            // The digest exactly as the line wrote it — tagged (`sha256:…`), which
+            // is this system's boundary convention and the SAME lexical form
+            // `ikigai-sign` writes on `sig:contentHash` since 0.2.0. Sharing a
+            // predicate while writing two spellings of one value would mean the two
+            // producers never join in a query, which is a silent failure and not a
+            // loud one; that is why the tag exists at both ends.
+            out.push(triple(
+                &node,
+                SIG_CONTENT_HASH,
+                Term::Literal(Literal::new_simple_literal(&seal.hash)),
+            ));
+            if let Some(token) = &seal.signature {
+                // SPLIT, not restated whole: the `#seal` line packs
+                // `{algorithm}:{base64}` into one column because a line has columns
+                // and a graph does not, and a graph that kept the packing would make
+                // `sig:value` mean something different here than in a signature-graph
+                // — which is exactly the join this vocabulary reuse exists to buy.
+                match crate::chain::split_signature(token) {
+                    Some((algorithm, value)) => {
+                        out.push(triple(
+                            &node,
+                            SIG_ALGORITHM,
+                            Term::Literal(Literal::new_simple_literal(algorithm)),
+                        ));
+                        out.push(triple(
+                            &node,
+                            SIG_VALUE,
+                            Term::Literal(Literal::new_simple_literal(value)),
+                        ));
+                    }
+                    // An untagged token names no algorithm, and inventing one would
+                    // make the tag decorative. Stated as written, losslessly, which
+                    // is the same posture an undeclared key gets.
+                    None => out.push(triple(
                         &node,
                         SIG_VALUE,
-                        Term::Literal(Literal::new_simple_literal(value)),
-                    ));
+                        Term::Literal(Literal::new_simple_literal(token)),
+                    )),
                 }
-                // An untagged token names no algorithm, and inventing one would
-                // make the tag decorative. Stated as written, losslessly, which
-                // is the same posture an undeclared key gets.
-                None => out.push(triple(
-                    &node,
-                    SIG_VALUE,
-                    Term::Literal(Literal::new_simple_literal(token)),
-                )),
             }
         }
-    }
 
-    Ok(out)
+        Ok(())
+    }
 }
 
 /// Walk the entry region, numbering entries and splitting them into process
@@ -707,7 +790,7 @@ fn push_unique(out: &mut Vec<Triple>, first: usize, candidate: Triple) {
 /// Only entry lines are judged: a `#seal`, a comment or a blank does not start
 /// with a digit, and a line too short to carry a timestamp is left for the
 /// parser to report properly.
-fn outside_window(raw: &str, options: &Options) -> bool {
+pub(crate) fn outside_window(raw: &str, options: &Options) -> bool {
     if options.since.is_none() && options.until.is_none() {
         return false;
     }
@@ -800,7 +883,24 @@ pub(crate) fn serialize(triples: &[Triple]) -> Result<String, GraphError> {
     let undeclared = triples
         .iter()
         .any(|t| t.predicate.as_str().starts_with(LOG_KEY_NS));
-    let mut serializer = RdfSerializer::from_format(RdfFormat::Turtle)
+    let mut serializer = serializer(Vec::new(), undeclared)?;
+    for triple in triples {
+        serializer
+            .serialize_triple(triple)
+            .map_err(|e| GraphError::Serialize(e.to_string()))?;
+    }
+    let bytes = serializer
+        .finish()
+        .map_err(|e| GraphError::Serialize(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|e| GraphError::Serialize(e.to_string()))
+}
+
+/// The same prefix policy and serializer for buffered and streamed emission.
+pub(crate) fn serializer<W: std::io::Write>(
+    writer: W,
+    undeclared: bool,
+) -> Result<oxrdfio::WriterQuadSerializer<W>, GraphError> {
+    Ok(RdfSerializer::from_format(RdfFormat::Turtle)
         .with_prefix("log", LOG_NS)
         .and_then(|s| s.with_prefix("prov", PROV_NS))
         .and_then(|s| s.with_prefix("sig", SIG_NS))
@@ -813,14 +913,12 @@ pub(crate) fn serialize(triples: &[Triple]) -> Result<String, GraphError> {
             }
         })
         .map_err(|e| GraphError::Serialize(e.to_string()))?
-        .for_writer(Vec::new());
-    for triple in triples {
-        serializer
-            .serialize_triple(triple)
-            .map_err(|e| GraphError::Serialize(e.to_string()))?;
-    }
-    let bytes = serializer
-        .finish()
-        .map_err(|e| GraphError::Serialize(e.to_string()))?;
-    String::from_utf8(bytes).map_err(|e| GraphError::Serialize(e.to_string()))
+        .for_writer(writer))
+}
+
+pub(crate) fn triples_bytes(triples: &[Triple]) -> usize {
+    triples
+        .iter()
+        .map(|triple| 2 * (triple.to_string().len() + std::mem::size_of::<Triple>()))
+        .sum()
 }

@@ -45,7 +45,7 @@
 <https://ikigai-rs.dev/ns/log> a owl:Ontology ;
     rdfs:label "ikigai-log vocabulary" ;
     rdfs:comment "The log's own terms: entry classes under log:Entry (a prov:Activity), the level ladder, and the key bindings that make the line format's key= columns into RDF. Also the transreptor's term table and the level dial's threshold table, embedded in the ikigai-log crate." ;
-    owl:versionInfo "0.9.0" .
+    owl:versionInfo "0.9.1" .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The spine

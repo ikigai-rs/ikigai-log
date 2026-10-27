@@ -398,6 +398,67 @@ rotation settings or limit the pure parsing/verification functions over strings
 already held by their caller.
 
 
+### File-backed bodies and a live tail
+
+`Kernel::issue_body` reads a raw segment (`as=text/x-ikigai-log`) as a seekable
+`Body::Replay`, with its exact byte length and a core `ContentId` validator. It
+holds a file version, not the text. Each reader checks that version on open,
+after each chunk and at EOF; a changed or removed file fails with `Conflict`.
+Obtain a fresh replay after a change. Raw reads still validate UTF-8 and hash the
+file once before returning, so seeking avoids transferring the prefix but does
+not eliminate that initial scan.
+
+The default Turtle face also replays from the file, using the same triple emitter
+and Oxigraph serializer as the bytes API. Its length and validator are measured
+without collecting its output; it supports sequential replay. Finished segment
+bodies cache without keeping the source text or Turtle in memory. The cache
+holds the replay recipe: opening a cached Turtle body parses and serializes again.
+The historical buffered-graph hot-cache measurements in this README do not apply
+to collecting that replay. This trades graph recomputation for bounded memory;
+raw range readers only read their requested suffix after the initial scan. Live
+segment reads remain uncacheable by default.
+
+The transreptor's body path accepts inline, reference and content-id arguments
+through `Invocation::content_body` and declares `incremental`, so a kernel plan
+passes streamed input directly to it. Line framing uses standard UTF-8 validation
+and the existing log parsers. Input and output can both exceed the working memory
+budget when records and deferred joins fit. Span joins, principals and seals have
+bounded retained state; exceeding that state or a record's working bound ends
+the stream with `OverBudget`, never a clean partial answer.
+
+To preserve the **exact existing Turtle bytes**, including the conditional
+`logkey:` prefix, a replay gets a prefix probe before emission. A one-shot input
+instead defers triples until the first `logkey:` property or EOF. That deferred
+prefix buffer is bounded too: a one-shot segment containing only declared keys
+can exhaust it even though the same input fits as a replay. Supply a file-backed
+replay, or spill through the host's facility before transreption, for large inputs
+of that shape. No path collects the source text. Collecting a body remains subject
+to core's separate run byte budget.
+
+A host can opt into append cuts for its **own** open segment:
+
+```rust,ignore
+let weak = Arc::downgrade(&kernel);
+handle.set_append_cutter(Some(Arc::new(move |thread| {
+    if let Some(kernel) = weak.upgrade() {
+        kernel.cut(thread);
+    }
+})));
+```
+
+Read that segment with `as=text/x-ikigai-log tail=true`. This raw snapshot is
+cacheable under its `urn:file:{absolute path}` thread. Register a kernel cut
+listener with that thread and the same read authority; after a cut, fetch a new
+body and consume `replay.open_at(last_offset)`. Advance the offset only after a
+successful range read. A rotation's final bytes name the successor with `next=`;
+follow that segment with offset zero. Close and rotation cut the old tail, and
+removing or replacing the hook cuts its former threads. Callbacks run outside the
+log lock; filtered writes produce no cut. A live `tail=true` read without a hook,
+or for another process's open segment, is refused. Files changed by other
+processes still require a host file watcher. The ordinary live read policy is
+unchanged, and `urn:log:verify` continues to collect under its existing bounds.
+
+
 ### What `urn:log:verify` proves, and what it cannot
 
 Said plainly, because a verifier that implies more than it checks is worse than
