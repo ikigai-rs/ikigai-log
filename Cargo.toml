@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-log"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
@@ -16,24 +16,9 @@ categories = ["development-tools::debugging", "web-programming"]
 rust-version = "1.89"
 
 [dependencies]
-# The published kernel, consumed from crates.io — the SAME version the hosts
-# use, so a host links exactly one `ikigai-core`. 0.1.108 is the true minimum:
-# bounded segment reads refuse oversized input with `Error::OverBudget`, added
-# there. The attribution seam below requires 0.1.93:
-# the principal a tracer attributes an entry to is read from the capability the
-# request ran under (`Capability::principal`, `PRINCIPAL_SCOPE_PREFIX`), and this
-# crate's `MAX_PRINCIPAL_LEN` IS core's constant (ledger #1077) — all three
-# arrived in 0.1.93 and nowhere earlier. Before that: `DENIED_NOTE` (0.1.62,
-# what makes a pre-dispatch refusal reach an observer at all), the
-# `config::{config_home, layered_paths_in, data_home_in}` path algebra the
-# layered `log.toml` reads (0.1.56), and older still `Tracer`, `TraceEvent`,
-# `Kernel::set_tracer`, ActionSpec, ArgSpec `class`/`one_of`/`default_value`,
-# `Error::Denied`, `Invocation::now`, and `Kernel::issue_traced`/`TraceScope`
-# (0.1.48, the per-call tracer seam the per-tenant `LogTracer` is handed to).
-#
-# ⚠ Read the caret as a RANGE: `"0.1.108"` is `>=0.1.108, <0.2.0`. Core is still
-# on the 0.1 line, so the ceiling binds nothing today; it will on core 0.2.
-ikigai-core = "0.1.108"
+# 0.2.0 is the streams release (ledger #2261). The old 0.1 pin meant
+# <0.2.0 under Cargo's 0.x rules, preventing hosts from sharing core's API types.
+ikigai-core = "0.2.0"
 
 # The read endpoints are `Endpoint` impls rather than `FnEndpoint` closures —
 # they carry a vocabulary and a handle — and `Endpoint::invoke` is `async_trait`.
@@ -63,15 +48,8 @@ oxrdfio = "0.2"
 # `.cargo/config.toml` (checked), but a `sig:`-tag crate, or features on
 # ikigai-sign, would be the honest shape of this dependency.
 #
-# ⚠ A RANGE, not a caret, because a 0.x caret is a ceiling: the old `"0.2"` was
-# `<0.3.0` and held every consumer of this crate at sign 0.2.x once 0.3.0 shipped
-# (ledger #1123). 0.3.0 changed nothing this crate uses — it added `SPACE_ID` and
-# a self-named `space()`, and raised its own core floor to 0.1.89, which the core
-# pin above already exceeds; `HASH_ALG_SHA256` is `"sha256"` from 0.2.0 through
-# 0.3.0. So the floor stays 0.2.0 and the range admits both lines, which lets a
-# consumer on either one link a SINGLE ikigai-sign. The ceiling `<0.4` is
-# deliberate: 0.4 is unread, so widen it by reading it, not by default.
-ikigai-sign = ">=0.2.0, <0.4"
+# 0.4.0 is the published sign release on core 0.2.0.
+ikigai-sign = "0.4.0"
 
 # SHA-256 for the hash chain (RustCrypto, pure Rust, wasm-clean) — the same
 # implementation ikigai-sign digests with, which is not a coincidence worth
@@ -98,21 +76,11 @@ futures = "0.3" # block_on, for the endpoint tests
 # hand-rolled stand-in would prove nothing. Dev-only: a host mounts whichever
 # SPARQL space it wants, and this crate depends on none of them at runtime.
 #
-# ⚠ `"0.2.1"` is `>=0.2.1, <0.3.0`; the old `"0.1.6"` was `<0.2.0` and tested
-# against a SPARQL line the hosts had left (ledger #1123). `space()` is unchanged,
-# and 0.2.1 is the floor because it sizes the SPARQL thread for the build, so the
-# debug build this test runs in agrees with release. Never reaches a consumer.
-ikigai-sparql = "0.2.1"
+# 0.3.0 is the published SPARQL release on core 0.2.0.
+ikigai-sparql = "0.3.0"
 
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
 # crate binds, every action each declares, every checkable rule at once.
 #
-# ⚠ Under Cargo's 0.x rules this pin is a CEILING as well as a floor: `"0.10.0"`
-# means `>=0.10.0, <0.11.0`. The earlier `"0.2.0"`, `"0.6.0"` and `"0.8.0"` pins each
-# froze this crate out of later checks while the suite kept reporting green against
-# the old definition of "done". 0.9.0 added core 0.1.105's contract-shape checks
-# (REQUIRED probes input groups, OUTPUTS honors output_from, PIPELINE's named-only
-# line, VALIDATE refuses a default on a binding) and RECOMPUTE; 0.10.0 adds FAILURES,
-# OFF unless a suite opts in (`check_failures()`), so one skipped line is expected.
-# It floors ikigai-core at 0.1.108, which the library caret above admits.
-ikigai-conformance = "0.10.0"
+# 0.11.0 runs DATATYPES and FAILURES by default against core 0.2.0.
+ikigai-conformance = "0.11.0"
