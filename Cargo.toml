@@ -85,5 +85,5 @@ ikigai-sparql = "0.3.0"
 # The module recipe as one test (`tests/conformance.rs`): every endpoint this
 # crate binds, every action each declares, every checkable rule at once.
 #
-# 0.11.0 runs DATATYPES and FAILURES by default against core 0.2.0.
-ikigai-conformance = "0.11.0"
+# 0.12.0 adds BODIES and BODY-INPUTS to the default checks, on core 0.2.4.
+ikigai-conformance = "0.12.0"

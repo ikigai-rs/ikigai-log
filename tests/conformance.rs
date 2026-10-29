@@ -117,7 +117,27 @@
 //! renamed in the ecosystem's naming wave (ledger #11); they are live MCP tool
 //! names, so the rename is a breaking change for anyone matching on them. Every
 //! check runs, including DATATYPES and FAILURES (on by default since conformance
-//! 0.11.0), with no opt-outs.
+//! 0.11.0) and BODIES and BODY-INPUTS (since 0.12.0), with no opt-outs.
+//!
+//! ## BODIES probes the deterministic Sources, and BODY-INPUTS has nothing to probe
+//!
+//! `BODIES` compares an endpoint's `invoke` with its collected `invoke_body`, which
+//! no kernel call can do (both dispatch `invoke_body`), so the suite is handed the
+//! module space through `Suite::body_space` — the same `Arc` the kernel was built
+//! from. Without it every Source is `unprobed: … the module space is unavailable`.
+//! With it, `log-transrept` is compared in both walks and `log-segment` in the
+//! finished one, and each is refused `OverBudget` one byte short. What stays
+//! unprobed is exactly the volatile answers, for the suite's own reason (independent
+//! calls of an uncacheable answer cannot establish agreement): `log-config`,
+//! `log-segments` and `log-verify` always, and `log-segment` while it is live.
+//! [`assert_unprobed`] pins that set, so the wiring cannot silently fall off.
+//!
+//! `BODY-INPUTS` probes only arguments declared `ArgSpec::reads_body`, and none
+//! is: the transreptor's `content` is read as a body because its description is
+//! an INCREMENTAL transreption, which core routes as a body reader without the
+//! declaration (`tests/stream_bodies.rs` covers its inline, reference and
+//! content-id doors). So no content store is handed to the suite: it would be
+//! scope nothing uses.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -363,6 +383,7 @@ fn suite(log: &Log) -> Suite {
         .cacheable(TRANSREPT)
         .host_named_space(SPACE_LABEL, log.space.clone())
         .host_named_space(WITH_VOCABULARY_LABEL, log.with_vocabulary.clone())
+        .body_space(log.space.clone())
 }
 
 /// The walk saw the six endpoints and their eight actions (config and the
@@ -392,6 +413,30 @@ fn assert_shape(report: &Report) {
     }
 }
 
+/// The `BODIES` probes the walk could not make, and nothing else unprobed: each
+/// of `ids` is a Source whose answer is volatile, unprobed for that reason.
+fn assert_unprobed(report: &Report, ids: &[&str]) {
+    let mut unprobed: Vec<(&str, Verb, Check)> = report
+        .unprobed
+        .iter()
+        .map(|u| (u.endpoint.as_str(), u.verb, u.check))
+        .collect();
+    unprobed.sort();
+    let mut expected: Vec<(&str, Verb, Check)> = ids
+        .iter()
+        .map(|id| (*id, Verb::Source, Check::Bodies))
+        .collect();
+    expected.sort();
+    assert_eq!(unprobed, expected, "{report}");
+    for u in report.unprobed.iter() {
+        assert!(
+            u.reason.contains("uncacheable"),
+            "{} is unprobed only because its answer is volatile: {report}",
+            u.endpoint
+        );
+    }
+}
+
 #[test]
 fn conforms() {
     let log = Log::new(false);
@@ -400,6 +445,7 @@ fn conforms() {
     eprintln!("[live segment]\n{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
+    assert_unprobed(&report, &[CONFIG, SEGMENTS, VERIFY, SEGMENT]);
 
     // The live tail is never served from the cache — the walk resolved it under
     // root more than once, and nothing stuck.
@@ -462,6 +508,7 @@ fn a_finished_segment_conforms_and_caches_under_its_file() {
     eprintln!("[finished segment]\n{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
+    assert_unprobed(&report, &[CONFIG, SEGMENTS, VERIFY]);
     assert_eq!(
         log.text(),
         before,
