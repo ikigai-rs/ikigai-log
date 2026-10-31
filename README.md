@@ -937,6 +937,12 @@ not open one. The module cannot tell whether it is inside a daemon or a one-shot
 nothing into the journal beside the servers. The knob lives here; the policy
 lives in the host.
 
+## Accessibility
+
+People read this crate's output with `grep`, `tail` and a pager as often as through the kernel:
+the log lines, the verify report and the errors. [ACCESSIBILITY.md](ACCESSIBILITY.md) says what
+that text is, the rules it follows, what is not tested, and how to report a barrier.
+
 ## License
 
 Dual-licensed, at your option:
