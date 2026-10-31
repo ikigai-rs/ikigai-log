@@ -77,6 +77,8 @@ Found by reading the source on 2026-10-31:
   `BROKEN` or `noted` word survives.
 - **Terse columns.** A line is CURIEs and `key=value` pairs (`dur=12` carries no unit on the
   line); what a key means is in `src/vocabulary.ttl`, not in the file a person is reading.
+- **A parenthesized plural** ends the verify report (`verified 1 segment(s), 0 broken`), which a
+  screen reader reads with the parentheses.
 - Times are always UTC; a reader converts to local time themselves.
 - Every message is English only.
 
