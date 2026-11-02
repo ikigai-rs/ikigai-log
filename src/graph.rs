@@ -95,7 +95,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use oxrdf::{Literal, NamedNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
-use crate::line::{Entry, Header, Line, ParseError, Prev, Seal, Timestamp, TIMESTAMP_WIDTH};
+use crate::line::{shown, Entry, Header, Line, ParseError, Prev, Seal, Timestamp, TIMESTAMP_WIDTH};
 use crate::vocabulary::{Vocabulary, LOG_KEY_NS, LOG_NS, PROCESS_START_CLASS, PROV_NS};
 
 /// The media type of a segment, and the `from` side of the transreption.
@@ -192,7 +192,7 @@ impl std::fmt::Display for GraphError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GraphError::Parse { line, error } => write!(f, "line {line}: {error}"),
-            GraphError::Iri(token) => write!(f, "not an RDF IRI: {token}"),
+            GraphError::Iri(token) => write!(f, "not an RDF IRI: {}", shown(token)),
             GraphError::Serialize(message) => write!(f, "serializing the graph: {message}"),
         }
     }

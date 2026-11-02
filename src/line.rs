@@ -76,17 +76,20 @@ pub enum ParseError {
     Version(String),
 }
 
+/// The offending text is shown escaped, as a line escapes it (plus the
+/// bidirectional format characters), so an error stays one printable line
+/// whatever the input held.
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ParseError::Timestamp(s) => write!(f, "bad timestamp: {s}"),
+            ParseError::Timestamp(s) => write!(f, "bad timestamp: {}", shown(s)),
             ParseError::MissingColumn(c) => write!(f, "missing {c} column"),
-            ParseError::Field(s) => write!(f, "bad key=value column: {s}"),
-            ParseError::UnboundPrefix(s) => write!(f, "unbound prefix in CURIE: {s}"),
-            ParseError::NotAnIri(s) => write!(f, "not an absolute IRI: {s}"),
-            ParseError::Header(s) => write!(f, "bad header: {s}"),
-            ParseError::Seal(s) => write!(f, "bad seal line: {s}"),
-            ParseError::Version(s) => write!(f, "bad version line: {s}"),
+            ParseError::Field(s) => write!(f, "bad key=value column: {}", shown(s)),
+            ParseError::UnboundPrefix(s) => write!(f, "unbound prefix in CURIE: {}", shown(s)),
+            ParseError::NotAnIri(s) => write!(f, "not an absolute IRI: {}", shown(s)),
+            ParseError::Header(s) => write!(f, "bad header: {}", shown(s)),
+            ParseError::Seal(s) => write!(f, "bad seal line: {}", shown(s)),
+            ParseError::Version(s) => write!(f, "bad version line: {}", shown(s)),
         }
     }
 }
@@ -105,16 +108,63 @@ pub enum RenderError {
     Key(String),
 }
 
+/// The offending text is shown escaped, as for [`ParseError`].
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RenderError::NotAnIri(s) => write!(f, "not an absolute IRI: {s}"),
-            RenderError::Key(s) => write!(f, "not a usable key: {s}"),
+            RenderError::NotAnIri(s) => write!(f, "not an absolute IRI: {}", shown(s)),
+            RenderError::Key(s) => write!(f, "not a usable key: {}", shown(s)),
         }
     }
 }
 
 impl std::error::Error for RenderError {}
+
+/// Offending text, made fit to show inside an error sentence: what [`shown`]
+/// returns.
+pub(crate) struct Shown<'a>(&'a str);
+
+/// `text` as an error message shows it: every character a written line never
+/// carries raw ([`needs_escape`]) is written as the line writes it (`\n`,
+/// `\r`, `\t`, or `\u{hex}`), and so is every bidirectional format character
+/// (U+202A–U+202E, U+2066–U+2069), which would reorder the rest of the
+/// sentence on screen. Everything else is shown as it is, a backslash included,
+/// so the text an error quotes from a segment reads as the segment does; the
+/// cost is that a literal `\u{1b}` and an escaped U+001B look alike here.
+/// An error is then one printable line, whatever the input held.
+///
+/// ```
+/// use ikigai_log::{Entry, Timestamp};
+///
+/// let entry = Entry::new(Timestamp::from_millis(0), "urn:c", "urn:s\u{1b}[2J\u{202e}x");
+/// let error = entry.render(&Default::default()).unwrap_err();
+/// assert_eq!(
+///     error.to_string(),
+///     "not an absolute IRI: urn:s\\u{1b}[2J\\u{202e}x"
+/// );
+/// ```
+pub(crate) fn shown(text: &str) -> Shown<'_> {
+    Shown(text)
+}
+
+impl fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for c in self.0.chars() {
+            if is_bidi_format(c) {
+                write!(f, "{}", c.escape_unicode())?;
+            } else if !write_escape(f, c)? {
+                fmt::Write::write_char(f, c)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The bidirectional embedding, override and isolate characters. Error text
+/// escapes them; a written line does not, yet.
+fn is_bidi_format(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
 
 // =====================================================================================
 // Time
@@ -292,15 +342,31 @@ fn quote(v: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if needs_escape(c) => out.extend(c.escape_unicode()),
-            c => out.push(c),
+            // Writing to a `String` cannot fail.
+            c => {
+                if !write_escape(&mut out, c).unwrap_or(false) {
+                    out.push(c);
+                }
+            }
         }
     }
     out.push('"');
     out
+}
+
+/// Write the escape a line uses for `c`, when [`needs_escape`] says it has one:
+/// `\n`, `\r` and `\t`, and `\u{hex}` (std's [`char::escape_unicode`] form)
+/// for every other. `Ok(false)`, writing nothing, when `c` is written as
+/// itself. The one escaper for both a line ([`quote`]) and an error ([`shown`]).
+fn write_escape(out: &mut impl fmt::Write, c: char) -> Result<bool, fmt::Error> {
+    match c {
+        '\n' => out.write_str("\\n")?,
+        '\r' => out.write_str("\\r")?,
+        '\t' => out.write_str("\\t")?,
+        c if needs_escape(c) => write!(out, "{}", c.escape_unicode())?,
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// Read the rest of a `\u{hex}` escape, the `\u` already consumed: one to six

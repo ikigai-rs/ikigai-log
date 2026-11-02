@@ -217,7 +217,7 @@ use ikigai_core::{
 };
 
 use crate::endpoints::LogHandle;
-use crate::line::{Entry, Timestamp};
+use crate::line::{shown, Entry, Timestamp};
 use crate::vocabulary::{
     CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS, DEPTH_EXCEEDED_CLASS, DROPPED_CLASS,
     ENDPOINT_DENIED_CLASS, NOT_RESOLVED_CLASS, PRINCIPAL_KEY, RESOLUTION_CLASS,
@@ -326,11 +326,13 @@ impl std::fmt::Display for PrincipalError {
                 f,
                 "a principal may be at most {MAX_PRINCIPAL_LEN} bytes and this one is {length}"
             ),
-            PrincipalError::NotAColumn { offered, detail } => {
-                write!(f, "{offered} cannot be written as a principal: {detail}")
-            }
+            PrincipalError::NotAColumn { offered, detail } => write!(
+                f,
+                "{} cannot be written as a principal: {detail}",
+                shown(offered)
+            ),
             PrincipalError::NotAnRdfIri { offered } => {
-                write!(f, "{offered} is not an IRI RDF will accept")
+                write!(f, "{} is not an IRI RDF will accept", shown(offered))
             }
         }
     }
