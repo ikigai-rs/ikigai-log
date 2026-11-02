@@ -160,6 +160,11 @@ impl fmt::Display for Shown<'_> {
     }
 }
 
+/// A path as error text shows it: [`shown`] over its display form.
+pub(crate) fn shown_path(path: &std::path::Path) -> String {
+    shown(&path.display().to_string()).to_string()
+}
+
 /// The bidirectional embedding, override and isolate characters. Error text
 /// escapes them; a written line does not, yet.
 fn is_bidi_format(c: char) -> bool {

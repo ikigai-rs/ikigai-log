@@ -551,7 +551,7 @@ impl Finding {
 impl fmt::Display for Finding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Finding::Malformed { line, detail } => write!(f, "line {line}: {detail}"),
+            Finding::Malformed { line, detail } => write!(f, "line {line}: {}", shown(detail)),
             Finding::SealMismatch {
                 first,
                 last,
@@ -559,8 +559,10 @@ impl fmt::Display for Finding {
                 recomputed,
             } => write!(
                 f,
-                "seal {first}-{last} states {stated} but the entries hash to {recomputed} — \
-                 the alteration is between sequence {first} and {last}"
+                "seal {first}-{last} states {} but the entries hash to {} — the alteration is \
+                 between sequence {first} and {last}",
+                shown(stated),
+                shown(recomputed)
             ),
             Finding::SealRangeMismatch {
                 first,
@@ -592,17 +594,22 @@ impl fmt::Display for Finding {
                 expected,
             } => write!(
                 f,
-                "@prev is {stated} but <{predecessor}> ends at {expected}: this segment does not \
-                 follow the one before it"
+                "@prev is {} but <{}> ends at {}: this segment does not follow the one before it",
+                shown(stated),
+                shown(predecessor),
+                shown(expected)
             ),
             Finding::UnexpectedGenesis { predecessor } => write!(
                 f,
-                "@prev is genesis, but <{predecessor}> precedes this segment: a chain was restarted"
+                "@prev is genesis, but <{}> precedes this segment: a chain was restarted",
+                shown(predecessor)
             ),
             Finding::MissingSuccessor { after, successor } => write!(
                 f,
-                "<{after}> rotated into <{successor}>, which is not here: the chain \
-                 was truncated at its head, where nothing points forward"
+                "<{}> rotated into <{}>, which is not here: the chain was truncated at its head, \
+                 where nothing points forward",
+                shown(after),
+                shown(successor)
             ),
             Finding::UnbracketedLevelChange {
                 from_segment,
@@ -611,14 +618,18 @@ impl fmt::Display for Finding {
                 to,
             } => write!(
                 f,
-                "the level went from {from} (<{from_segment}>) to {to} (<{to_segment}>) with no \
-                 sealed log:LevelChange recording that change: the gap that opened is \
-                 unexplained"
+                "the level went from {} (<{}>) to {} (<{}>) with no sealed log:LevelChange \
+                 recording that change: the gap that opened is unexplained",
+                shown(from),
+                shown(from_segment),
+                shown(to),
+                shown(to_segment)
             ),
             Finding::UnmarkedEnd { last_class } => match last_class {
                 Some(class) => write!(
                     f,
-                    "ends on {class}, not an orderly stop or a rotation: the process died"
+                    "ends on {}, not an orderly stop or a rotation: the process died",
+                    shown(class)
                 ),
                 None => f.write_str("has no entries at all"),
             },
@@ -740,7 +751,10 @@ impl ChainReport {
             if report.is_unreadable() {
                 // No header, so no level, instance, chain link or head to state
                 // — and stating defaults for them would read as facts.
-                out.push_str(&format!("segment {} BROKEN unreadable\n", report.name));
+                out.push_str(&format!(
+                    "segment {} BROKEN unreadable\n",
+                    shown(&report.name)
+                ));
                 for line in report.render_findings().lines() {
                     out.push_str(&format!("  {line}\n"));
                 }
@@ -748,24 +762,24 @@ impl ChainReport {
             }
             out.push_str(&format!(
                 "segment {} {} entries={} seals={} level={} prev={}",
-                report.name,
+                shown(&report.name),
                 if report.ok() { "OK" } else { "BROKEN" },
                 report.entries,
                 report.seals,
-                report.level,
-                match &report.prev {
-                    Prev::Genesis => "genesis".to_string(),
-                    Prev::Seal(hash) => hash.clone(),
-                }
+                shown(&report.level),
+                shown(match &report.prev {
+                    Prev::Genesis => "genesis",
+                    Prev::Seal(hash) => hash.as_str(),
+                })
             ));
             if report.signed_with.is_empty() {
                 // Stated, not omitted: an unsigned seal still localizes tampering,
                 // and a reader should not have to infer which guarantee they have.
                 out.push_str(" signed=none");
             } else {
-                out.push_str(&format!(" signed={}", report.signed_with.join(",")));
+                out.push_str(&format!(" signed={}", shown(&report.signed_with.join(","))));
             }
-            out.push_str(&format!(" head={}\n", report.head));
+            out.push_str(&format!(" head={}\n", shown(&report.head)));
             for line in report.render_findings().lines() {
                 out.push_str(&format!("  {line}\n"));
             }

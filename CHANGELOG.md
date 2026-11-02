@@ -29,6 +29,17 @@ with the first release that changes a public name.
   everything else, a backslash included, is shown as it is. Before, each quoted its
   input raw. Log lines are unchanged: they do not escape the bidirectional format
   characters.
+- Report and error text show names escaped the same way (ledger #2913). The verify
+  report's segment line (name, level, `prev=`, `signed=`, `head=`) and every
+  `Finding` that names what it read (`Malformed`, `SealMismatch`, `PrevMismatch`,
+  `UnexpectedGenesis`, `MissingSuccessor`, `UnbracketedLevelChange`,
+  `UnmarkedEnd`); `WriteError` (`UnknownLevel`, `InstanceInUse`, and the path in
+  `SegmentExists` and `Io`); `ConfigError`'s paths and messages; `VocabError`; the
+  streaming transreptor's stray-directive error; and the endpoints' text that
+  repeats a requested segment IRI, a class, a level or a path. A segment written
+  before 0.9.2 can carry such a character in its header or a class, and a request
+  IRI can carry a bidirectional format character. The entry IRI `urn:log:write`
+  answers is unchanged: it is an IRI, not a sentence.
 
 ## 0.9.1
 

@@ -70,7 +70,7 @@ use crate::chain::{RotationPolicy, SealPolicy, SealSigner};
 use crate::config::LogConfig;
 #[cfg(not(target_family = "wasm"))]
 use crate::config::{level_iri, ConfigError, Destination, Patch};
-use crate::line::{parse_fields, Entry, Timestamp};
+use crate::line::{parse_fields, shown, Entry, Timestamp};
 #[cfg(not(target_family = "wasm"))]
 use crate::segments::{
     SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
@@ -1002,8 +1002,8 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
         return Err(Error::InvalidArgument {
             name: "class".to_string(),
             detail: format!(
-                "{class} is an always-land marker this log writes itself; a caller cannot \
-                 append one"
+                "{} is an always-land marker this log writes itself; a caller cannot append one",
+                shown(&class)
             ),
         });
     }
@@ -1060,7 +1060,8 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
         // because a host that believes it is logging and is not should find out
         // from the first write and not from an empty directory next week.
         return Ok(plain(format!(
-            "closed: no segment is open, so {class} was not written"
+            "closed: no segment is open, so {} was not written",
+            shown(&class)
         )));
     }
     match handle.write_landed(entry).map_err(write_error)? {
@@ -1069,8 +1070,9 @@ fn write_impl(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represent
         // returns.
         Some((segment, seq)) => Ok(plain(format!("{segment}:{seq}"))),
         None => Ok(plain(format!(
-            "filtered: {class} is below this segment's level ({})",
-            handle.config().level
+            "filtered: {} is below this segment's level ({})",
+            shown(&class),
+            shown(&handle.config().level)
         ))),
     }
 }
@@ -1206,13 +1208,16 @@ fn config_source(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Repres
         let mut body = config.to_toml();
         match &open {
             Some((segment, instance)) => {
-                body.push_str(&format!("\n# open = true\n# segment = {segment}\n"));
-                body.push_str(&format!("# instance = {instance}\n"));
+                body.push_str(&format!(
+                    "\n# open = true\n# segment = {}\n",
+                    shown(segment)
+                ));
+                body.push_str(&format!("# instance = {}\n", shown(instance)));
             }
             None => body.push_str("\n# open = false\n"),
         }
         for layer in &config.layers {
-            body.push_str(&format!("# layer = {}\n", layer.display()));
+            body.push_str(&format!("# layer = {}\n", crate::line::shown_path(layer)));
         }
         body
     };
@@ -1292,14 +1297,15 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
             Some(iri) => {
                 let vocabulary = handle.vocabulary();
                 vocabulary.rank(&iri).is_none().then(|| {
+                    let known = vocabulary
+                        .levels()
+                        .filter(|(_, rank)| *rank >= 0)
+                        .map(|(iri, _)| iri.strip_prefix(LOG_NS).unwrap_or(iri))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!(
                         "not a level this vocabulary defines (it knows: {})",
-                        vocabulary
-                            .levels()
-                            .filter(|(_, rank)| *rank >= 0)
-                            .map(|(iri, _)| iri.strip_prefix(LOG_NS).unwrap_or(iri))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        shown(&known)
                     )
                 })
             }
@@ -1517,7 +1523,7 @@ fn config_sink(handle: &Arc<LogHandle>, inv: &Invocation<'_>) -> Result<Represen
     // so those take hold at the next segment (a rotation or a restart), while
     // where the log is written and under what name wait for the next process
     // start — a rotation stays with its writer and its instance lock.
-    let mut body = format!("wrote {}\n", target.display());
+    let mut body = format!("wrote {}\n", crate::line::shown_path(&target));
     for (key, when) in &changed {
         body.push_str(&format!(
             "{key}: effective at the {}\n",
