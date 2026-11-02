@@ -41,17 +41,19 @@ error kinds.
 
 Verified by reading the source:
 
-- **One entry is one printable line.** A newline, carriage return or tab inside a value is
-  written as an escape (`\n`, `\r`, `\t`), and every other control character (C0, DEL, C1) and
-  the line and paragraph separators as `\u{hex}`, so a reader or a screen reader moving line by
-  line meets whole entries, and no value reaches the screen as a control sequence. A subject or
-  class holding one is refused rather than written.
+- **One entry is one printable line that reads in its written order.** A newline, carriage
+  return or tab inside a value is written as an escape (`\n`, `\r`, `\t`), and every other
+  control character (C0, DEL, C1), the line and paragraph separators, and the bidirectional
+  formatting characters (U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F, U+061C) as
+  `\u{hex}`, so a reader or a screen reader moving line by line meets whole entries, no value
+  reaches the screen as a control sequence, and no value reorders the rest of its line. A
+  subject, class or principal holding one is refused rather than written.
 - **An error is one printable line.** An error or report line that repeats its input (`ParseError`,
   `RenderError`, `GraphError`, `PrincipalError`, `WriteError`, `ConfigError`, `VocabError`, every
   verify finding and the verify report's segment line, and an endpoint's text naming a requested
-  segment, a class, a level or a path) shows those same characters escaped the same way, and the
-  bidirectional format characters (U+202A to U+202E, U+2066 to U+2069) as `\u{hex}` too, so quoted
-  text cannot reorder the sentence around it on screen.
+  segment, a class, a level or a path) shows those same characters escaped the same way, the
+  bidirectional formatting characters included, so quoted text cannot reorder the sentence around
+  it on screen.
 - Timestamps are fixed-width ISO 8601 in UTC with milliseconds and a `Z`.
 - The verify report says its outcome in words: `OK` or `BROKEN` per segment, `BROKEN` or `noted`
   per finding, and a total; an unsigned segment says `signed=none` rather than leaving it out.
@@ -67,9 +69,10 @@ Verified by reading the source:
   `verify_binds_above_the_template_and_reports_through_the_kernel` pins the report's `OK`,
   `BROKEN` and `verified 1 segment(s), 0 broken`; `a_crashed_tail_is_noted_and_not_called_broken`
   pins that a crash is not reported as breaking.
-- `tests/control_characters.rs` pins that no written line holds a raw control character, that
-  each escape reads back to the value logged through the parser, the verifier and both
-  transreption paths, and that a segment written before the escape still reads and verifies.
+- `tests/control_characters.rs` pins that no written line holds a raw control character or
+  bidirectional formatting character, that each escape reads back to the value logged through
+  the parser, the verifier and both transreption paths, that a principal holding one is
+  refused, and that segments written before either escape still read and verify.
 - `tests/error_text.rs` pins that every error quoting its input, every finding, the verify
   report's segment line, the streaming transreptor's errors and the endpoints' answers naming a
   request show each such character, and each bidirectional format character, escaped, and
@@ -96,8 +99,6 @@ Found by reading the source on 2026-10-31 and 2026-11-02:
 - **A parenthesized plural** ends the verify report (`verified 1 segment(s), 0 broken`), which a
   screen reader reads with the parentheses.
 - Times are always UTC; a reader converts to local time themselves.
-- **Bidirectional format characters in a log line** are written as they are, so a value holding
-  one can reorder the rest of that line on screen.
 - Every message is English only.
 
 ## Contributing
@@ -123,3 +124,4 @@ goes through [private vulnerability reporting](https://github.com/ikigai-rs/ikig
 | 2026-11-02 | Control characters in values are escaped; the rule and its test are listed. |
 | 2026-11-02 | Errors show quoted input escaped, bidirectional format characters included. |
 | 2026-11-02 | The verify report, every finding and every error show the names they repeat escaped. |
+| 2026-11-02 | Log lines escape bidirectional formatting characters; the limitation row is removed. |

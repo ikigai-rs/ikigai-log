@@ -24,9 +24,11 @@
 //! the per-line hash chain, and for a rotation that has to reason about a
 //! prefix of a file. So a newline inside a value is escaped on the way out, and
 //! a raw newline can never appear in rendered output. The same holds for every
-//! other control character (C0, DEL, C1) and the line and paragraph separators:
-//! a value carrying one is quoted and the character written as `\u{hex}`, so
-//! the line stays printable, and an IRI column carrying one is refused.
+//! other control character (C0, DEL, C1), the line and paragraph separators,
+//! and the bidirectional formatting characters (U+202A–U+202E, U+2066–U+2069,
+//! U+200E, U+200F, U+061C): a value carrying one is quoted and the character
+//! written as `\u{hex}`, so the line stays printable and reads in its written
+//! order, and an IRI column carrying one is refused.
 //!
 //! Prefixes bind the CLASS column only. A subject is always written as the
 //! absolute IRI it is: `urn:agent:calendar` is indistinguishable from a CURIE
@@ -76,9 +78,8 @@ pub enum ParseError {
     Version(String),
 }
 
-/// The offending text is shown escaped, as a line escapes it (plus the
-/// bidirectional format characters), so an error stays one printable line
-/// whatever the input held.
+/// The offending text is shown escaped, as a line escapes it, so an error
+/// stays one printable line whatever the input held.
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -125,10 +126,10 @@ impl std::error::Error for RenderError {}
 pub(crate) struct Shown<'a>(&'a str);
 
 /// `text` as an error message shows it: every character a written line never
-/// carries raw ([`needs_escape`]) is written as the line writes it (`\n`,
-/// `\r`, `\t`, or `\u{hex}`), and so is every bidirectional format character
-/// (U+202A–U+202E, U+2066–U+2069), which would reorder the rest of the
-/// sentence on screen. Everything else is shown as it is, a backslash included,
+/// carries raw ([`needs_escape`]: control characters, the line and paragraph
+/// separators, and the bidirectional formatting characters, which would reorder
+/// the rest of the sentence on screen) is written as the line writes it (`\n`,
+/// `\r`, `\t`, or `\u{hex}`). Everything else is shown as it is, a backslash included,
 /// so the text an error quotes from a segment reads as the segment does; the
 /// cost is that a literal `\u{1b}` and an escaped U+001B look alike here.
 /// An error is then one printable line, whatever the input held.
@@ -150,9 +151,7 @@ pub(crate) fn shown(text: &str) -> Shown<'_> {
 impl fmt::Display for Shown<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for c in self.0.chars() {
-            if is_bidi_format(c) {
-                write!(f, "{}", c.escape_unicode())?;
-            } else if !write_escape(f, c)? {
+            if !write_escape(f, c)? {
                 fmt::Write::write_char(f, c)?;
             }
         }
@@ -165,10 +164,14 @@ pub(crate) fn shown_path(path: &std::path::Path) -> String {
     shown(&path.display().to_string()).to_string()
 }
 
-/// The bidirectional embedding, override and isolate characters. Error text
-/// escapes them; a written line does not, yet.
+/// The bidirectional formatting characters: the embeddings and overrides
+/// (U+202A–U+202E), the isolates (U+2066–U+2069), and the marks (U+200E,
+/// U+200F, U+061C). Each changes the order the text around it is shown in.
 fn is_bidi_format(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
+    )
 }
 
 // =====================================================================================
@@ -312,11 +315,13 @@ fn is_key(k: &str) -> bool {
 }
 
 /// Whether `c` may never appear raw on a written line: every Unicode control
-/// character (C0, DEL and C1), and the line and paragraph separators, which
-/// some readers break a line on. One entry is one PRINTABLE line, so these are
+/// character (C0, DEL and C1), the line and paragraph separators, which some
+/// readers break a line on, and the bidirectional formatting characters
+/// ([`is_bidi_format`]), which reorder the rest of the line on screen. One
+/// entry is one PRINTABLE line that reads in its written order, so these are
 /// always written as escapes.
 fn needs_escape(c: char) -> bool {
-    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}' || is_bidi_format(c)
 }
 
 /// Whether `s` can be written in an IRI column: [`is_iri`], and nothing that
