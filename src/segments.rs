@@ -146,6 +146,8 @@ fn check_segment_size(size: usize, limit: usize) -> Result<()> {
 /// after opening. The sentinel detects overflow; no prefix is ever returned.
 #[cfg(not(target_family = "wasm"))]
 fn read_segment_with_budget(path: &Path, limit: usize) -> Result<String> {
+    // ambient: fs: reads one of the log's own segment files, bounded by the read budget
+    #[allow(clippy::disallowed_methods)]
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))?;
     let mut bytes = Vec::new();
@@ -809,7 +811,10 @@ fn locate(directory: &Path, tail: &str, iri: &str) -> Option<PathBuf> {
             "{}-{stamp}.{SEGMENT_EXTENSION}",
             crate::writer::slug(instance)
         ));
-        if candidate.is_file() && header_name(&candidate).as_deref() == Some(iri) {
+        // ambient: fs: the fast path probes the segment file the IRI names in the log's own directory
+        #[allow(clippy::disallowed_methods)]
+        let is_file = candidate.is_file();
+        if is_file && header_name(&candidate).as_deref() == Some(iri) {
             return Some(candidate);
         }
     }
@@ -823,6 +828,8 @@ fn locate(directory: &Path, tail: &str, iri: &str) -> Option<PathBuf> {
 /// Every readable segment in `directory`, as `(IRI, path)`, ordered by IRI —
 /// which is chronological within an instance, because the stamp sorts lexically.
 fn segment_files(directory: &Path) -> Vec<(String, PathBuf)> {
+    // ambient: fs: lists the log's own segment directory
+    #[allow(clippy::disallowed_methods)]
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -861,6 +868,8 @@ const TAIL_PROBE_BYTES: u64 = 256 * 1024;
 /// is), not the whole file: this runs at every process start, over every segment
 /// the instance has ever left in the directory.
 pub(crate) fn chain_tail(directory: &Path, instance: &str) -> Option<(PathBuf, Header, String)> {
+    // ambient: fs: lists the log's own segment directory to find this instance's chain tail at start
+    #[allow(clippy::disallowed_methods)]
     let mut found: Vec<(Header, PathBuf, String)> = std::fs::read_dir(directory)
         .ok()?
         .flatten()
@@ -891,6 +900,8 @@ pub(crate) fn chain_tail(directory: &Path, instance: &str) -> Option<(PathBuf, H
 /// header when it has none — reading the end of the file first.
 fn stated_head_of_file(path: &Path, header: &Header) -> Option<String> {
     use std::io::{Seek, SeekFrom};
+    // ambient: fs: reads the end of one of the log's own segment files for its last seal
+    #[allow(clippy::disallowed_methods)]
     let mut file = std::fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let start = length.saturating_sub(TAIL_PROBE_BYTES);
@@ -940,6 +951,8 @@ fn header_of(path: &Path) -> Option<Header> {
 /// [`header_of`], saying why when there is none — what verify reports for a file
 /// it cannot read rather than skipping it.
 fn read_header(path: &Path) -> std::result::Result<Header, String> {
+    // ambient: fs: reads the header of one of the log's own segment files
+    #[allow(clippy::disallowed_methods)]
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut buffer = vec![0u8; HEADER_PROBE_BYTES];
     let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
@@ -1162,6 +1175,8 @@ fn chains_in(directory: &Path) -> Result<DirectoryChains> {
 #[cfg(not(target_family = "wasm"))]
 fn chains_in_with_budget(directory: &Path, budget: usize) -> Result<DirectoryChains> {
     let mut remaining = budget;
+    // ambient: fs: lists the log's own segment directory for verify
+    #[allow(clippy::disallowed_methods)]
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Ok((Vec::new(), Vec::new()));
     };

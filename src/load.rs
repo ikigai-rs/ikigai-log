@@ -73,6 +73,8 @@ pub fn complete_in(
     let mut effective = base;
     effective.layers.clear();
     for path in layered_paths_in(home, STEM, app) {
+        // ambient: fs: a layered log.toml under the config home the host names; a configuration read until a config-home resource exists (ledger #2400)
+        #[allow(clippy::disallowed_methods)]
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             // Absent is the normal case and means "this layer states nothing".
@@ -111,7 +113,10 @@ pub fn target_layer(home: &Path, app: Option<&str>) -> Option<PathBuf> {
 
 /// Read one layer file as the patch it is. An absent file is an empty patch.
 pub fn read_layer(path: &Path) -> Result<Patch, ConfigError> {
-    match std::fs::read_to_string(path) {
+    // ambient: fs: the layer file urn:log:config rewrites, under the config home the host named; a configuration read until ledger #2400
+    #[allow(clippy::disallowed_methods)]
+    let read = std::fs::read_to_string(path);
+    match read {
         Ok(text) => Patch::parse(&text, Some(path.to_path_buf())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Patch::default()),
         Err(e) => Err(ConfigError::Unreadable {
@@ -165,11 +170,15 @@ pub fn write_layer(path: &Path, change: &Patch) -> Result<Patch, ConfigError> {
         }
     }
     if let Some(parent) = path.parent() {
+        // ambient: fs: the directory of the layer file urn:log:config writes, under the config home the host named; until ledger #2400
+        #[allow(clippy::disallowed_methods)]
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::Unwritable {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
     }
+    // ambient: fs: the layer file urn:log:config writes, under the config home the host named; until ledger #2400
+    #[allow(clippy::disallowed_methods)]
     std::fs::write(path, merged.to_toml()).map_err(|e| ConfigError::Unwritable {
         path: path.to_path_buf(),
         message: e.to_string(),

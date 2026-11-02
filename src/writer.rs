@@ -424,6 +424,8 @@ impl Writer {
         claimed: Option<(String, std::fs::File)>,
     ) -> Result<Writer, WriteError> {
         let directory = resolve_directory(config).ok_or(WriteError::NoDirectory)?;
+        // ambient: fs: creates the segment directory the log's config names; the writer is a connector by design
+        #[allow(clippy::disallowed_methods)]
         std::fs::create_dir_all(&directory).map_err(|e| WriteError::Io {
             path: Some(directory.clone()),
             message: e.to_string(),
@@ -969,7 +971,11 @@ pub(crate) fn reserve_segment(
             format!("{base}-{attempt}")
         };
         let path = directory.join(format!("{}-{stamp}.log", slug(name)));
-        match owner_only(std::fs::OpenOptions::new().write(true).create_new(true)).open(&path) {
+        // ambient: fs: reserves a new owner-only segment file (create_new) in the log's own directory
+        #[allow(clippy::disallowed_methods)]
+        let opened =
+            owner_only(std::fs::OpenOptions::new().write(true).create_new(true)).open(&path);
+        match opened {
             Ok(file) => {
                 let iri = segment_iri(&crate::config::instance_iri(name), stamp.clone());
                 return Ok(Reserved {
@@ -1123,6 +1129,8 @@ fn try_claim(directory: &std::path::Path, name: &str) -> Result<Option<std::fs::
     use io::Write;
 
     let path = directory.join(format!("{}.lock", slug(name)));
+    // ambient: fs: the per-instance lock file that keeps two live processes off one chain
+    #[allow(clippy::disallowed_methods)]
     let file = owner_only(
         std::fs::OpenOptions::new()
             .write(true)

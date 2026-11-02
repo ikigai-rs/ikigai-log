@@ -36,7 +36,10 @@ impl LogHandle {
         let path = self.open_path();
         let mut lengths = BTreeMap::new();
         if let Some(path) = path {
-            if let Ok(metadata) = path.metadata() {
+            // ambient: fs: the length of the segment file this handle has open, so the first append cuts only on growth
+            #[allow(clippy::disallowed_methods)]
+            let metadata = path.metadata();
+            if let Ok(metadata) = metadata {
                 lengths.insert(path, metadata.len());
             }
         }
@@ -112,6 +115,8 @@ impl Drop for AppendGuard<'_> {
             paths
                 .into_iter()
                 .filter_map(|path| {
+                    // ambient: fs: the length of a segment file this write touched, so an unchanged file cuts nothing
+                    #[allow(clippy::disallowed_methods)]
                     let len = path.metadata().ok()?.len();
                     if observer.lengths.insert(path.clone(), len) == Some(len) {
                         return None;
