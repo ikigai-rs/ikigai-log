@@ -363,7 +363,8 @@ impl std::error::Error for PrincipalError {}
 /// renders a probe line carrying this value and parses that line back, and
 /// accepts the principal only if every column comes back unchanged and the
 /// value was written BARE. A principal that would have to be quoted (a space, a
-/// tab, a newline, a `"`) is refused rather than escaped — escaping would be
+/// tab, a newline, a `"`, a control or bidirectional formatting character) is
+/// refused rather than escaped — escaping would be
 /// lossless and still wrong, because `grep 'principal=urn:agent:x'` is half the
 /// reason the format is what it is, and a quoted column is invisible to it.
 ///

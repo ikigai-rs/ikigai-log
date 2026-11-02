@@ -27,8 +27,15 @@ with the first release that changes a public name.
   carries raw as the line writes it (`\n`, `\r`, `\t` or `\u{hex}`), and the
   bidirectional format characters (U+202A to U+202E, U+2066 to U+2069) as `\u{hex}`;
   everything else, a backslash included, is shown as it is. Before, each quoted its
-  input raw. Log lines are unchanged: they do not escape the bidirectional format
-  characters.
+  input raw.
+- Log lines escape bidirectional formatting characters so every entry reads in its
+  written order (ledger #2917). A value holding one of U+202A to U+202E, U+2066 to
+  U+2069, U+200E, U+200F or U+061C is quoted, with the character written as
+  `\u{hex}`, exactly as a control character is; a subject, class, header IRI or
+  prefix holding one is refused with `RenderError`. `Principal::new` refuses an IRI
+  holding one, since it would have to be quoted. A segment written before this
+  change, raw characters included, still parses, verifies and transrepts. Error
+  text escapes the same set, the marks U+200E, U+200F and U+061C now included.
 - Report and error text show names escaped the same way (ledger #2913). The verify
   report's segment line (name, level, `prev=`, `signed=`, `head=`) and every
   `Finding` that names what it read (`Malformed`, `SealMismatch`, `PrevMismatch`,

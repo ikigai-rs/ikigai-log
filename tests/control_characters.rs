@@ -1,12 +1,16 @@
-//! Control characters in logged values (ledger #2732).
+//! Control and bidirectional formatting characters in logged values (ledger
+//! #2732, #2917).
 //!
-//! One entry is one PRINTABLE line: a value holding a control character (C0,
-//! DEL, C1) or a line or paragraph separator is written as an escape that the
-//! parser reads back, never as the raw character, whether the value would
-//! otherwise have been written bare or quoted. The hash chain folds in the line
-//! as written and the transreptor reads the value as parsed, so the two must
-//! agree on the escaped form. And a segment written before the escape existed,
-//! with the raw characters in it, still parses, verifies and transrepts.
+//! One entry is one PRINTABLE line that reads in its written order: a value
+//! holding a control character (C0, DEL, C1), a line or paragraph separator, or
+//! a bidirectional formatting character (the embeddings, overrides and isolates
+//! U+202A–U+202E and U+2066–U+2069, and the marks U+200E, U+200F and U+061C) is
+//! written as an escape that the parser reads back, never as the raw character,
+//! whether the value would otherwise have been written bare or quoted. The hash
+//! chain folds in the line as written and the transreptor reads the value as
+//! parsed, so the two must agree on the escaped form. And a segment written
+//! before the escape existed, with the raw characters in it, still parses,
+//! verifies and transrepts.
 //!
 //! Public API only, so this is what a consumer of the crate can rely on.
 
@@ -15,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use ikigai_log::{
     parse_fields, to_triples, verify_chain, ClosureSink, Entry, LogConfig, Options, Prev,
-    RenderError, SealPolicy, Timestamp, Vocabulary, Writer, WriterOptions, MESSAGE_CLASS,
+    Principal, PrincipalError, RenderError, SealPolicy, Timestamp, Vocabulary, Writer,
+    WriterOptions, MESSAGE_CLASS,
 };
 use oxrdf::Term;
 
@@ -33,16 +38,29 @@ fn prefixes() -> BTreeMap<String, String> {
     )])
 }
 
+/// The bidirectional formatting characters: the embeddings and overrides
+/// (U+202A–U+202E), the isolates (U+2066–U+2069) and the marks (U+200E,
+/// U+200F, U+061C). Each reorders the text around it on screen.
+const BIDI_FORMAT: [u32; 12] = [
+    0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c,
+];
+
+fn is_bidi_format(c: char) -> bool {
+    BIDI_FORMAT.contains(&(c as u32))
+}
+
 /// Whether `c` may not appear raw on a written line: every Unicode control
-/// character (C0, DEL, C1), and the two separators some readers break a line on.
+/// character (C0, DEL, C1), the two separators some readers break a line on,
+/// and every bidirectional formatting character.
 fn forbidden(c: char) -> bool {
-    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}' || is_bidi_format(c)
 }
 
 /// Every forbidden character, one at a time.
 fn every_forbidden() -> Vec<char> {
     (0u32..=0x9f)
         .chain([0x2028, 0x2029])
+        .chain(BIDI_FORMAT)
         .filter_map(char::from_u32)
         .filter(|&c| forbidden(c))
         .collect()
@@ -58,6 +76,9 @@ fn payloads() -> Vec<String> {
         "two words\u{1b}]0;title\u{7} and more".to_string(),
         "\u{9b}2J\u{7f}\u{0}".to_string(),
         "line\u{2028}separator and\u{2029}paragraph".to_string(),
+        // Text whose display order differs from its written order.
+        "abc\u{202e}fed\u{202c}ghi".to_string(),
+        "two words \u{2067}isolated\u{2069} \u{200f}\u{61c}".to_string(),
         // Text that already looks like an escape must stay that text.
         "literal \\u{1b} stays literal".to_string(),
         "\\u{1b}".to_string(),
@@ -274,7 +295,11 @@ fn the_incremental_transreptor_agrees_with_the_bytes_path_on_escaped_values() {
         Exact::new(ikigai_log::TRANSREPT_IRI),
         ikigai_log::segments::TransreptEndpoint::new(Vocabulary::shared_builtin()),
     )));
-    for text in [escaped.as_str(), WRITTEN_BY_0_9_1] {
+    for text in [
+        escaped.as_str(),
+        WRITTEN_BY_0_9_1,
+        WRITTEN_BEFORE_BIDI_ESCAPE,
+    ] {
         let expected = ikigai_log::to_turtle(text, Vocabulary::builtin(), &Options::all()).unwrap();
         let request = Request::new(Verb::Source, Iri::parse(ikigai_log::TRANSREPT_IRI).unwrap())
             .with_arg("content", ArgRef::Inline(text.as_bytes().to_vec()));
@@ -283,5 +308,67 @@ fn the_incremental_transreptor_agrees_with_the_bytes_path_on_escaped_values() {
             block_on(answer.collect(1 << 22)).unwrap().bytes,
             expected.as_bytes()
         );
+    }
+}
+
+/// The exact bytes the writer produced before log lines escaped the
+/// bidirectional formatting characters (main at 5adb684, unreleased 0.9.2):
+/// raw U+202E, U+2066 and U+2069 in a bare value (seq 2), raw U+202E, U+202C,
+/// U+200F and U+061C in a quoted one (seq 3), with its seal. Captured from that
+/// writer, not composed by hand.
+const WRITTEN_BEFORE_BIDI_ESCAPE: &str = "# ikigai-log v1\n@prefix log:  <https://ikigai-rs.dev/ns/log#> .\n@prefix prov: <http://www.w3.org/ns/prov#> .\n@name     urn:log:bug:seg:2023-11-14T22-13-20Z\n@instance urn:ikigai:instance:bug:seg\n@level    log:info\n@started  2023-11-14T22:13:20.000Z\n@prev     genesis\n\n\n2023-11-14T22:13:20.000Z log:ProcessStart urn:ikigai:instance:bug:seg seq=1 pid=83453\n2023-11-14T22:13:20.010Z log:Message urn:ikigai:instance:bug:seg seq=2 msg=abc\u{202e}fed\u{2066}x\u{2069}\n2023-11-14T22:13:20.020Z log:Message urn:ikigai:instance:bug:seg seq=3 msg=\"two words \u{202e}desrever\u{202c} \u{200f}\u{61c}\"\n2023-11-14T22:13:20.030Z log:Message urn:ikigai:instance:bug:seg seq=4 msg=plain\n2023-11-14T22:13:20.040Z log:ProcessStop urn:ikigai:instance:bug:seg seq=5\n#seal 1-5 sha256:0aec8826373c81bd52b67a52cfe2ff97018b02e38e83e74a8260e1e342754f18\n";
+
+#[test]
+fn a_segment_written_before_the_bidi_escape_still_parses_verifies_and_transrepts() {
+    let text = WRITTEN_BEFORE_BIDI_ESCAPE;
+    assert!(
+        text.chars().any(is_bidi_format),
+        "the fixture lost its raw characters"
+    );
+    let report = verify_chain(&[(name_of(text), text.to_string())], Vocabulary::builtin());
+    assert!(report.ok(), "{}", report.render());
+    assert!(
+        report.segments[0].findings.is_empty(),
+        "{}",
+        report.render()
+    );
+    assert_eq!(report.segments[0].entries, 5);
+    assert_eq!(report.segments[0].seals, 1);
+
+    let found = literals(text);
+    for value in [
+        "abc\u{202e}fed\u{2066}x\u{2069}",
+        "two words \u{202e}desrever\u{202c} \u{200f}\u{61c}",
+    ] {
+        assert!(found.contains(&value.to_string()), "lost {value:?}");
+    }
+}
+
+#[test]
+fn a_bidi_formatting_character_is_written_as_its_escape_in_a_quoted_value() {
+    let prefixes = prefixes();
+    for c in BIDI_FORMAT.into_iter().filter_map(char::from_u32) {
+        for value in [format!("bare{c}value"), format!("quoted {c} value")] {
+            let entry = Entry::new(at(T0), MESSAGE_CLASS, SUBJECT).with("msg", value.clone());
+            let line = entry.render(&prefixes).unwrap();
+            let escaped = value.replace(c, &format!("\\u{{{:x}}}", c as u32));
+            assert!(
+                line.ends_with(&format!(" msg=\"{escaped}\"")),
+                "U+{:04X} in {value:?} wrote {line:?}",
+                c as u32
+            );
+        }
+    }
+}
+
+#[test]
+fn a_principal_holding_a_bidi_formatting_character_is_refused() {
+    assert!(Principal::new("urn:agent:alice").is_ok());
+    for c in BIDI_FORMAT.into_iter().filter_map(char::from_u32) {
+        let iri = format!("urn:agent:al{c}ice");
+        match Principal::new(iri.clone()) {
+            Err(PrincipalError::NotAColumn { offered, .. }) => assert_eq!(offered, iri),
+            other => panic!("U+{:04X} in a principal: {other:?}", c as u32),
+        }
     }
 }
