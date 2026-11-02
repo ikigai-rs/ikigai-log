@@ -10,7 +10,7 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-log/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-log/security/advisories/new) |
-| Last reviewed | 2026-10-31 |
+| Last reviewed | 2026-11-02 |
 
 ## What it emits that people read
 
@@ -41,14 +41,17 @@ error kinds.
 
 Verified by reading the source:
 
-- **One entry is one line.** A newline, carriage return or tab inside a value is written as an
-  escape (`\n`, `\r`, `\t`), so a reader or a screen reader moving line by line meets whole
-  entries.
+- **One entry is one printable line.** A newline, carriage return or tab inside a value is
+  written as an escape (`\n`, `\r`, `\t`), and every other control character (C0, DEL, C1) and
+  the line and paragraph separators as `\u{hex}`, so a reader or a screen reader moving line by
+  line meets whole entries, and no value reaches the screen as a control sequence. A subject or
+  class holding one is refused rather than written.
 - Timestamps are fixed-width ISO 8601 in UTC with milliseconds and a `Z`.
 - The verify report says its outcome in words: `OK` or `BROKEN` per segment, `BROKEN` or `noted`
   per finding, and a total; an unsigned segment says `signed=none` rather than leaving it out.
   A finding names the sequence numbers or segments involved and says what they mean.
-- No color, no terminal control sequences of its own and no markup are written.
+- No color, no terminal control sequences and no markup are written into a segment, its own
+  or a logged value's.
 
 ## How it is tested
 
@@ -58,6 +61,9 @@ Verified by reading the source:
   `verify_binds_above_the_template_and_reports_through_the_kernel` pins the report's `OK`,
   `BROKEN` and `verified 1 segment(s), 0 broken`; `a_crashed_tail_is_noted_and_not_called_broken`
   pins that a crash is not reported as breaking.
+- `tests/control_characters.rs` pins that no written line holds a raw control character, that
+  each escape reads back to the value logged through the parser, the verifier and both
+  transreption paths, and that a segment written before the escape still reads and verifies.
 - `tests/audit_904.rs`: `r8_a_damaged_segment_in_the_directory_is_reported` pins a
   `segment … BROKEN` line for a damaged file.
 
@@ -102,3 +108,4 @@ goes through [private vulnerability reporting](https://github.com/ikigai-rs/ikig
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-02 | Control characters in values are escaped; the rule and its test are listed. |

@@ -3,6 +3,25 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
+## 0.9.2
+
+### Fixed
+
+- Escape control characters in log lines so every entry stays one printable line
+  (ledger #2732). A value holding a control character (C0, DEL or C1) or a line or
+  paragraph separator is now quoted, with the character written as `\u{hex}`;
+  before, such a value could be written bare, and a quoted one kept every control
+  character but newline, carriage return and tab. The parser reads `\u{hex}` back,
+  so the value, the hash chain and the transreptor's graph all agree. A subject,
+  class, header IRI or prefix holding one is refused with `RenderError` instead of
+  written, as whitespace already was; the tracer counts such an entry as
+  unwritable.
+- Segments written before this release, raw characters included, still parse,
+  verify and transrept unchanged. A reader older than 0.9.2 reads a new escape as
+  the text after its backslash, so read new segments with 0.9.2 or later. The
+  format version stays v1: the grammar gained one escape, and no line an earlier
+  writer produced reads differently.
+
 ## 0.9.1
 
 ### Added

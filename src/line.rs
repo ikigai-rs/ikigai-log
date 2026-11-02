@@ -23,7 +23,10 @@
 //! **One entry is one line** is load-bearing three times over: for `grep`, for
 //! the per-line hash chain, and for a rotation that has to reason about a
 //! prefix of a file. So a newline inside a value is escaped on the way out, and
-//! a raw newline can never appear in rendered output.
+//! a raw newline can never appear in rendered output. The same holds for every
+//! other control character (C0, DEL, C1) and the line and paragraph separators:
+//! a value carrying one is quoted and the character written as `\u{hex}`, so
+//! the line stays printable, and an IRI column carrying one is refused.
 //!
 //! Prefixes bind the CLASS column only. A subject is always written as the
 //! absolute IRI it is: `urn:agent:calendar` is indistinguishable from a CURIE
@@ -253,14 +256,35 @@ fn is_key(k: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
-/// Whether a value can be written without quotes: non-empty and free of
-/// anything the scanner treats as structure.
-fn is_bare_value(v: &str) -> bool {
-    !v.is_empty() && !v.contains('"') && !v.contains('\\') && !v.chars().any(char::is_whitespace)
+/// Whether `c` may never appear raw on a written line: every Unicode control
+/// character (C0, DEL and C1), and the line and paragraph separators, which
+/// some readers break a line on. One entry is one PRINTABLE line, so these are
+/// always written as escapes.
+fn needs_escape(c: char) -> bool {
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
 }
 
-/// Quote and escape a value. Newlines and tabs become escapes rather than
-/// characters — one entry is one line, and nothing may break that.
+/// Whether `s` can be written in an IRI column: [`is_iri`], and nothing that
+/// [`needs_escape`]. An IRI column has no quoting, so such an IRI is refused
+/// rather than written. Parsing stays on [`is_iri`], so a segment written
+/// before this rule still reads.
+fn is_writable_iri(s: &str) -> bool {
+    is_iri(s) && !s.chars().any(needs_escape)
+}
+
+/// Whether a value can be written without quotes: non-empty and free of
+/// anything the scanner treats as structure or that must be escaped.
+fn is_bare_value(v: &str) -> bool {
+    !v.is_empty()
+        && !v.contains('"')
+        && !v.contains('\\')
+        && !v.chars().any(|c| c.is_whitespace() || needs_escape(c))
+}
+
+/// Quote and escape a value. Newlines and tabs become `\n`, `\r` and `\t`,
+/// and every other character [`needs_escape`] becomes `\u{hex}` (std's
+/// [`char::escape_unicode`] form), so one entry is one printable line and the
+/// scanner reads each escape back to the character it stands for.
 fn quote(v: &str) -> String {
     let mut out = String::with_capacity(v.len() + 2);
     out.push('"');
@@ -271,11 +295,29 @@ fn quote(v: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if needs_escape(c) => out.extend(c.escape_unicode()),
             c => out.push(c),
         }
     }
     out.push('"');
     out
+}
+
+/// Read the rest of a `\u{hex}` escape, the `\u` already consumed: one to six
+/// hex digits naming a Unicode scalar value, then `}`. Anything else is `None`.
+fn unescape_unicode(chars: &mut impl Iterator<Item = char>) -> Option<char> {
+    if chars.next()? != '{' {
+        return None;
+    }
+    let mut hex = String::new();
+    loop {
+        match chars.next()? {
+            '}' => break,
+            c if c.is_ascii_hexdigit() && hex.len() < 6 => hex.push(c),
+            _ => return None,
+        }
+    }
+    char::from_u32(u32::from_str_radix(&hex, 16).ok()?)
 }
 
 /// Render a value: bare when it can be, quoted when it must be.
@@ -296,7 +338,7 @@ fn render_iri_column(
     iri: &str,
     prefixes: &BTreeMap<String, String>,
 ) -> Result<String, RenderError> {
-    if !is_iri(iri) {
+    if !is_writable_iri(iri) {
         return Err(RenderError::NotAnIri(iri.to_string()));
     }
     let mut best: Option<(&str, &str)> = None;
@@ -367,6 +409,10 @@ fn scan(line: &str) -> Result<Vec<String>, ParseError> {
                     Some('n') => token.push('\n'),
                     Some('r') => token.push('\r'),
                     Some('t') => token.push('\t'),
+                    Some('u') => match unescape_unicode(&mut chars) {
+                        Some(c) => token.push(c),
+                        None => return Err(ParseError::Field(line.to_string())),
+                    },
                     Some(esc) => token.push(esc),
                     None => return Err(ParseError::Field(line.to_string())),
                 },
@@ -439,7 +485,7 @@ impl Entry {
 
     /// Render the line (no trailing newline). Never contains a raw newline.
     pub fn render(&self, prefixes: &BTreeMap<String, String>) -> Result<String, RenderError> {
-        if !is_iri(&self.subject) {
+        if !is_writable_iri(&self.subject) {
             return Err(RenderError::NotAnIri(self.subject.clone()));
         }
         let mut out = String::new();
@@ -672,13 +718,19 @@ impl Header {
     /// from the entries.
     pub fn render(&self) -> Result<String, RenderError> {
         for iri in [&self.name, &self.instance, &self.level] {
-            if !is_iri(iri) {
+            if !is_writable_iri(iri) {
                 return Err(RenderError::NotAnIri(iri.clone()));
             }
         }
         let mut out = format!("{VERSION_PREFIX}{}\n", self.version);
         let width = self.prefixes.keys().map(String::len).max().unwrap_or(0);
         for (prefix, namespace) in &self.prefixes {
+            if prefix.chars().any(|c| c.is_whitespace() || needs_escape(c)) {
+                return Err(RenderError::Key(prefix.clone()));
+            }
+            if namespace.chars().any(needs_escape) {
+                return Err(RenderError::NotAnIri(namespace.clone()));
+            }
             let padded = format!("{prefix}:");
             out.push_str(&format!(
                 "@prefix {padded:<w$} <{namespace}> .\n",
