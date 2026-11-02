@@ -89,7 +89,7 @@ use crate::endpoints::opt;
 use crate::endpoints::{LogHandle, CAP_READ};
 use crate::graph::{to_turtle, Options, LOG_MEDIA_TYPE, TURTLE_MEDIA_TYPE};
 #[cfg(not(target_family = "wasm"))]
-use crate::line::{Header, Line, Prev, Timestamp};
+use crate::line::{shown, shown_path, Header, Line, Prev, Timestamp};
 use crate::vocabulary::Vocabulary;
 
 /// The transreptor: `text/x-ikigai-log` → `text/turtle`.
@@ -149,13 +149,13 @@ fn read_segment_with_budget(path: &Path, limit: usize) -> Result<String> {
     // ambient: fs: reads one of the log's own segment files, bounded by the read budget
     #[allow(clippy::disallowed_methods)]
     let file = std::fs::File::open(path)
-        .map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))?;
+        .map_err(|e| Error::Endpoint(format!("{}: {e}", shown_path(path))))?;
     let mut bytes = Vec::new();
     file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))?;
+        .map_err(|e| Error::Endpoint(format!("{}: {e}", shown_path(path))))?;
     check_segment_size(bytes.len(), limit)?;
-    String::from_utf8(bytes).map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))
+    String::from_utf8(bytes).map_err(|e| Error::Endpoint(format!("{}: {e}", shown_path(path))))
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -385,9 +385,7 @@ impl Endpoint for SegmentEndpoint {
             .ok_or_else(|| Error::Endpoint("no segment named".into()))?;
         let iri = inv.request.target.as_str();
         let directory = self.directory()?;
-        let path = locate(&directory, tail, iri).ok_or_else(|| {
-            Error::NotFound(format!("no segment <{iri}> in {}", directory.display()))
-        })?;
+        let path = locate(&directory, tail, iri).ok_or_else(|| no_segment(iri, &directory))?;
         let memory = inv
             .memory_budget()
             .map_or(ikigai_core::DEFAULT_STREAM_MEMORY, |b| b.remaining());
@@ -450,9 +448,7 @@ impl Endpoint for SegmentEndpoint {
         let options = window(inv)?;
 
         let directory = self.directory()?;
-        let path = locate(&directory, tail, &iri).ok_or_else(|| {
-            Error::NotFound(format!("no segment <{iri}> in {}", directory.display()))
-        })?;
+        let path = locate(&directory, tail, &iri).ok_or_else(|| no_segment(&iri, &directory))?;
         let text = read_segment(&path)?;
 
         // The golden thread is declared rather than acquired: this read did not
@@ -478,7 +474,7 @@ impl Endpoint for SegmentEndpoint {
         let repr = if face == TURTLE_MEDIA_TYPE {
             turtle_repr(
                 to_turtle(&text, &self.vocabulary, &options)
-                    .map_err(|e| Error::Endpoint(format!("<{iri}>: {e}")))?,
+                    .map_err(|e| Error::Endpoint(format!("<{}>: {e}", shown(&iri))))?,
             )
         } else {
             if !options.is_all() {
@@ -794,6 +790,17 @@ fn ends_finally(text: &str, vocabulary: &Vocabulary) -> bool {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// The refusal for a segment the directory does not hold, the requested IRI
+/// and the directory shown escaped.
+fn no_segment(iri: &str, directory: &Path) -> Error {
+    Error::NotFound(format!(
+        "no segment <{}> in {}",
+        shown(iri),
+        shown_path(directory)
+    ))
+}
+
+#[cfg(not(target_family = "wasm"))]
 /// The file a segment IRI names.
 ///
 /// The fast path derives the name the writer would have used
@@ -1069,7 +1076,7 @@ impl Endpoint for VerifyEndpoint {
             // blank body would read as the second.
             return Err(Error::NotFound(format!(
                 "no segments to verify in {}",
-                directory.display()
+                shown_path(&directory)
             )));
         }
         // NOT cacheable, for the reason the listing is not: the directory changes

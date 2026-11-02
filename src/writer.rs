@@ -75,7 +75,7 @@ use crate::chain::{seal_due, seal_for, Chain, RotationPolicy, SealPolicy, SealSi
 #[cfg(not(target_family = "wasm"))]
 use crate::config::Destination;
 use crate::config::LogConfig;
-use crate::line::{Entry, Header, Prev, RenderError, Timestamp, FORMAT_VERSION};
+use crate::line::{shown, shown_path, Entry, Header, Prev, RenderError, Timestamp, FORMAT_VERSION};
 use crate::vocabulary::{
     Vocabulary, LEVEL_CHANGE_CLASS, LOG_NS, PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS,
     ROTATION_CLASS,
@@ -125,23 +125,26 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::UnknownLevel { level, known } => write!(
                 f,
-                "level {level} is not defined by this vocabulary — it knows: {}",
-                known.join(", ")
+                "level {} is not defined by this vocabulary — it knows: {}",
+                shown(level),
+                shown(&known.join(", "))
             ),
             WriteError::NoDirectory => f.write_str(
                 "no log directory: set `directory` in log.toml, or give the process a HOME so \
                  the data home can be found",
             ),
             WriteError::SegmentExists(path) => {
-                write!(f, "{}: a segment is already there", path.display())
+                write!(f, "{}: a segment is already there", shown_path(path))
             }
             WriteError::InstanceInUse { name, tried } => write!(
                 f,
-                "instance {name} is held by another process and {tried} is too"
+                "instance {} is held by another process and {} is too",
+                shown(name),
+                shown(tried)
             ),
             WriteError::Io { path, message } => match path {
-                Some(path) => write!(f, "{}: {message}", path.display()),
-                None => f.write_str(message),
+                Some(path) => write!(f, "{}: {}", shown_path(path), shown(message)),
+                None => write!(f, "{}", shown(message)),
             },
             WriteError::Render(e) => write!(f, "{e}"),
         }

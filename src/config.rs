@@ -82,7 +82,7 @@ use oxrdf::{Literal, NamedNode, Term, Triple};
 use serde::Deserialize;
 
 use crate::chain::{RotationPolicy, SealPolicy};
-use crate::line::is_iri;
+use crate::line::{is_iri, shown, shown_path};
 use crate::vocabulary::LOG_NS;
 
 /// The config file stem the log layers: `log.toml` shared, `{app}.log.toml` as
@@ -299,16 +299,20 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Parse { path, message } => match path {
-                Some(path) => write!(f, "{}: {message}", path.display()),
-                None => write!(f, "{message}"),
+                Some(path) => write!(f, "{}: {}", shown_path(path), shown(message)),
+                None => write!(f, "{}", shown(message)),
             },
             ConfigError::BadValue {
                 key,
                 value,
                 expected,
             } => write!(f, "{key}: {value:?} is not {expected}"),
-            ConfigError::Unreadable { path, message } => write!(f, "{}: {message}", path.display()),
-            ConfigError::Unwritable { path, message } => write!(f, "{}: {message}", path.display()),
+            ConfigError::Unreadable { path, message } => {
+                write!(f, "{}: {}", shown_path(path), shown(message))
+            }
+            ConfigError::Unwritable { path, message } => {
+                write!(f, "{}: {}", shown_path(path), shown(message))
+            }
             ConfigError::NoConfigHome => {
                 f.write_str("no ikigai config home: neither XDG_CONFIG_HOME nor HOME is set")
             }

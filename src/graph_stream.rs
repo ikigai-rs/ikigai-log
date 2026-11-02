@@ -15,7 +15,7 @@ use oxrdf::Triple;
 use oxrdfio::WriterQuadSerializer;
 
 use crate::graph::{self, GraphBuilder, Options};
-use crate::line::{Entry, Header, Line, Seal};
+use crate::line::{shown, Entry, Header, Line, Seal};
 use crate::segments::MAX_SEGMENT_BYTES;
 use crate::vocabulary::{Vocabulary, LOG_KEY_NS, PROCESS_START_CLASS};
 
@@ -175,8 +175,9 @@ impl Input {
                 Line::Blank | Line::Comment(_) => {}
                 Line::Directive { name, .. } => {
                     return Err(graph_error(format!(
-                        "line {}: @{name} after the header block",
-                        self.lines.number
+                        "line {}: @{} after the header block",
+                        self.lines.number,
+                        shown(&name)
                     )))
                 }
             }
