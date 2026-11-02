@@ -5167,17 +5167,34 @@ fn concurrent_writers_rotate_a_segment_exactly_once() {
         .expect("closes");
 
     let segments = segments_on_disk(dir.path());
-    assert!(
-        segments.len() > 4,
-        "the policy really did roll the log several times: {} segment(s)",
-        segments.len()
-    );
     let report = verify_chain(&segments, Vocabulary::builtin());
     assert!(
         report.ok(),
         "★ the whole chain verifies across every rotation that happened under \
          concurrent writers:\n{}",
         report.render()
+    );
+    // HOW MANY segments there are is scheduling, not policy (ledger #2912).
+    // Between the writer that wins a rotation setting `rotating` and its
+    // `rotate` taking the state lock, the other writers keep landing entries in
+    // the segment being rolled, each deferring to the rotation in flight, so a
+    // rotator that is descheduled lets a segment grow far past the threshold.
+    // Idle, this test writes 21 segments; under load it has written 17, and CI
+    // once saw 4. What timing cannot change is stated instead: the log rolled
+    // at least once (the writer that crosses the threshold rotates, or defers
+    // to the one already rotating), and never more often than once per
+    // threshold crossed, the total of the per-segment check below.
+    let entries: u64 = report.segments.iter().map(|s| s.entries).sum();
+    assert!(
+        segments.len() >= 2,
+        "the policy rolled the log at least once: {} segment(s)",
+        segments.len()
+    );
+    assert!(
+        segments.len() as u64 <= entries / 25 + 1,
+        "★ {} segment(s) for {entries} entries: more rotations than thresholds \
+         crossed, so some segment rolled twice",
+        segments.len()
     );
     for segment in &report.segments[..report.segments.len() - 1] {
         assert!(

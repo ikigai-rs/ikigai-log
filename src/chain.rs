@@ -117,7 +117,7 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::line::{Entry, Header, Line, Prev, Seal, Timestamp};
+use crate::line::{shown, Entry, Header, Line, Prev, Seal, Timestamp};
 use crate::vocabulary::{
     Vocabulary, CONFIG_CHANGE_CLASS, LEVEL_CHANGE_CLASS, PROCESS_STOP_CLASS, ROTATION_CLASS,
 };
@@ -914,7 +914,7 @@ pub fn verify_segment(
             Ok(Line::Blank) | Ok(Line::Comment(_)) => {}
             Ok(Line::Directive { name, .. }) => findings.push(Finding::Malformed {
                 line: number,
-                detail: format!("@{name} after the header block"),
+                detail: format!("@{} after the header block", shown(&name)),
             }),
             Err(error) => findings.push(Finding::Malformed {
                 line: number,

@@ -46,6 +46,11 @@ Verified by reading the source:
   the line and paragraph separators as `\u{hex}`, so a reader or a screen reader moving line by
   line meets whole entries, and no value reaches the screen as a control sequence. A subject or
   class holding one is refused rather than written.
+- **An error is one printable line.** An error that quotes its input (`ParseError`,
+  `RenderError`, `GraphError`, `PrincipalError`, a verify finding about a malformed line) shows
+  those same characters escaped the same way, and the bidirectional format characters (U+202A to
+  U+202E, U+2066 to U+2069) as `\u{hex}` too, so quoted text cannot reorder the sentence around it
+  on screen.
 - Timestamps are fixed-width ISO 8601 in UTC with milliseconds and a `Z`.
 - The verify report says its outcome in words: `OK` or `BROKEN` per segment, `BROKEN` or `noted`
   per finding, and a total; an unsigned segment says `signed=none` rather than leaving it out.
@@ -64,6 +69,8 @@ Verified by reading the source:
 - `tests/control_characters.rs` pins that no written line holds a raw control character, that
   each escape reads back to the value logged through the parser, the verifier and both
   transreption paths, and that a segment written before the escape still reads and verifies.
+- `tests/error_text.rs` pins that every error quoting its input shows each such character, and
+  each bidirectional format character, escaped, and printable text as it is.
 - `tests/audit_904.rs`: `r8_a_damaged_segment_in_the_directory_is_reported` pins a
   `segment … BROKEN` line for a damaged file.
 
@@ -73,7 +80,7 @@ output.**
 
 ## Known limitations
 
-Found by reading the source on 2026-10-31:
+Found by reading the source on 2026-10-31 and 2026-11-02:
 
 - **Long opaque strings.** `#seal` lines, `@prev`, and the report's `prev=` and `head=` carry
   full SHA-256 digests, and a seal mismatch finding states two; a screen reader reads them
@@ -86,6 +93,12 @@ Found by reading the source on 2026-10-31:
 - **A parenthesized plural** ends the verify report (`verified 1 segment(s), 0 broken`), which a
   screen reader reads with the parentheses.
 - Times are always UTC; a reader converts to local time themselves.
+- **Names a verify report or a `WriteError` repeats as read.** A segment written before 0.9.2
+  can hold a control character in a header IRI or a class, and the verify report's segment line
+  and its other findings, and a `WriteError` naming a level or an instance, show such a name
+  unescaped.
+- **Bidirectional format characters in a log line** are written as they are, so a value holding
+  one can reorder the rest of that line on screen.
 - Every message is English only.
 
 ## Contributing
@@ -109,3 +122,4 @@ goes through [private vulnerability reporting](https://github.com/ikigai-rs/ikig
 |---|---|
 | 2026-10-31 | First version. |
 | 2026-11-02 | Control characters in values are escaped; the rule and its test are listed. |
+| 2026-11-02 | Errors show quoted input escaped, bidirectional format characters included. |

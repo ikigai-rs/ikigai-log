@@ -21,6 +21,14 @@ with the first release that changes a public name.
   the text after its backslash, so read new segments with 0.9.2 or later. The
   format version stays v1: the grammar gained one escape, and no line an earlier
   writer produced reads differently.
+- Error messages show the offending text escaped, so they stay one printable line
+  (ledger #2911). `ParseError`, `RenderError`, `GraphError::Iri` and `PrincipalError`,
+  and a verify finding naming a stray directive, write each character a line never
+  carries raw as the line writes it (`\n`, `\r`, `\t` or `\u{hex}`), and the
+  bidirectional format characters (U+202A to U+202E, U+2066 to U+2069) as `\u{hex}`;
+  everything else, a backslash included, is shown as it is. Before, each quoted its
+  input raw. Log lines are unchanged: they do not escape the bidirectional format
+  characters.
 
 ## 0.9.1
 
