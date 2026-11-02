@@ -59,6 +59,8 @@ impl SegmentBody {
         vocabulary: &Vocabulary,
         memory_bytes: usize,
     ) -> Result<(Self, bool)> {
+        // ambient: fs: opens one of the log's own segment files to pin its version for a streamed body
+        #[allow(clippy::disallowed_methods)]
         let file = File::open(path).map_err(io)?;
         let version = file.metadata().map_err(io)?;
         if version.len() > MAX_SEGMENT_BYTES as u64 {
@@ -135,6 +137,8 @@ impl SegmentBody {
 
     fn reader(&self, offset: u64) -> ByteStream {
         let opened = (|| {
+            // ambient: fs: reopens the pinned segment file, refused below if it changed
+            #[allow(clippy::disallowed_methods)]
             let mut file = File::open(&self.path).map_err(|_| changed())?;
             if !same_version(&self.version, &file.metadata().map_err(io)?) {
                 return Err(changed());
