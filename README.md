@@ -845,7 +845,11 @@ installs a tracer should expect to set them, and now it can.
 
 **One entry is one line.** It carries `grep`, the hash chain (which folds in each
 line exactly as written), and any rotation that reasons about a prefix of a file.
-Newlines inside values are escaped, never written.
+Newlines inside values are escaped, never written, and so is every other control
+character (C0, DEL, C1) and the line and paragraph separators: a value holding one
+is quoted and the character written as `\u{hex}`, which the parser reads back, so
+each entry stays one printable line. An IRI column has no quoting, so a subject or
+class holding one is refused rather than written.
 
 **A hash chain is tamper-evident, not omission-evident.** It proves nothing was
 altered; it cannot prove nothing was left out. So every legitimate source of
