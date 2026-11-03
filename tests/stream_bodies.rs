@@ -234,7 +234,10 @@ fn transrept_body_resolves_inline_reference_and_content_id() {
     )
     .unwrap();
     let store = Arc::new(MemoryContentStore::new(1 << 20));
-    let held = store.put(text.clone()).unwrap();
+    let session = Capability::scoped([ikigai_log::CAP_READ]);
+    let deliverer = session.with_principal("urn:fixture:alice").unwrap();
+    let other = session.with_principal("urn:fixture:bob").unwrap();
+    let held = store.put_for(&deliverer, text.clone()).unwrap();
     let source_text = text.clone();
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new()
@@ -253,6 +256,13 @@ fn transrept_body_resolves_inline_reference_and_content_id() {
             ),
     ))
     .with_content_store(store);
+    let content_request =
+        Request::new(Verb::Source, Iri::parse(ikigai_log::TRANSREPT_IRI).unwrap())
+            .with_arg("content", ArgRef::Content(held.id()));
+    assert!(matches!(
+        block_on(kernel.issue_body(content_request, &other)),
+        Err(ikigai_core::Error::NotFound(_))
+    ));
     for arg in [
         ArgRef::Inline(text),
         ArgRef::Reference(Iri::parse("urn:fixture").unwrap()),
@@ -260,7 +270,7 @@ fn transrept_body_resolves_inline_reference_and_content_id() {
     ] {
         let request = Request::new(Verb::Source, Iri::parse(ikigai_log::TRANSREPT_IRI).unwrap())
             .with_arg("content", arg);
-        let answer = block_on(kernel.issue_body(request, &Capability::root())).unwrap();
+        let answer = block_on(kernel.issue_body(request, &deliverer)).unwrap();
         assert_eq!(
             block_on(answer.collect(1 << 20)).unwrap().bytes,
             expected.as_bytes()
