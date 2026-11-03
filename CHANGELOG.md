@@ -3,6 +3,16 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
+## 0.10.0
+
+### Changed
+
+- Public API types now use ikigai-core 0.3.0 and its scoped content store
+  (ledger #2965). Runtime and test dependencies share that core release.
+- The content-ID transreption fixture holds content for its deliverer and checks
+  that another principal cannot read it.
+- The vocabulary version is 0.10.0; Brian must redeploy `/ns/log`.
+
 ## 0.9.3
 
 ### Fixed
