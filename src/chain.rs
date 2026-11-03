@@ -1110,6 +1110,7 @@ pub fn verify_chain(segments: &[(String, String)], vocab: &Vocabulary) -> ChainR
 pub(crate) enum WalkExtent {
     WholeChain,
     /// The final segment's successor is intentionally outside this walk.
+    #[cfg(not(target_family = "wasm"))] // Only file rotation verifies a window.
     Window,
 }
 
