@@ -483,14 +483,15 @@ impl LogHandle {
         // TWO segments, not one. Verifying only what this process just wrote
         // would be verifying our own arithmetic — it cannot fail. What can fail
         // is the segment BEFORE it, edited on disk while this process ran, and
-        // the LINK between the two. `verify_chain` over the pair checks both
+        // the LINK between the two. Verifying the pair as a window checks both
         // chains, the `@prev` link, and the level bracket, in one call. The
         // segment before is the one this writer actually followed, recorded at
         // open — not whichever file sorts just before it by name.
         //
         // Bounded at two on purpose: walking all of history on every rotation
         // would make rotation cost grow with the log. The full walk is
-        // `urn:log:verify`.
+        // `urn:log:verify`. The just-sealed segment names the successor that
+        // will open below, outside this window; its absence is expected.
         let verdict = closed.path.as_ref().map(|sealed_path| {
             let mut walk = Vec::new();
             let mut unreadable = Vec::new();
@@ -514,7 +515,11 @@ impl LogHandle {
                     e.to_string(),
                 )),
             }
-            let mut report = crate::chain::verify_chain(&walk, &vocabulary);
+            let mut report = crate::chain::verify_chain_walk(
+                &walk,
+                &vocabulary,
+                crate::chain::WalkExtent::Window,
+            );
             // Rotation remains best-effort, but an unreadable or over-budget
             // segment must leave a ChainBroken entry rather than vanish.
             report.segments.extend(unreadable);

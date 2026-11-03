@@ -3066,6 +3066,29 @@ fn forge_without(text: &str, drop: &str) -> String {
 }
 
 #[test]
+fn intact_rotations_do_not_record_chain_broken() {
+    let dir = Scratch::new("intact-rotations");
+    let handle = chained_handle(dir.path(), "bug:intact", "info", 1_700_000_000_000);
+    for now in [1_700_000_060_000, 1_700_000_120_000] {
+        handle
+            .rotate(at(now))
+            .expect("rotates")
+            .expect("file destination");
+    }
+    handle.close(at(1_700_000_121_000)).expect("closes");
+    let segments = segments_on_disk(dir.path());
+    assert_eq!(segments.len(), 3);
+    for (name, text) in &segments {
+        assert!(
+            !text.contains("log:ChainBroken"),
+            "an intact rotation must not report a broken chain in {name}:\n{text}"
+        );
+    }
+    let report = verify_chain(&segments, Vocabulary::builtin());
+    assert!(report.ok(), "{}", report.render());
+}
+
+#[test]
 fn a_rotation_that_cannot_verify_its_predecessor_lands_chain_broken_and_does_not_panic() {
     // Layer 4. The failure belongs in the record it is a failure of — an entry,
     // not an exception, because an exception would be caught by whatever was
