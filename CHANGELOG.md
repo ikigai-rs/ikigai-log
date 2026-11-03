@@ -3,6 +3,16 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
+## 0.9.3
+
+### Fixed
+
+- Rotation no longer writes a false `log:ChainBroken` entry for the segment it
+  just sealed (ledger #2951). Rotation verifies a bounded window whose final
+  successor is expected outside the walk. Whole-chain verification still reports
+  a missing newest segment, and rotation still checks the segments and the link
+  between them for tampering.
+
 ## 0.9.2
 
 ### Fixed

@@ -1099,8 +1099,26 @@ fn check_sequence(entry: &Entry, last_seq: &mut Option<u64>, findings: &mut Vec<
 ///
 /// `segments` is `(name, bytes)`, oldest first. Ordering is the caller's: within
 /// an instance the segment IRI sorts chronologically, because the stamp is
-/// fixed-width UTC.
+/// fixed-width UTC. The walk must include the head: a final segment that names
+/// an absent successor is reported as a truncated chain.
 pub fn verify_chain(segments: &[(String, String)], vocab: &Vocabulary) -> ChainReport {
+    verify_chain_walk(segments, vocab, WalkExtent::WholeChain)
+}
+
+/// Whether the walk reaches the chain's head or ends at a rotation boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkExtent {
+    WholeChain,
+    /// The final segment's successor is intentionally outside this walk.
+    #[cfg(not(target_family = "wasm"))] // Only file rotation verifies a window.
+    Window,
+}
+
+pub(crate) fn verify_chain_walk(
+    segments: &[(String, String)],
+    vocab: &Vocabulary,
+    extent: WalkExtent,
+) -> ChainReport {
     let mut reports: Vec<SegmentReport> = Vec::with_capacity(segments.len());
     for (_, text) in segments {
         let predecessor = reports
@@ -1148,12 +1166,14 @@ pub fn verify_chain(segments: &[(String, String)], vocab: &Vocabulary) -> ChainR
         }
         reports.push(report);
     }
-    if let Some(last) = reports.last_mut() {
-        if let Some(named) = last.successor.clone() {
-            last.findings.push(Finding::MissingSuccessor {
-                after: last.name.clone(),
-                successor: named,
-            });
+    if extent == WalkExtent::WholeChain {
+        if let Some(last) = reports.last_mut() {
+            if let Some(named) = last.successor.clone() {
+                last.findings.push(Finding::MissingSuccessor {
+                    after: last.name.clone(),
+                    successor: named,
+                });
+            }
         }
     }
     ChainReport { segments: reports }
