@@ -1695,7 +1695,7 @@ fn the_config_sink_declares_the_content_door() {
 use oxrdf::{NamedNodeRef, NamedOrBlankNode, Term as OxTerm, Triple};
 use oxrdfio::{RdfFormat, RdfParser};
 
-use crate::graph::{to_triples, to_turtle, GraphError, Options, LOG_MEDIA_TYPE, SIG_NS};
+use crate::graph::{to_triples, to_turtle, GraphError, Options, LOG_MEDIA_TYPE};
 use crate::segments::{SegmentEndpoint, TransreptEndpoint, SEGMENTS_IRI, TRANSREPT_IRI};
 
 const PROV: &str = "http://www.w3.org/ns/prov#";
@@ -2111,7 +2111,7 @@ fn a_seal_transrepts_as_what_it_says_and_asserts_nothing_about_its_validity() {
     assert!(states(
         &triples,
         &seal,
-        &format!("{SIG_NS}contentHash"),
+        ikigai_sign::SIG_CONTENT_HASH,
         string("sha256:4c1e0d")
     ));
     // The signature column is SPLIT: a line has columns and a graph does not, and
@@ -2120,13 +2120,13 @@ fn a_seal_transrepts_as_what_it_says_and_asserts_nothing_about_its_validity() {
     assert!(states(
         &triples,
         &seal,
-        &format!("{SIG_NS}algorithm"),
+        ikigai_sign::SIG_ALGORITHM,
         string("Ed25519")
     ));
     assert!(states(
         &triples,
         &seal,
-        &format!("{SIG_NS}value"),
+        ikigai_sign::SIG_VALUE,
         string("MEUCIQD")
     ));
 
@@ -2136,10 +2136,10 @@ fn a_seal_transrepts_as_what_it_says_and_asserts_nothing_about_its_validity() {
     assert!(states(
         &triples,
         &unsigned,
-        &format!("{SIG_NS}contentHash"),
+        ikigai_sign::SIG_CONTENT_HASH,
         string("sha256:9ab7")
     ));
-    assert!(objects(&triples, &unsigned, &format!("{SIG_NS}value")).is_empty());
+    assert!(objects(&triples, &unsigned, ikigai_sign::SIG_VALUE).is_empty());
 
     // Nothing anywhere claims a seal is valid, verified, or intact.
     let turtle = to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap();
@@ -2861,25 +2861,20 @@ fn a_signer_signs_the_tagged_hash_and_the_token_splits_into_the_graph() {
         states(
             &triples,
             &node,
-            "https://ikigai-rs.dev/ns/sign#algorithm",
+            ikigai_sign::SIG_ALGORITHM,
             string("Ed25519")
         ),
         "sig:algorithm, split out of the line's packed column"
     );
     assert!(
-        states(
-            &triples,
-            &node,
-            "https://ikigai-rs.dev/ns/sign#value",
-            string(value)
-        ),
+        states(&triples, &node, ikigai_sign::SIG_VALUE, string(value)),
         "sig:value is the signature ALONE, as it is in a signature-graph"
     );
     assert!(
         states(
             &triples,
             &node,
-            "https://ikigai-rs.dev/ns/sign#contentHash",
+            ikigai_sign::SIG_CONTENT_HASH,
             string(&seal.hash)
         ),
         "sig:contentHash is tagged at both ends, so the two producers join"
@@ -7105,5 +7100,21 @@ fn the_ontology_header_is_not_a_term() {
     assert!(
         vocab.levels().all(|(iri, _)| iri != ONTOLOGY_IRI),
         "the ontology is not a level"
+    );
+}
+
+#[test]
+fn sealed_graph_bytes_match_the_pre_vocabulary_registration_output() {
+    let (_, mut text) = written_segment("info", |_| {});
+    text.push_str("#seal 1-1 sha256:4c1e0d Ed25519:MEUCIQD\n");
+    text.push_str("#seal 2-2 sha256:9ab7\n");
+    text.push_str("#seal 3-3 sha256:abcd legacy-signature\n");
+    // The fixture was captured before replacing the local signature constants.
+    // Fix only the process ID so the writer output is stable across test runs.
+    let text = text.replace(&format!("pid={}", std::process::id()), "pid=42");
+    let turtle = to_turtle(&text, Vocabulary::builtin(), &Options::all()).unwrap();
+    assert_eq!(
+        turtle.as_bytes(),
+        include_bytes!("../tests/fixtures/sealed-graph.ttl")
     );
 }

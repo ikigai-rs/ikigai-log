@@ -55,21 +55,8 @@
 //!   ([`the_faces_emit_only_terms_the_vocabulary_defines`]): `Suite::namespace`
 //!   waives VOCABULARY for every `log:` term, so this file parses both Turtle
 //!   faces and requires every `log:` term to be a subject of
-//!   [`ikigai_log::VOCABULARY_TTL`]. `sig:` is `ikigai-sign`'s namespace,
-//!   defined in that crate's prose; the three terms a seal carries are held to
-//!   that list.
-//!
-//!   ★ **What a seal's terms would do WITHOUT that registration**: nothing
-//!   resolves them. `sig:` is not in `ikigai-vocab` and `ikigai-sign` publishes
-//!   no machine-readable vocabulary for it — the three terms are defined in that
-//!   crate's README prose — so VOCABULARY would report `sig:contentHash`,
-//!   `sig:algorithm` and `sig:value` as undefined the moment any walk reached a
-//!   sealed segment. `Suite::namespace(SIG_NS)` is therefore a real waiver
-//!   standing in for a vocabulary that does not exist yet, and the by-hand list
-//!   [`SIG_TERMS`] is this crate's local substitute for it. Whether `sig:` should
-//!   become a published vocabulary (in `ikigai-vocab`, or served from
-//!   `ikigai-sign`) is `ikigai-sign`'s question, recorded in
-//!   `ikigai-sign-PENDING.md` §1 and not settled here.
+//!   [`ikigai_log::VOCABULARY_TTL`]. The `sig:` terms are checked by the suite
+//!   against [`ikigai_sign::VOCABULARY_TTL`], without a namespace waiver.
 //! - **Each Sink is fired exactly once under root, and a refused write lands
 //!   nowhere** (in [`conforms`]): the kernel refuses `ENFORCED`'s no-grants call
 //!   before dispatch and this kernel has no tracer, so the only entry the walk
@@ -183,21 +170,14 @@ const T0: u64 = 1_700_000_000_000;
 /// under test.
 const CONFIG_BODY: &str = "level = \"info\"\n";
 
-/// The `sig:` terms a `#seal` line becomes — `ikigai-sign`'s, defined in that
-/// crate's README and nowhere machine-readable, so this is the list the face is
-/// held to.
-const SIG_TERMS: [&str; 3] = ["contentHash", "algorithm", "value"];
-
 /// Checkpoint on every entry, and never on time.
 ///
 /// The time bound is disabled because the kernel's clock here is [`Fixed`] and a
 /// time-based seal could never come due; the entry bound is 1 so the
 /// `log:ProcessStart` that `Writer::open_with` writes is sealed before the walk
 /// starts, and every face the walk probes over the segment carries the seal's
-/// three `sig:` terms. Without this the LIVE segment reaches no seal at all and
-/// DECLARATIONS reports `Suite::namespace(SIG_NS)` as scope nobody needs — which
-/// is how this was found. The module docs say why the fixture, not the
-/// registration, is the thing that was wrong.
+/// digest term. Without this the live walk would not exercise the published
+/// signature vocabulary.
 const SEAL_EVERY_ENTRY: SealPolicy = SealPolicy {
     every_entries: 1,
     every_millis: u64::MAX,
@@ -291,9 +271,8 @@ impl Log {
         }
         let path = segment_file(&dir);
         // The fixture's whole point, stated where it is cheap to see fail: an
-        // unsealed segment emits no `sig:` term, and then `Suite::namespace`
-        // registers scope nothing uses. DECLARATIONS catches that too, but from
-        // the far end of a walk.
+        // unsealed segment emits no `sig:` term, leaving the published signature
+        // vocabulary unexercised.
         assert!(
             std::fs::read_to_string(&path)
                 .expect("the segment file reads")
@@ -367,14 +346,14 @@ fn reader() -> Capability {
 }
 
 /// The suite, configured for this module (the file docs say why each line): the
-/// two namespaces the faces use beside the well-known ones, a real segment for
+/// log namespace and published signature vocabulary, a real segment for
 /// the transreptor and the segment's own tail for the template, the one pure
 /// function declared as such, and both space constructors declared host-named.
 fn suite(log: &Log) -> Suite {
     Suite::new()
         .checks(Checks::all())
         .namespace(LOG_NS)
-        .namespace(SIG_NS)
+        .vocabulary(ikigai_sign::VOCABULARY_TTL)
         .fixture(Fixture::new(TRANSREPT, Verb::Source).arg("content", log.text()))
         .fixture(Fixture::new(CONFIG, Verb::Sink).arg("content", CONFIG_BODY))
         .fixture(Fixture::new(SEGMENT, Verb::Source).binding("segment", log.tail()))
@@ -648,9 +627,9 @@ fn declared_outputs_are_the_media_types_served() {
 
 /// `Suite::namespace(LOG_NS)` waives VOCABULARY for every `log:` term, defined
 /// or not, so the promise it makes is checked here: every `log:` predicate and
-/// class either Turtle face emits is a subject of [`VOCABULARY_TTL`], every
-/// `sig:` term is one of the three a seal carries, and everything else is
-/// well-known. Over the finished segment, so the face has a seal in it.
+/// class either Turtle face emits is a subject of [`VOCABULARY_TTL`]. The suite
+/// checks `sig:` against its published vocabulary. Over the finished segment,
+/// so the face has a seal in it.
 #[test]
 fn the_faces_emit_only_terms_the_vocabulary_defines() {
     let log = Log::new(true);
@@ -702,18 +681,13 @@ fn the_faces_emit_only_terms_the_vocabulary_defines() {
                     defined.contains(term),
                     "the {name} face emits log:{local}, which vocabulary.ttl does not define"
                 );
-            } else if let Some(local) = term.strip_prefix(SIG_NS) {
-                assert!(
-                    SIG_TERMS.contains(&local),
-                    "the {name} face emits sig:{local}, which ikigai-sign does not define"
-                );
-            } else {
+            } else if !term.starts_with(SIG_NS) {
                 assert!(rdf::is_defined(term, &[]), "{name}: `{term}` is nobody's");
             }
         }
         if name == "segment" {
             assert!(
-                terms.contains(&format!("{SIG_NS}contentHash")),
+                terms.contains(ikigai_sign::SIG_CONTENT_HASH),
                 "a sealed segment's face carries the seal's digest: {terms:?}"
             );
         }
@@ -803,5 +777,51 @@ fn the_fixture_ids_are_the_description_ids() {
             .describe(&Iri::parse(iri).unwrap())
             .unwrap_or_else(|| panic!("{iri} describes itself"));
         assert_eq!(description.id, id, "{iri}");
+    }
+}
+
+/// Exercise all three seal predicates, and prove the published vocabulary does
+/// not waive a misspelled signature term as the old namespace registration did.
+#[test]
+fn signature_vocabulary_checks_signed_seals_and_rejects_unknown_terms() {
+    use ikigai_core::{Description, Exact, FnEndpoint, Invocation, ReprType};
+
+    let golden = include_str!("fixtures/sealed-graph.ttl");
+    for (text, expected_findings) in [
+        (golden.to_string(), 0),
+        (golden.replace("sig:contentHash", "sig:contentHahs"), 1),
+    ] {
+        let endpoint = FnEndpoint::new("sealed-graph", move |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/turtle"),
+                text.as_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("sealed-graph")
+                .verb(Verb::Source)
+                .output("text/turtle"),
+        );
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:sealed-graph"), endpoint),
+        ));
+        let report = Suite::new()
+            .checks(Checks::VOCABULARY)
+            .namespace(LOG_NS)
+            .vocabulary(ikigai_sign::VOCABULARY_TTL)
+            .run_blocking(&kernel);
+        assert_eq!(
+            report.of(Check::Vocabulary).count(),
+            expected_findings,
+            "{report}"
+        );
+        if expected_findings != 0 {
+            assert!(report
+                .of(Check::Vocabulary)
+                .next()
+                .unwrap()
+                .detail
+                .contains("contentHahs"));
+        }
     }
 }

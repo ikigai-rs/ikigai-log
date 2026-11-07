@@ -3,6 +3,17 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
+## 0.10.1
+
+### Changed
+
+- Conformance checks signature terms against ikigai-sign's published vocabulary,
+  replacing the namespace waiver and local term list (ledger #2370).
+- Graph emission uses ikigai-sign's public constants. A byte-for-byte fixture
+  preserves the existing signed, unsigned, and legacy seal output.
+- The vocabulary version is 0.10.1; no terms changed. This change does not publish
+  the crate; publication remains Brian's.
+
 ## 0.10.0
 
 ### Changed
