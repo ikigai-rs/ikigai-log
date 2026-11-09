@@ -92,6 +92,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ikigai_sign::{SIG_ALGORITHM, SIG_CONTENT_HASH, SIG_VALUE};
 use oxrdf::{Literal, NamedNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
@@ -112,7 +113,7 @@ pub const TURTLE_MEDIA_TYPE: &str = "text/turtle";
 /// `sig:contentHash` / `sig:value` rather than minting parallel terms — which is
 /// what makes ikigai-log the second consumer that crate names as its own
 /// promotion trigger.
-pub const SIG_NS: &str = "https://ikigai-rs.dev/ns/sign#";
+pub use ikigai_sign::SIG_NS;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -143,10 +144,6 @@ const LOG_ENTRY_CLASS: &str = crate::vocabulary::ENTRY_CLASS;
 const LOG_INVOKED: &str = "https://ikigai-rs.dev/ns/log#invoked";
 const LOG_FIRST_SEQUENCE: &str = "https://ikigai-rs.dev/ns/log#firstSequence";
 const LOG_LAST_SEQUENCE: &str = "https://ikigai-rs.dev/ns/log#lastSequence";
-
-const SIG_CONTENT_HASH: &str = "https://ikigai-rs.dev/ns/sign#contentHash";
-const SIG_VALUE: &str = "https://ikigai-rs.dev/ns/sign#value";
-const SIG_ALGORITHM: &str = "https://ikigai-rs.dev/ns/sign#algorithm";
 
 /// The `key=` columns whose values are joined into `log:invoked`. Read from the
 /// vocabulary by property IRI rather than hard-coded by column name, so a
