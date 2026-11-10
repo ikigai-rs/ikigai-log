@@ -724,6 +724,57 @@ retried at the next write, and an orderly close reports it), is not a drop.
 **There is no sampling**, for the same reason: sampling is holes everywhere with
 no brackets.
 
+### One door line: who did what
+
+A host's doors write one `log:Access` entry per request through `AccessLog`, and
+no host keeps a private access log. It is gonk's door line, generalized, with every
+column declared in `vocabulary.ttl`, so a segment transrepts with no host-specific
+parsing:
+
+```
+2026-11-10T22:41:06.120Z log:Access urn:cms:page:home seq=7 door=web verb=GET outcome=ok bytes=5120 dur=12 principal=urn:agent:alice credential=https://ikigai-rs.dev/ns/log#passkey grant=urn:grant:cms:read q=lang=en
+```
+
+| column | property | holds |
+|---|---|---|
+| the subject | `log:requested` | what the request asked for |
+| `door=` | `log:door` | which door served it (`web`, `wire`, `cli`) |
+| `verb=` | `log:verb` | the verb it was made with |
+| `outcome=` | `log:outcome` | `ok`, or one error-kind token |
+| `bytes=` | `log:byteCount` | bytes sent back |
+| `dur=` | `log:durationMs` | milliseconds |
+| `principal=` | `log:onBehalfOf` | the authenticated principal, or `anon` |
+| `credential=` | `log:credentialKind` | `log:passkey`, `log:clientCertificate`, `log:socketOwner` or `log:anonymous`, as an IRI |
+| `grant=` | `log:grant` | the grant that authorized the call, as an IRI |
+| `q=` | `log:servedQuery` | the served arguments, percent-encoded `name=value` pairs joined by `&` |
+
+```rust
+let doors = AccessLog::new(handle, clock);
+let caller = Caller::authenticated(Principal::new(peer)?, Credential::ClientCertificate);
+let answer = kernel.issue_traced(request, capability, doors.tracer_for(&caller)).await?;
+doors.record(&Access::new(started, subject, "wire", "SOURCE", "ok", caller)
+    .bytes(answer.bytes.len() as u64)
+    .duration_ms(elapsed))?;
+```
+
+* **Attribution is per request.** `tracer_for` is the per-call tracer for
+  `Kernel::issue_traced`, so the kernel's entries for the request carry the same
+  principal as its door line. A principal on the global `set_tracer` tracer would
+  credit every tenant's work to the process.
+* **What is never written.** An `Access` has no field for a cookie, an
+  `Authorization` header, a session or wire token or a form body, and an argument
+  named for one (`content`, `body`, `cookie`, `authorization`, or any name holding
+  `session`, `token`, `password` or `secret`) is left out of `q=`. An anonymous
+  caller is `Caller::Anonymous`, which carries no data: its line says
+  `principal=anon` and nothing more, with no address and no fingerprint. In the
+  graph that is the literal `"anon"` and no `prov:Delegation`, because there is
+  no agent to name.
+* **Long fields are cut and marked.** The subject and each free-text column are
+  percent-encoded to ASCII, then cut at `MAX_FIELD` (256 bytes) and ended with
+  `…`. Percent-encoding never writes `…`, so the marker is never part of a value.
+* `log:Access` sits at `info`: it lands at the default level and an operator
+  can turn it off by setting the dial to `warn` or `error`.
+
 ## One dial, and a floor it cannot reach
 
 The verbosity level is a **vocabulary fact**: `log:rank` orders the ladder,

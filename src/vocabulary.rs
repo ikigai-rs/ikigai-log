@@ -143,6 +143,9 @@ pub const RESOLUTION_CLASS: &str = "https://ikigai-rs.dev/ns/log#Resolution";
 /// highest-volume, lowest-information events, so they sit at `trace`, one notch
 /// above the resolutions they are otherwise identical to.
 pub const CACHE_HIT_CLASS: &str = "https://ikigai-rs.dev/ns/log#CacheHit";
+/// `log:Access` — one request a host's door served, written by
+/// [`crate::AccessLog`]. At `info`.
+pub const ACCESS_CLASS: &str = "https://ikigai-rs.dev/ns/log#Access";
 /// `log:Dropped` — always-land. What an observer that cannot fail upward leaves
 /// behind when it loses something.
 pub const DROPPED_CLASS: &str = "https://ikigai-rs.dev/ns/log#Dropped";

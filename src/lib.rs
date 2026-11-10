@@ -122,6 +122,16 @@
 //! nothing is sampled, because a sampled log is holes with no brackets and a
 //! hash chain is not omission-evident. [`tracer`] has the whole argument.
 //!
+//! ## Who did what: one door line
+//!
+//! [`AccessLog`] is the line a host's doors write, one `log:Access` per request:
+//! subject, door, verb, outcome, bytes, duration, principal, credential kind,
+//! grant and the served arguments, every column declared in the vocabulary.
+//! [`AccessLog::tracer_for`] is the per-call tracer for `Kernel::issue_traced`,
+//! so the kernel's entries for the request carry the same caller. No cookie,
+//! header, token or body is written, and an anonymous caller is `anon` and
+//! nothing more. [`access`] has the rules.
+//!
 //! ## What this crate is not, yet
 //!
 //! SHACL on write and retention with `log:Tombstone` are still ahead.
@@ -138,6 +148,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod chain;
 pub mod config;
 pub mod endpoints;
@@ -156,6 +167,11 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use access::{
+    is_withheld, Access, AccessError, AccessLog, Caller, Credential, Grant, ANONYMOUS_CREDENTIAL,
+    CLIENT_CERTIFICATE_CREDENTIAL, CUT_MARKER, MAX_FIELD, MAX_GRANT_LEN, PASSKEY_CREDENTIAL,
+    SOCKET_OWNER_CREDENTIAL, WITHHELD_ARGUMENTS,
+};
 pub use chain::{
     head_of, split_signature, tagged, verify_chain, verify_segment, Chain, ChainReport, Finding,
     RotationPolicy, SealPolicy, SealSigner, SegmentReport, HASH_ALGORITHM,
@@ -181,15 +197,15 @@ pub use segments::{
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
 pub use tracer::{
     class_for, entry_for, entry_for_principal, principal_of, LogTracer, Principal, PrincipalError,
-    DROP_REASONS, MAX_PRINCIPAL_LEN, NOT_RESOLVED_NOTES,
+    ANONYMOUS_PRINCIPAL, DROP_REASONS, MAX_PRINCIPAL_LEN, NOT_RESOLVED_NOTES,
 };
 pub use vocabulary::{
-    ClassDef, KeyDef, VocabError, Vocabulary, CACHE_HIT_CLASS, CAPABILITY_DENIED_CLASS,
-    CHAIN_BROKEN_CLASS, CONFIG_CHANGE_CLASS, DEFAULT_MIN_LEVEL, DEPTH_EXCEEDED_CLASS,
-    DROPPED_CLASS, ENDPOINT_DENIED_CLASS, ENTRY_CLASS, ERROR_CLASS, FAILED_KEY, LEVEL_CHANGE_CLASS,
-    LEVEL_CHANGE_REJECTED_CLASS, LOG_KEY_NS, LOG_NS, MESSAGE_CLASS, NOT_RESOLVED_CLASS,
-    ON_BEHALF_OF_PROPERTY, PRINCIPAL_KEY, PROCESS_START_CLASS, PROCESS_STOP_CLASS, PROV_NS,
-    RESOLUTION_CLASS, ROTATION_CLASS, VOCABULARY_TTL, WARNING_CLASS,
+    ClassDef, KeyDef, VocabError, Vocabulary, ACCESS_CLASS, CACHE_HIT_CLASS,
+    CAPABILITY_DENIED_CLASS, CHAIN_BROKEN_CLASS, CONFIG_CHANGE_CLASS, DEFAULT_MIN_LEVEL,
+    DEPTH_EXCEEDED_CLASS, DROPPED_CLASS, ENDPOINT_DENIED_CLASS, ENTRY_CLASS, ERROR_CLASS,
+    FAILED_KEY, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS, LOG_KEY_NS, LOG_NS, MESSAGE_CLASS,
+    NOT_RESOLVED_CLASS, ON_BEHALF_OF_PROPERTY, PRINCIPAL_KEY, PROCESS_START_CLASS,
+    PROCESS_STOP_CLASS, PROV_NS, RESOLUTION_CLASS, ROTATION_CLASS, VOCABULARY_TTL, WARNING_CLASS,
 };
 pub use writer::{Closed, ClosureSink, LineSink, WriteError, Writer, WriterOptions};
 #[cfg(not(target_family = "wasm"))]
