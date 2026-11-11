@@ -240,6 +240,8 @@ pub struct Writer {
     vocabulary: Arc<Vocabulary>,
     sink: Box<dyn LineSink>,
     seq: u64,
+    /// A complete line was accepted but has not yet been flushed successfully.
+    needs_flush: bool,
     /// The running hash over the header and every entry written so far. In
     /// memory only — a hash per line would wreck `grep`.
     chain: Chain,
@@ -636,6 +638,7 @@ impl Writer {
             vocabulary,
             sink,
             seq: 0,
+            needs_flush: false,
             chain,
             sealed_through: 0,
             sealed_head,
@@ -695,7 +698,12 @@ impl Writer {
     /// Append one entry, if this segment's level includes its class.
     ///
     /// Returns the sequence number written, or `None` when the level dial
-    /// excluded it. `seq=` goes on the line explicitly and first: it is
+    /// excluded it. A flush error can occur after the sink accepted the complete
+    /// line; that line still consumes its sequence and advances the chain. An
+    /// I/O error does not guarantee that nothing was written, so callers must
+    /// not blindly retry the same entry.
+    ///
+    /// `seq=` goes on the line explicitly and first: it is
     /// recoverable from line position, but a line that has been grepped out of
     /// its file has lost its position, and a seal range names sequences. Eight
     /// bytes buys a self-identifying line, in a format that already trades
@@ -722,13 +730,16 @@ impl Writer {
         }
         .render(&self.header.prefixes)?;
         guarded(|| self.sink.write_line(&line)).map_err(|e| io_error(&self.path, e))?;
-        // Per entry, deliberately. See the module docs.
-        guarded(|| self.sink.flush()).map_err(|e| io_error(&self.path, e))?;
+        // A successful write_line accepted the complete line. Commit that fact
+        // before flushing: a flush error cannot undo bytes already accepted.
+        self.needs_flush = true;
         self.seq = seq;
         // The chain folds in the line as WRITTEN — the same bytes a verifier
         // will read back — so the two agree by construction rather than by two
         // implementations of one rule.
         self.chain.advance(&line);
+        // Per entry, deliberately. See the module docs.
+        self.flush_pending()?;
         if seal_due(
             &self.seals,
             self.seq,
@@ -737,12 +748,11 @@ impl Writer {
             self.last_seal_at,
         ) {
             // ★ A seal that fails here does NOT fail the write: the entry is
-            // already on disk and in the chain, and `Err` from this method
-            // means the entry did not land — a caller that retried on it would
-            // write the entry twice (#904 item 9). The seal is still owed:
-            // `sealed_through` has not moved, so the next write tries again,
-            // and an orderly close or rotation seals explicitly and DOES report
-            // a failure.
+            // already flushed and in the chain. Reporting an automatic seal
+            // failure as an entry failure could make a caller write it twice
+            // (#904 item 9). A failed seal write is still owed; a failed seal
+            // flush leaves needs_flush set. Later writes, explicit seals, and
+            // orderly close retry the outstanding work.
             let _ = self.seal(time);
         }
         Ok(Some(seq))
@@ -750,11 +760,13 @@ impl Writer {
 
     /// Commit everything written since the last checkpoint as a `#seal` line.
     ///
-    /// A no-op when there is nothing new: a seal over an empty range would state
+    /// No new seal when there is nothing new; a previously failed flush is
+    /// retried. A seal over an empty range would state
     /// a hash already stated and add a line whose only effect is to make the
     /// range arithmetic wrong.
     pub fn seal(&mut self, now: Timestamp) -> Result<Option<crate::line::Seal>, WriteError> {
         if self.seq <= self.sealed_through {
+            self.flush_pending()?;
             return Ok(None);
         }
         let seal = seal_for(
@@ -764,11 +776,20 @@ impl Writer {
             self.signer.as_deref(),
         );
         guarded(|| self.sink.write_line(&seal.render())).map_err(|e| io_error(&self.path, e))?;
-        guarded(|| self.sink.flush()).map_err(|e| io_error(&self.path, e))?;
+        self.needs_flush = true;
         self.sealed_through = self.seq;
         self.sealed_head = self.chain.head().to_string();
         self.last_seal_at = now;
+        self.flush_pending()?;
         Ok(Some(seal))
+    }
+
+    fn flush_pending(&mut self) -> Result<(), WriteError> {
+        if self.needs_flush {
+            guarded(|| self.sink.flush()).map_err(|e| io_error(&self.path, e))?;
+            self.needs_flush = false;
+        }
+        Ok(())
     }
 
     /// The chain head: the last sealed hash, or h₀ while nothing is sealed.
@@ -910,10 +931,10 @@ impl Writer {
 /// turned into an ordinary write error, which every caller here already knows
 /// how to report.
 ///
-/// Nothing is left half-done by the conversion: the sink is called before the
-/// sequence advances and before the chain folds the line in, so a sink that
-/// fails — by returning `Err` or by unwinding — leaves the writer exactly as it
-/// was.
+/// A sink failure can leave bytes behind, just like an I/O error. A successful
+/// complete-line write advances the sequence and chain before its flush is
+/// attempted, so a flush failure never makes the writer reuse that sequence.
+/// A failed write may be partial; the writer cannot roll back a host sink.
 fn guarded<T>(call: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     match catch_unwind(AssertUnwindSafe(call)) {
         Ok(result) => result,
@@ -966,6 +987,7 @@ pub(crate) fn reserve_segment(
     name: &str,
     now: Timestamp,
 ) -> Result<Reserved, WriteError> {
+    now.validate()?;
     let base = stamp(now);
     for attempt in 0..MAX_STAMP_ATTEMPTS {
         let stamp = if attempt == 0 {

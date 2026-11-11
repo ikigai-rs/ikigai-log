@@ -5,6 +5,16 @@ with the first release that changes a public name.
 
 ## Unreleased
 
+### Fixed
+
+- A flush failure after a complete entry or seal write no longer makes the writer
+  reuse its sequence number or repeat the seal. A later explicit seal retries an
+  outstanding flush without appending another checkpoint (ledger #3436). I/O
+  errors can occur after bytes were accepted; callers must not blindly retry an entry.
+- Entry and header rendering refuse timestamps beyond year 9999 with
+  `RenderError::Timestamp`, before writing a line or reserving a segment file.
+  Accepted timestamps keep the v1 parser's fixed-width format (ledger #3436).
+
 ### Added
 
 - `AccessLog`, the one door line every host shares (ledger #3390): a `log:Access`

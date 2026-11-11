@@ -86,6 +86,9 @@ Verified by reading the source:
   report's segment line, the streaming transreptor's errors and the endpoints' answers naming a
   request show each such character, and each bidirectional format character, escaped, and
   printable text as it is.
+- `tests/audit_3436.rs` checks that entry and header rendering refuse timestamps
+  beyond year 9999 with a printable error, and that the first and last supported
+  timestamps and payloads round-trip through lines and Turtle.
 - `tests/audit_904.rs`: `r8_a_damaged_segment_in_the_directory_is_reported` pins a
   `segment … BROKEN` line for a damaged file.
 
