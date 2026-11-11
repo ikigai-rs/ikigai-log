@@ -675,9 +675,9 @@ impl LogHandle {
         #[cfg(not(target_family = "wasm"))]
         if _rotation_due {
             if let Err(e) = self.rotate_if_due(now) {
-                // ★ The entry LANDED, so this write is not an error: `Err` from
-                // a write means the entry did not land, and a caller (the tracer
-                // above all) that read a rotation failure as a lost entry counted
+                // ★ The entry was already flushed, so a rotation failure must
+                // not turn it into a write error. A caller (the tracer above
+                // all) that read a rotation failure as a lost entry counted
                 // drops that never happened and wrote `log:Dropped` markers that
                 // lied (#904 item 10). The failure is recorded instead — once per
                 // run of failures, in the log it is about, and on the handle.

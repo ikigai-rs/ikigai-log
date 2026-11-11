@@ -103,6 +103,8 @@ impl std::error::Error for ParseError {}
 /// silently writing that into a hash-chained file is worse than refusing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderError {
+    /// Milliseconds since the Unix epoch exceed the four-digit year format.
+    Timestamp(u64),
     /// A token that must be an absolute IRI is not one.
     NotAnIri(String),
     /// A key that is not `[A-Za-z][A-Za-z0-9_.-]*`.
@@ -113,6 +115,10 @@ pub enum RenderError {
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RenderError::Timestamp(millis) => write!(
+                f,
+                "timestamp {millis} milliseconds since the Unix epoch is outside 1970 through 9999"
+            ),
             RenderError::NotAnIri(s) => write!(f, "not an absolute IRI: {}", shown(s)),
             RenderError::Key(s) => write!(f, "not a usable key: {}", shown(s)),
         }
@@ -204,7 +210,16 @@ impl Timestamp {
         self.0
     }
 
-    /// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+    pub(crate) fn validate(self) -> Result<(), RenderError> {
+        // 9999-12-31T23:59:59.999Z, the last instant the v1 parser accepts.
+        if self.0 > 253_402_300_799_999 {
+            return Err(RenderError::Timestamp(self.0));
+        }
+        Ok(())
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS.mmmZ`. Values beyond year 9999 render with a
+    /// wider year; entry and header rendering refuse them in the v1 format.
     pub fn render(self) -> String {
         let days = (self.0 / 86_400_000) as i64;
         let rem = self.0 % 86_400_000;
@@ -561,6 +576,7 @@ impl Entry {
 
     /// Render the line (no trailing newline). Never contains a raw newline.
     pub fn render(&self, prefixes: &BTreeMap<String, String>) -> Result<String, RenderError> {
+        self.time.validate()?;
         if !is_writable_iri(&self.subject) {
             return Err(RenderError::NotAnIri(self.subject.clone()));
         }
@@ -793,6 +809,7 @@ impl Header {
     /// Render the header block, ending with the blank line that separates it
     /// from the entries.
     pub fn render(&self) -> Result<String, RenderError> {
+        self.started.validate()?;
         for iri in [&self.name, &self.instance, &self.level] {
             if !is_writable_iri(iri) {
                 return Err(RenderError::NotAnIri(iri.clone()));
