@@ -3,6 +3,24 @@
 Earlier releases are described in their commit messages and pull requests; this file starts
 with the first release that changes a public name.
 
+## Unreleased
+
+### Added
+
+- `AccessLog`, the one door line every host shares (ledger #3390): a `log:Access`
+  entry per request with `door=`, `verb=`, `outcome=`, `bytes=`, `dur=`,
+  `principal=`, `credential=`, `grant=` and `q=`, written through the log's writer.
+  `AccessLog::tracer_for` gives the per-call tracer for `Kernel::issue_traced`, so
+  the kernel's entries for a request carry its caller. No cookie, `Authorization`
+  header, session or wire token, form body or `content` argument is written, and an
+  anonymous caller is `principal=anon` and nothing more. Long fields are cut at
+  `MAX_FIELD` and end with `…`.
+- Vocabulary: `log:Access`, `log:requested`, `log:door`, `log:verb`, `log:outcome`,
+  `log:byteCount`, `log:credentialKind`, `log:grant`, `log:servedQuery`, and the
+  `log:CredentialKind` individuals `log:passkey`, `log:clientCertificate`,
+  `log:socketOwner` and `log:anonymous`. The version is not bumped here: the release
+  that ships these terms needs a crate publish and an `/ns/log` redeploy, both Brian's.
+
 ## 0.10.1
 
 ### Changed

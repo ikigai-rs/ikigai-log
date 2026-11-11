@@ -174,6 +174,7 @@ fn every_class_is_placeable_on_the_dial() {
         log("Config"),
         log("Destination"),
         log("Cadence"),
+        log("CredentialKind"),
     ];
     for class in vocab.classes() {
         if structural.contains(&class.iri) {

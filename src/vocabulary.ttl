@@ -336,6 +336,99 @@ log:scopeClockMs a rdf:Property ;
     rdfs:comment "What a temporal corridor's derived clock read as the event was recorded, in milliseconds since the epoch (ikigai_core::SCOPE_CLOCK_NOTE). Only beside log:scopeChain. The corridor's name is a claim about time; this is what the kernel observed. The kernel's own clock stays on prov:startedAtTime." .
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Door requests — who did what, one line per request a host's door served
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Written by ikigai_log::AccessLog, the one door line every host shares (ledger
+# #3390): gonk's `gonk:Access` line, generalized. A host's door calls it once
+# per request with what it knows, and nothing here parses a host's own format.
+# What is never written is the helper's rule, not each host's: no cookie, no
+# Authorization header, no session or wire token, no form body or `content`
+# argument, and nothing that identifies an anonymous caller.
+
+log:Access a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:info ;
+    log:subjectPredicate log:requested ;
+    rdfs:label "Access" ;
+    rdfs:comment "One request a host's door served: who asked (log:onBehalfOf, and log:credentialKind for how the door knew), what they asked for (the subject column, log:door, log:verb, log:servedQuery), under which grant (log:grant), and how it went (log:outcome, log:byteCount, log:durationMs). The kernel's own entries for the same request carry the same principal, because the door issues it with a per-call tracer for that caller. At log:info, the day-to-day default, so the record of who did what lands unless an operator turns the dial down to warn or error, and NOT always-land: a refused authority is already a log:CapabilityDenied, which is." .
+
+log:requested a rdf:Property ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "requested" ;
+    rdfs:comment "The resource a door request asked for: the subject column of a log:Access. NOT a sub-property of prov:used: a refused or failed request used nothing, and log:outcome says which it was." .
+
+log:door a rdf:Property ;
+    log:keyName "door" ;
+    rdfs:domain log:Access ;
+    rdfs:range xsd:string ;
+    rdfs:label "door" ;
+    rdfs:comment "Which of the host's doors served the request, as the host names it (`web`, `wire`, `cli`). A name for the door, never anything about the caller: not an address and not a port." .
+
+log:verb a rdf:Property ;
+    log:keyName "verb" ;
+    rdfs:domain log:Access ;
+    rdfs:range xsd:string ;
+    rdfs:label "verb" ;
+    rdfs:comment "The verb the request was made with, as the door received it (an HTTP method, an ikigai verb)." .
+
+log:outcome a rdf:Property ;
+    log:keyName "outcome" ;
+    rdfs:domain log:Access ;
+    rdfs:range xsd:string ;
+    rdfs:label "outcome" ;
+    rdfs:comment "How the request ended, as one token: `ok`, or the kind of error the door answered with (`denied`, `not-found`, …). Never the error's message, which may carry a path or a host." .
+
+log:byteCount a rdf:Property ;
+    log:keyName "bytes" ;
+    rdfs:domain log:Access ;
+    rdfs:range xsd:integer ;
+    rdfs:label "byteCount" ;
+    rdfs:comment "How many bytes the door sent back in answer." .
+
+log:CredentialKind a rdfs:Class ;
+    rdfs:label "CredentialKind" ;
+    rdfs:comment "How a door knew who its caller was. Individuals rather than strings, so a query can join on one and a reader can ask what it means. The kind and never the credential: a passkey's id, a certificate's fingerprint or a socket's peer id is the principal's business, not this column's." .
+
+log:passkey a log:CredentialKind ;
+    rdfs:label "passkey" ;
+    rdfs:comment "A WebAuthn passkey assertion." .
+
+log:clientCertificate a log:CredentialKind ;
+    rdfs:label "clientCertificate" ;
+    rdfs:comment "A TLS client certificate." .
+
+log:socketOwner a log:CredentialKind ;
+    rdfs:label "socketOwner" ;
+    rdfs:comment "The operating-system owner of a local socket's peer process." .
+
+log:anonymous a log:CredentialKind ;
+    rdfs:label "anonymous" ;
+    rdfs:comment "No credential: the door did not authenticate the caller. Its log:Access carries the principal `anon` and nothing that identifies the caller: no address, no fingerprint, no session." .
+
+log:credentialKind a rdf:Property ;
+    log:keyName "credential" ;
+    rdfs:domain log:Access ;
+    rdfs:range log:CredentialKind ;
+    rdfs:label "credentialKind" ;
+    rdfs:comment "How the door authenticated the request's principal: one of the log:CredentialKind individuals, written as its IRI." .
+
+log:grant a rdf:Property ;
+    log:keyName "grant" ;
+    rdfs:domain log:Access ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "grant" ;
+    rdfs:comment "The grant that authorized the request, as its IRI: the policy the door applied, never a token that carries it." .
+
+log:servedQuery a rdf:Property ;
+    log:keyName "q" ;
+    rdfs:domain log:Access ;
+    rdfs:range xsd:string ;
+    rdfs:label "servedQuery" ;
+    rdfs:comment "The arguments the door served, as `name=value` pairs joined by `&`, each name and value percent-encoded. An argument that carries a secret or a body (a `content`, `body`, `cookie`, `authorization`, session, token or password argument) is left out by name. Like every free-text column a log:Access carries, cut at ikigai_log::MAX_FIELD bytes and ended with `…` when it is cut: percent-encoding writes ASCII only, so a `…` there is always the cut marker and never part of a value." .
+
+# ═══════════════════════════════════════════════════════════════════════════
 # The unstructured escape hatch — permitted, honest, and MEASURABLE
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -386,52 +386,22 @@ impl Principal {
     /// The principal named by `iri`, or why it cannot be one.
     pub fn new(iri: impl Into<String>) -> Result<Principal, PrincipalError> {
         let iri = iri.into();
-        if iri.len() > MAX_PRINCIPAL_LEN {
-            return Err(PrincipalError::TooLong { length: iri.len() });
+        match bare_iri_column(PRINCIPAL_KEY, &iri, MAX_PRINCIPAL_LEN) {
+            Ok(()) => Ok(Principal(iri)),
+            Err(ColumnRefusal::TooLong) => Err(PrincipalError::TooLong { length: iri.len() }),
+            Err(ColumnRefusal::NotAColumn(detail)) => Err(PrincipalError::NotAColumn {
+                offered: iri,
+                detail,
+            }),
+            Err(ColumnRefusal::NotAnRdfIri) => Err(PrincipalError::NotAnRdfIri { offered: iri }),
         }
-        let refuse = |detail: &str| {
-            Err(PrincipalError::NotAColumn {
-                offered: iri.clone(),
-                detail: detail.to_string(),
-            })
-        };
-        // ★ PARSE THE OUTPUT. Everything below is a statement about a rendered
-        // line, not about the characters that went in: the rules for what a
-        // column may hold live in `line`, and a second copy of them here would
-        // be a second copy to keep in step.
-        let prefixes = std::collections::BTreeMap::new();
-        let probe = Entry::new(Timestamp::from_millis(0), RESOLUTION_CLASS, PROBE_SUBJECT)
-            .with(PRINCIPAL_KEY, iri.clone());
-        let line = match probe.render(&prefixes) {
-            Ok(line) => line,
-            Err(e) => return refuse(&e.to_string()),
-        };
-        // Bare, not quoted. The one property `render` would happily give up:
-        // it escapes rather than refuses, which is right for a message and
-        // wrong for an identity that has to be found by `grep`.
-        if !line.ends_with(&format!(" {PRINCIPAL_KEY}={iri}")) {
-            return refuse(
-                "it would have to be quoted, and a quoted principal is one `grep` cannot find",
-            );
-        }
-        let back = match Entry::parse(&line, &prefixes) {
-            Ok(entry) => entry,
-            Err(e) => return refuse(&e.to_string()),
-        };
-        if back.subject != PROBE_SUBJECT || back.class != RESOLUTION_CLASS {
-            return refuse("it displaces another column");
-        }
-        if back.get(PRINCIPAL_KEY) != Some(iri.as_str()) || back.fields.len() != 1 {
-            return refuse("it does not read back as the value that went in");
-        }
-        // And an IRI the graph face can state a delegation with. `value_term`
-        // degrades an unusable IRI to a literal rather than dropping it, which
-        // is the right posture for a segment already on disk and the wrong one
-        // for a value this crate is about to write on purpose.
-        if oxrdf::NamedNode::new(&iri).is_err() {
-            return Err(PrincipalError::NotAnRdfIri { offered: iri });
-        }
-        Ok(Principal(iri))
+    }
+
+    /// The one principal that is not an IRI: `anon`, the caller a door did not
+    /// authenticate (see [`ANONYMOUS_PRINCIPAL`]). Only this crate builds it, so
+    /// [`new`](Self::new) still refuses every other value that is not an IRI.
+    pub(crate) fn anonymous() -> Principal {
+        Principal(ANONYMOUS_PRINCIPAL.to_string())
     }
 
     /// The IRI, as it is written.
@@ -444,6 +414,75 @@ impl std::fmt::Display for Principal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// What a door writes as the principal of a caller it did not authenticate:
+/// `anon`, and nothing more. No address, no fingerprint, no session: the
+/// no-tracking rule says an anonymous caller is not identified, and any
+/// identifier written here would identify one.
+///
+/// Deliberately not an IRI. In the graph it is the literal `"anon"` on
+/// `log:onBehalfOf` and no `prov:Delegation` is stated, because there is no
+/// agent to delegate to, and one shared individual would merge every anonymous
+/// caller into a single agent.
+pub const ANONYMOUS_PRINCIPAL: &str = "anon";
+
+/// Why a value cannot be written as a bare IRI column.
+pub(crate) enum ColumnRefusal {
+    /// Longer than the bound the caller gave.
+    TooLong,
+    /// It does not come back from a line as the bare value that went in. The
+    /// clause says why.
+    NotAColumn(String),
+    /// RDF will not accept it as an IRI.
+    NotAnRdfIri,
+}
+
+/// Whether `iri` can be written as the bare `key=` column of an entry and read
+/// back as the same value and as an IRI RDF accepts: the rule a [`Principal`]
+/// and a door's grant are both held to.
+pub(crate) fn bare_iri_column(key: &str, iri: &str, max: usize) -> Result<(), ColumnRefusal> {
+    if iri.len() > max {
+        return Err(ColumnRefusal::TooLong);
+    }
+    let refuse = |detail: &str| Err(ColumnRefusal::NotAColumn(detail.to_string()));
+    // ★ PARSE THE OUTPUT. Everything below is a statement about a rendered
+    // line, not about the characters that went in: the rules for what a column
+    // may hold live in `line`, and a second copy of them here would be a second
+    // copy to keep in step.
+    let prefixes = std::collections::BTreeMap::new();
+    let probe =
+        Entry::new(Timestamp::from_millis(0), RESOLUTION_CLASS, PROBE_SUBJECT).with(key, iri);
+    let line = match probe.render(&prefixes) {
+        Ok(line) => line,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    // Bare, not quoted. The one property `render` would happily give up: it
+    // escapes rather than refuses, which is right for a message and wrong for
+    // an identity that has to be found by `grep`.
+    if !line.ends_with(&format!(" {key}={iri}")) {
+        return refuse(&format!(
+            "it would have to be quoted, and a quoted {key} is one `grep` cannot find"
+        ));
+    }
+    let back = match Entry::parse(&line, &prefixes) {
+        Ok(entry) => entry,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    if back.subject != PROBE_SUBJECT || back.class != RESOLUTION_CLASS {
+        return refuse("it displaces another column");
+    }
+    if back.get(key) != Some(iri) || back.fields.len() != 1 {
+        return refuse("it does not read back as the value that went in");
+    }
+    // And an IRI the graph face can state it with. `value_term` degrades an
+    // unusable IRI to a literal rather than dropping it, which is the right
+    // posture for a segment already on disk and the wrong one for a value this
+    // crate is about to write on purpose.
+    if oxrdf::NamedNode::new(iri).is_err() {
+        return Err(ColumnRefusal::NotAnRdfIri);
+    }
+    Ok(())
 }
 
 /// The per-reason loss counters, shared by every tracer derived from one base.
@@ -544,11 +583,18 @@ impl LogTracer {
     /// would carry the only record that something was lost out of the process
     /// with the connection.
     pub fn on_behalf_of(&self, principal: Principal) -> LogTracer {
+        self.derive(Some(principal))
+    }
+
+    /// A tracer attributing to `principal`, sharing this one's handle, clock
+    /// and drop ledger: [`on_behalf_of`](Self::on_behalf_of) for any principal,
+    /// `anon` included.
+    pub(crate) fn derive(&self, principal: Option<Principal>) -> LogTracer {
         LogTracer {
             handle: Arc::clone(&self.handle),
             clock: Arc::clone(&self.clock),
             drops: Arc::clone(&self.drops),
-            principal: Some(principal),
+            principal,
         }
     }
 

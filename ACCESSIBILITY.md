@@ -21,6 +21,10 @@ This is a library a host uses to write and read its log. People read its files w
   per line, `<timestamp> <class> <subject> key=value…`, for example
   `2026-08-23T09:14:22.031Z log:Message urn:agent:calendar seq=2 msg="sync started"`, and
   `#seal` lines carrying hashes and, when signed, a signature.
+- **Door lines** (`src/access.rs`): one `log:Access` entry per request a host's door served,
+  `… log:Access <subject> door=… verb=… outcome=… bytes=… dur=… principal=… credential=… grant=… q=…`.
+  Its subject and free-text columns are percent-encoded to ASCII, so they hold no control or
+  bidirectional formatting character at all, and a column cut at `MAX_FIELD` ends with `…`.
 - **The verify report** from `urn:log:verify` (`ChainReport::render` in `src/chain.rs`,
   `text/plain`): one `segment <iri> OK|BROKEN entries=… seals=… level=… prev=… signed=… head=…`
   line per segment, each finding indented under it and prefixed `BROKEN` or `noted`, and a last
@@ -32,7 +36,8 @@ This is a library a host uses to write and read its log. People read its files w
   segment IRIs, one per line; `urn:log:config` answers the effective configuration as TOML; a
   segment or the transreptor answers Turtle.
 - **Errors**: the `Display` of `ParseError` (`bad timestamp: …`, `unbound prefix in CURIE: …`),
-  `RenderError`, `WriteError`, `ConfigError` and `VocabError`, and the endpoints' refusals.
+  `RenderError`, `WriteError`, `ConfigError`, `VocabError` and `AccessError`, and the endpoints'
+  refusals.
 
 Not this repository's: how a host or a terminal shows any of this, and the display of core's
 error kinds.
@@ -49,11 +54,11 @@ Verified by reading the source:
   reaches the screen as a control sequence, and no value reorders the rest of its line. A
   subject, class or principal holding one is refused rather than written.
 - **An error is one printable line.** An error or report line that repeats its input (`ParseError`,
-  `RenderError`, `GraphError`, `PrincipalError`, `WriteError`, `ConfigError`, `VocabError`, every
-  verify finding and the verify report's segment line, and an endpoint's text naming a requested
-  segment, a class, a level or a path) shows those same characters escaped the same way, the
-  bidirectional formatting characters included, so quoted text cannot reorder the sentence around
-  it on screen.
+  `RenderError`, `GraphError`, `PrincipalError`, `AccessError`, `WriteError`, `ConfigError`,
+  `VocabError`, every verify finding and the verify report's segment line, and an endpoint's text
+  naming a requested segment, a class, a level or a path) shows those same characters escaped the
+  same way, the bidirectional formatting characters included, so quoted text cannot reorder the
+  sentence around it on screen.
 - Timestamps are fixed-width ISO 8601 in UTC with milliseconds and a `Z`.
 - The verify report says its outcome in words: `OK` or `BROKEN` per segment, `BROKEN` or `noted`
   per finding, and a total; an unsigned segment says `signed=none` rather than leaving it out.
@@ -73,6 +78,10 @@ Verified by reading the source:
   bidirectional formatting character, that each escape reads back to the value logged through
   the parser, the verifier and both transreption paths, that a principal holding one is
   refused, and that segments written before either escape still read and verify.
+- `tests/access.rs` pins that a door line reads back and transrepts with every column declared,
+  that an anonymous caller's line holds nothing but `principal=anon` and `credential=`, that a
+  cut column ends with `…` and an uncut one never does, and that `AccessError` shows what it
+  quotes escaped.
 - `tests/error_text.rs` pins that every error quoting its input, every finding, the verify
   report's segment line, the streaming transreptor's errors and the endpoints' answers naming a
   request show each such character, and each bidirectional format character, escaped, and
