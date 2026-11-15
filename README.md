@@ -379,6 +379,58 @@ gap is bracketed by an always-land marker**:
   truncating a chain at its head would otherwise be free, and the head is the
   recent past.
 
+### Hourly roots and an anchored key history
+
+The chain is unkeyed, so whoever writes the files can recompute it. The answer is a
+commitment held by someone else, and two modules make one small enough to hand over.
+
+**`merkle`: one RFC 9162 root per hour over the seals.** Each `#seal` line is a leaf,
+`<segment IRI> <first>-<last> <chain hash>`, in chain order, hashed as RFC 9162
+§2.1.1 says (`0x00` before a leaf, `0x01` before a node). The tree is cumulative,
+and `hourly_heads` gives the tree's size and root at the end of each hour that had a
+seal, as one line:
+
+```
+#root 2026-11-15T13:00:00.000Z 4 sha256:…
+```
+
+A seal's time is the time of the last entry it covers. Inclusion and consistency
+proofs follow RFC 9162 §2.1.3 and §2.1.4, so a Certificate Transparency verifier
+reads them as they are, and the tests check the RFC 6962 reference tree.
+`check_heads` takes heads held elsewhere and says whether the seals in the files
+still hash to them. A rewritten seal, a reordered segment or a deleted oldest segment
+changes the root.
+
+**`anchor`: key changes, and heads, seen by a party the operator does not control.**
+A key history is one line per key change, each chained to the one before and
+followed by its receipt:
+
+```
+#key 2026-11-15T12:00:00.000Z Ed25519 urn:key:ops-1 genesis
+#anchor rfc3161 MIIEZjAD…
+#key 2026-12-01T09:30:00.000Z Ed25519 urn:key:ops-2 sha256:6b1f…
+#anchor rfc3161 MIIEaDAD…
+```
+
+The receipt is an RFC 3161 time-stamp token over the SHA-256 of the `#key` line
+(the 32 bytes its tagged digest spells), or a transparency log's inclusion receipt.
+`Anchor` obtains one and `AnchorCheck` checks one. Both are seams, as `SealSigner`
+is: this crate makes no network call, parses no ASN.1 and holds no trust root.
+`verify_key_history` requires every record to be chained, in order, anchored,
+accepted by the checker, and anchored within a stated lag of the time it says it
+took effect. That last rule catches a rewrite: an operator who swaps in their own key
+for the past needs new receipts, and new receipts carry the time they were issued.
+`verify_anchored_heads` does the same for tree heads, from the end of each hour, and
+then runs `check_heads`. `KeyHistory::key_at` names the key to check a seal's
+signature with.
+
+What this does not do: nothing here obtains or checks a real token (the host's client
+does, through the seams), the writer does not publish heads or key changes on its
+own, and `urn:log:verify` does not read either file. The lag is a tolerance for an
+unreachable anchor, and it is also the window in which a record could be back-dated.
+A head covers only sealed entries, so the seal cadence still bounds the rewritable
+tail.
+
 ### Segment read budgets
 
 Segment Source reads (both raw log and Turtle), piped transreption, and piped
@@ -485,8 +537,8 @@ What it does **not** establish:
   writer comes only from **signatures**, and seal signatures are **stated, not
   checked** here: `signed=` lists the algorithms the seals name, and checking one
   is `urn:sign:verify` with the public key, which this crate never resolves. An
-  external anchor of the head (a signed or published seal) is the other answer,
-  and nothing here makes one.
+  external anchor of the head is the other answer: see "Hourly roots and an
+  anchored key history" below. `urn:log:verify` does not check anchors.
 * **The level is verified as *recorded*, not as *authentic*.** A `log:LevelChange`
   brackets the gap and the chain proves that entry was not altered afterwards,
   but nothing stops whoever holds the writer from lowering the level and honestly
@@ -500,7 +552,8 @@ What it does **not** establish:
 * **Deleting the oldest segments looks like retention.** The first segment
   listed is not checked against a predecessor that is not there, so removing
   history from the old end is invisible to the walk. (There is no retention or
-  `log:Tombstone` yet to make it distinguishable.)
+  `log:Tombstone` yet to make it distinguishable.) A tree head anchored before
+  the deletion sees it, through `merkle::check_heads`.
 * **Comment lines are not chained.** A `#` line that is not a seal carries
   nothing into the graph and nothing into the hash, so one can be added or
   removed freely. A repeated header directive is not refused either; the header

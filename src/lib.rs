@@ -91,6 +91,14 @@
 //! crate never holds, and the level is verified as RECORDED rather than as
 //! AUTHENTIC — a level MAC needs a key the application itself cannot hold.
 //!
+//! ## Held elsewhere: hourly roots and an anchored key history
+//!
+//! The chain is unkeyed, so its worth against whoever writes the files is a
+//! commitment someone else holds. [`merkle`] builds an RFC 9162 tree over every
+//! seal and gives one head per hour; [`anchor`] chains key changes into a history
+//! and checks both against receipts from an RFC 3161 time-stamping authority or a
+//! transparency log, through seams a host wires to its own client.
+//!
 //! ## The kernel writes it
 //!
 //! [`LogTracer`] is an [`ikigai_core::Tracer`]: a host installs one with
@@ -149,6 +157,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access;
+pub mod anchor;
 pub mod chain;
 pub mod config;
 pub mod endpoints;
@@ -157,6 +166,7 @@ mod graph_stream;
 mod line;
 #[cfg(not(target_family = "wasm"))]
 pub mod load;
+pub mod merkle;
 #[cfg(not(target_family = "wasm"))]
 mod segment_body;
 pub mod segments;

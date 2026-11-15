@@ -17,6 +17,23 @@ with the first release that changes a public name.
 
 ### Added
 
+- `merkle`, an RFC 9162 Merkle tree over seals (ledger #3642). Every `#seal` line is
+  a leaf, `<segment IRI> <first>-<last> <chain hash>`, in chain order, and the tree is
+  cumulative: `hourly_heads` gives one `TreeHead` (`#root <until> <size> <root>`) per
+  hour that has a seal. `inclusion_proof`/`verify_inclusion` and
+  `consistency_proof`/`verify_consistency` follow RFC 9162 §2.1.3 and §2.1.4, and
+  `check_heads` reports a held head whose seals were rewritten or removed, including
+  the oldest segments, which a chain walk takes for retention. Checked against the
+  RFC 6962 reference tree.
+- `anchor`, a key history anchored outside the operator's control (ledger #3642): a
+  `#key <time> <algorithm> <key IRI> <prev>` line per key change, chained record to
+  record, each with an `#anchor <kind> <base64>` receipt from an RFC 3161
+  time-stamping authority or a transparency log. `Anchor` and `AnchorCheck` are seams
+  a host wires to its own client; this crate makes no network call and parses no
+  ASN.1. `verify_key_history` and `verify_anchored_heads` report a record or head that
+  is unchained, out of order, unanchored, rejected by the checker, or anchored later
+  than the allowed lag, which is what a rewrite re-anchored after the fact looks like.
+  `KeyHistory::key_at` names the key in effect at a time.
 - `AccessLog`, the one door line every host shares (ledger #3390): a `log:Access`
   entry per request with `door=`, `verb=`, `outcome=`, `bytes=`, `dur=`,
   `principal=`, `credential=`, `grant=` and `q=`, written through the log's writer.

@@ -35,8 +35,14 @@ This is a library a host uses to write and read its log. People read its files w
   level …`); `urn:log:segments` lists
   segment IRIs, one per line; `urn:log:config` answers the effective configuration as TOML; a
   segment or the transreptor answers Turtle.
+- **Tree heads and the key history** (`src/merkle.rs`, `src/anchor.rs`): one line per head,
+  `#root <until> <size> <root>`, and one per key change, `#key <time> <algorithm> <key IRI>
+  <prev>`, each followed by its `#anchor <kind> <base64>` receipt. Their findings are sentences
+  (`HeadFinding` and `AnchorFinding`'s `Display`), for example `key record 1 (urn:key:ops-1) has
+  no anchor receipt: nothing outside the operator's control has seen it`.
 - **Errors**: the `Display` of `ParseError` (`bad timestamp: …`, `unbound prefix in CURIE: …`),
-  `RenderError`, `WriteError`, `ConfigError`, `VocabError` and `AccessError`, and the endpoints'
+  `RenderError`, `WriteError`, `ConfigError`, `VocabError`, `AccessError`, `BadLine` (`bad root line: …`),
+  `KeyChangeError` and `UnreadableSegment`, and the endpoints'
   refusals.
 
 Not this repository's: how a host or a terminal shows any of this, and the display of core's
@@ -55,7 +61,8 @@ Verified by reading the source:
   subject, class or principal holding one is refused rather than written.
 - **An error is one printable line.** An error or report line that repeats its input (`ParseError`,
   `RenderError`, `GraphError`, `PrincipalError`, `AccessError`, `WriteError`, `ConfigError`,
-  `VocabError`, every verify finding and the verify report's segment line, and an endpoint's text
+  `VocabError`, `BadLine`, `KeyChangeError`, `UnreadableSegment`, every verify, head and anchor
+  finding and the verify report's segment line, and an endpoint's text
   naming a requested segment, a class, a level or a path) shows those same characters escaped the
   same way, the bidirectional formatting characters included, so quoted text cannot reorder the
   sentence around it on screen.
@@ -90,6 +97,7 @@ They do not establish usability, pronunciation, reading order in a host, or WCAG
 | Quoted input in errors, findings and endpoint answers | Pass | `tests/error_text.rs`, run by `cargo test` with the tools and date above. Checks control/bidirectional character escaping and unchanged printable text, including streaming errors and report segment names; does not evaluate error comprehension. |
 | Timestamp bounds and payload round trips | Pass | `tests/audit_3436.rs`: `out_of_format_timestamps_are_refused_before_writing` and `timestamp_endpoints_and_payloads_survive_lines_and_turtle`, run by `cargo test` with the tools and date above. Checks printable rejection beyond year 9999 and supported timestamp/payload round trips; no assistive technology check. |
 | Damaged-file report | Pass | `tests/audit_904.rs`: `r8_a_damaged_segment_in_the_directory_is_reported`, run by `cargo test` with the tools and date above. Checks a `segment … BROKEN` line for a damaged file, not its presentation by a host. |
+| Tree head and key history text | Pass | `tests/merkle_anchor.rs`: `a_head_line_round_trips_and_a_bad_one_is_shown_escaped`, `key_changes_are_refused_out_of_order_or_unprintable` and `a_rewritten_and_re_anchored_history_is_late_everywhere`, run by `cargo test` on 2026-11-15 on Linux with rustc 1.99.0 for ledger #3642, not with the tools and date above. Checks escaped bidirectional characters in `BadLine` and `KeyChangeError` text, and the exact wording of one finding; no assistive technology check. |
 | Automated accessibility checker | Blocked | No automated accessibility checker has been run on this output. No host page or browser checker is configured in this library repository; format tests do not substitute for one. |
 | Browser presentation, zoom, reflow and contrast | Blocked | No browser has been used to evaluate this output. This library emits text; a host presentation and browser session were not available for this review. |
 | Manual keyboard navigation | Blocked | No person has performed a keyboard pass on a host presenting this output; no interactive host session was available for this review. |
