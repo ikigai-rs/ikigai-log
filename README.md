@@ -747,6 +747,7 @@ parsing:
 | `credential=` | `log:credentialKind` | `log:passkey`, `log:clientCertificate`, `log:socketOwner` or `log:anonymous`, as an IRI |
 | `grant=` | `log:grant` | the grant that authorized the call, as an IRI |
 | `q=` | `log:servedQuery` | the served arguments, percent-encoded `name=value` pairs joined by `&` |
+| `needs=` | `log:neededCapability` | only beside `outcome=denied`, and only when the door knows: the capability IRIs the request lacked, percent-encoded and space-separated |
 
 ```rust
 let doors = AccessLog::new(handle, clock);
@@ -756,6 +757,22 @@ doors.record(&Access::new(started, subject, "wire", "SOURCE", "ok", caller)
     .bytes(answer.bytes.len() as u64)
     .duration_ms(elapsed))?;
 ```
+
+A refusal can name the scope that was missing, so a caller that used an old
+spelling of a scope can be told apart from any other refusal:
+
+```
+2026-11-19T09:02:11.004Z log:Access urn:exec:git:log seq=8 door=wire verb=SOURCE outcome=denied principal=urn:agent:alice credential=https://ikigai-rs.dev/ns/log#clientCertificate needs=urn:cap:exec:read:git
+```
+
+```rust
+doors.record(&Access::new(started, subject, "wire", "SOURCE", "denied", caller)
+    .needs("urn:cap:exec:read:git"))?;
+```
+
+`needs=` is written only when the outcome is `denied` (`DENIED_OUTCOME`); on
+any other line it is left out. Capability IRIs are already public, so it
+discloses nothing new.
 
 * **Attribution is per request.** `tracer_for` is the per-call tracer for
   `Kernel::issue_traced`, so the kernel's entries for the request carry the same
@@ -769,7 +786,7 @@ doors.record(&Access::new(started, subject, "wire", "SOURCE", "ok", caller)
   `principal=anon` and nothing more, with no address and no fingerprint. In the
   graph that is the literal `"anon"` and no `prov:Delegation`, because there is
   no agent to name.
-* **Long fields are cut and marked.** The subject and each free-text column are
+* **Long fields are cut and marked.** The subject and each free-text column (`q=` and `needs=` included) are
   percent-encoded to ASCII, then cut at `MAX_FIELD` (256 bytes) and ended with
   `…`. Percent-encoding never writes `…`, so the marker is never part of a value.
 * `log:Access` sits at `info`: it lands at the default level and an operator

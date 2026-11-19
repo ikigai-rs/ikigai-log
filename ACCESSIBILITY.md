@@ -22,7 +22,7 @@ This is a library a host uses to write and read its log. People read its files w
   `2026-08-23T09:14:22.031Z log:Message urn:agent:calendar seq=2 msg="sync started"`, and
   `#seal` lines carrying hashes and, when signed, a signature.
 - **Door lines** (`src/access.rs`): one `log:Access` entry per request a host's door served,
-  `… log:Access <subject> door=… verb=… outcome=… bytes=… dur=… principal=… credential=… grant=… q=…`.
+  `… log:Access <subject> door=… verb=… outcome=… bytes=… dur=… principal=… credential=… grant=… q=… needs=…`.
   Its subject and free-text columns are percent-encoded to ASCII, so they hold no control or
   bidirectional formatting character at all, and a column cut at `MAX_FIELD` ends with `…`.
 - **The verify report** from `urn:log:verify` (`ChainReport::render` in `src/chain.rs`,

@@ -17,6 +17,11 @@ with the first release that changes a public name.
 
 ### Added
 
+- `Access::needs`, an optional `needs=` column on a door line naming the
+  capabilities a refused request lacked, as capability IRIs, space-separated
+  (ledger #3829). Written only beside `outcome=denied` (`DENIED_OUTCOME`), and
+  encoded and cut at `MAX_FIELD` as `q=` is.
+- Vocabulary: `log:neededCapability`, keyed `needs`. `/ns/log` needs a redeploy.
 - `AccessLog`, the one door line every host shares (ledger #3390): a `log:Access`
   entry per request with `door=`, `verb=`, `outcome=`, `bytes=`, `dur=`,
   `principal=`, `credential=`, `grant=` and `q=`, written through the log's writer.

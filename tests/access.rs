@@ -11,10 +11,10 @@ use ikigai_core::{
     Request, Time, Verb,
 };
 use ikigai_log::{
-    to_triples, verify_chain, Access, AccessLog, Caller, ClosureSink, Credential, Entry, Grant,
-    Header, Line, LogConfig, LogHandle, Options, Principal, Vocabulary, ACCESS_CLASS,
-    ANONYMOUS_CREDENTIAL, ANONYMOUS_PRINCIPAL, CUT_MARKER, LOG_NS, MAX_FIELD, PASSKEY_CREDENTIAL,
-    PRINCIPAL_KEY, RESOLUTION_CLASS,
+    to_triples, to_turtle, verify_chain, Access, AccessLog, Caller, ClosureSink, Credential, Entry,
+    Grant, Header, Line, LogConfig, LogHandle, Options, Principal, Vocabulary, ACCESS_CLASS,
+    ANONYMOUS_CREDENTIAL, ANONYMOUS_PRINCIPAL, CUT_MARKER, DENIED_OUTCOME, LOG_NS, MAX_FIELD,
+    PASSKEY_CREDENTIAL, PRINCIPAL_KEY, RESOLUTION_CLASS,
 };
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 
@@ -492,4 +492,123 @@ fn an_access_error_shows_what_it_quotes_escaped() {
         error,
         "no\\u{202e}scheme cannot be the subject of a door line: it is not an absolute IRI"
     );
+}
+
+/// Ledger #3829: a refusal names the capability it lacked, so "used the old
+/// spelling of a scope" can be told apart from any other refusal.
+#[test]
+fn a_denied_line_names_what_it_needed_and_transrepts_with_it() {
+    let (handle, lines) = open("info");
+    let doors = AccessLog::new(handle, Arc::new(Fixed(T0)));
+    let access = Access::new(
+        at(T0),
+        "urn:exec:git:log",
+        "wire",
+        "SOURCE",
+        DENIED_OUTCOME,
+        alice(),
+    )
+    .needs("urn:cap:exec:read:git")
+    .needs("urn:cap:exec:caf\u{e9}");
+    doors.record(&access).unwrap().expect("it lands");
+
+    let written = of_class(&lines, ACCESS_CLASS);
+    assert_eq!(written.len(), 1);
+    assert_eq!(
+        written[0],
+        access.entry().unwrap(),
+        "it reads back as written"
+    );
+    assert_eq!(written[0].get("outcome"), Some("denied"));
+    let needs = written[0]
+        .get("needs")
+        .expect("a denied line carries needs=");
+    assert_eq!(needs, "urn:cap:exec:read:git urn:cap:exec:caf%C3%A9");
+    assert!(needs.is_ascii());
+    assert_eq!(
+        needs.split(' ').collect::<Vec<_>>(),
+        ["urn:cap:exec:read:git", "urn:cap:exec:caf%C3%A9"],
+        "space-separated, and no encoded IRI holds a space"
+    );
+
+    let triples = graph(&lines);
+    let node = node_of(&triples, ACCESS_CLASS);
+    assert!(
+        objects(&triples, &node, &format!("{LOG_NS}undeclaredKey")).is_empty(),
+        "needs= is declared in the vocabulary"
+    );
+    let found = objects(&triples, &node, &format!("{LOG_NS}neededCapability"));
+    assert!(
+        matches!(found.as_slice(), [Term::Literal(l)] if l.value() == needs),
+        "{found:?}"
+    );
+    let turtle = to_turtle(&text(&lines), Vocabulary::builtin(), &Options::all())
+        .expect("it transrepts to Turtle");
+    assert!(turtle.contains("urn:cap:exec:read:git"), "{turtle}");
+    let report = verify_chain(&[("door".to_string(), text(&lines))], Vocabulary::builtin());
+    assert_eq!(report.broken(), 0, "{}", report.render());
+}
+
+#[test]
+fn an_ok_line_never_carries_needs() {
+    let (handle, lines) = open("info");
+    let doors = AccessLog::new(handle, Arc::new(Fixed(T0)));
+    for outcome in ["ok", "not-found"] {
+        doors
+            .record(
+                &Access::new(
+                    at(T0),
+                    "urn:exec:git:log",
+                    "wire",
+                    "SOURCE",
+                    outcome,
+                    alice(),
+                )
+                .needs("urn:cap:exec:read:git"),
+            )
+            .unwrap()
+            .expect("it lands");
+    }
+    // Denied, but the door does not know what was missing.
+    doors
+        .record(&Access::new(
+            at(T0),
+            "urn:exec:git:log",
+            "wire",
+            "SOURCE",
+            DENIED_OUTCOME,
+            alice(),
+        ))
+        .unwrap()
+        .expect("it lands");
+
+    let written = of_class(&lines, ACCESS_CLASS);
+    assert_eq!(written.len(), 3);
+    for entry in &written {
+        assert_eq!(entry.get("needs"), None, "{entry:?}");
+    }
+    assert!(!text(&lines).contains("needs="));
+    assert!(!graph(&lines)
+        .iter()
+        .any(|t| t.predicate.as_str() == format!("{LOG_NS}neededCapability")));
+}
+
+#[test]
+fn a_long_needs_column_is_cut_and_marked() {
+    let (handle, lines) = open("info");
+    let doors = AccessLog::new(handle, Arc::new(Fixed(T0)));
+    let mut access = Access::new(at(T0), "urn:x:y", "web", "GET", DENIED_OUTCOME, alice());
+    for i in 0..64 {
+        access = access.needs(format!("urn:cap:exec:read:repository-{i}"));
+    }
+    doors.record(&access).unwrap().expect("it lands");
+    let written = of_class(&lines, ACCESS_CLASS);
+    let needs = written[0].get("needs").unwrap();
+    let body = needs
+        .strip_suffix(CUT_MARKER)
+        .expect("the cut needs= is marked");
+    assert_eq!(body.len(), MAX_FIELD);
+    assert!(graph(&lines)
+        .iter()
+        .any(|t| t.predicate.as_str() == format!("{LOG_NS}neededCapability")));
 }

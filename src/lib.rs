@@ -169,8 +169,8 @@ mod tests;
 
 pub use access::{
     is_withheld, Access, AccessError, AccessLog, Caller, Credential, Grant, ANONYMOUS_CREDENTIAL,
-    CLIENT_CERTIFICATE_CREDENTIAL, CUT_MARKER, MAX_FIELD, MAX_GRANT_LEN, PASSKEY_CREDENTIAL,
-    SOCKET_OWNER_CREDENTIAL, WITHHELD_ARGUMENTS,
+    CLIENT_CERTIFICATE_CREDENTIAL, CUT_MARKER, DENIED_OUTCOME, MAX_FIELD, MAX_GRANT_LEN,
+    PASSKEY_CREDENTIAL, SOCKET_OWNER_CREDENTIAL, WITHHELD_ARGUMENTS,
 };
 pub use chain::{
     head_of, split_signature, tagged, verify_chain, verify_segment, Chain, ChainReport, Finding,
