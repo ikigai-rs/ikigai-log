@@ -7,6 +7,13 @@
 //! 2026-11-10T22:41:06.120Z log:Access urn:cms:page:home door=web verb=GET outcome=ok bytes=5120 dur=12 principal=urn:agent:alice credential=https://ikigai-rs.dev/ns/log#passkey grant=urn:grant:cms:read q=lang=en
 //! ```
 //!
+//! A refused request can also say which capability it lacked, when the door
+//! knows ([`Access::needs`]):
+//!
+//! ```text
+//! 2026-11-19T09:02:11.004Z log:Access urn:exec:git:log door=wire verb=SOURCE outcome=denied principal=urn:agent:alice credential=https://ikigai-rs.dev/ns/log#clientCertificate needs=urn:cap:exec:read:git
+//! ```
+//!
 //! gonk's door line (ledger #739), generalized (ledger #3390). Every column is
 //! declared in `vocabulary.ttl`, so a segment transrepts to Turtle with no
 //! host-specific parsing, and a host adopts this helper instead of keeping a
@@ -37,8 +44,8 @@
 //!
 //! ## Long fields are cut, and the cut is marked
 //!
-//! Every free-text column (`door`, `verb`, `outcome`, `q`) and the subject are
-//! percent-encoded to ASCII, then cut at [`MAX_FIELD`] bytes and ended with
+//! Every free-text column (`door`, `verb`, `outcome`, `q`, `needs`) and the
+//! subject are percent-encoded to ASCII, then cut at [`MAX_FIELD`] bytes and ended with
 //! [`CUT_MARKER`], `…`. Percent-encoding never writes `…`, so a `…` in one of
 //! these columns is always a cut and never part of a value.
 
@@ -67,6 +74,10 @@ pub const CUT_MARKER: &str = "\u{2026}";
 /// The longest grant IRI written: core's principal bound, for the same reason
 /// it bounds a principal. A grant is an IRI and is refused rather than cut.
 pub const MAX_GRANT_LEN: usize = ikigai_core::MAX_PRINCIPAL_LEN;
+
+/// The `outcome=` token of a refused request: the one outcome a door line
+/// writes `needs=` for.
+pub const DENIED_OUTCOME: &str = "denied";
 
 /// `log:passkey`.
 pub const PASSKEY_CREDENTIAL: &str = "https://ikigai-rs.dev/ns/log#passkey";
@@ -286,6 +297,7 @@ pub struct Access {
     duration_ms: Option<u64>,
     grant: Option<Grant>,
     arguments: Vec<(String, String)>,
+    needs: Vec<String>,
 }
 
 impl Access {
@@ -314,6 +326,7 @@ impl Access {
             duration_ms: None,
             grant: None,
             arguments: Vec::new(),
+            needs: Vec::new(),
         }
     }
 
@@ -343,6 +356,21 @@ impl Access {
     #[must_use]
     pub fn argument(mut self, name: impl Into<String>, value: impl Into<String>) -> Access {
         self.arguments.push((name.into(), value.into()));
+        self
+    }
+
+    /// A capability the request lacked, as an IRI (`urn:cap:exec:read:git`).
+    /// Call it once per capability; they are written in order, space-separated,
+    /// in one `needs=` column.
+    ///
+    /// Written only when the outcome is [`DENIED_OUTCOME`], `denied`: a request
+    /// that was served lacked nothing, so any other line leaves `needs=` out.
+    /// Each IRI is percent-encoded to ASCII as the subject is, so none holds a
+    /// space, and the column is cut at [`MAX_FIELD`] and marked as `q=` is.
+    /// Capability IRIs are public, so the column discloses nothing new.
+    #[must_use]
+    pub fn needs(mut self, capability: impl Into<String>) -> Access {
+        self.needs.push(capability.into());
         self
     }
 
@@ -385,6 +413,15 @@ impl Access {
             .collect();
         if !served.is_empty() {
             entry = entry.with("q", cut(served.join("&")));
+        }
+        let needs: Vec<String> = self
+            .needs
+            .iter()
+            .filter(|iri| !iri.is_empty())
+            .map(|iri| encode_iri(iri))
+            .collect();
+        if self.outcome == DENIED_OUTCOME && !needs.is_empty() {
+            entry = entry.with("needs", cut(needs.join(" ")));
         }
         Ok(entry)
     }
