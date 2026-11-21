@@ -839,7 +839,7 @@ impl LogHandle {
         if let Some(now) = inv.now().map(|t| Timestamp::from_millis(t.as_millis())) {
             let _ = self.write(self.denial(now, Some(inv), capability, action));
         }
-        Error::Denied(format!("{action} requires `{capability}`"))
+        Error::Denied(format!("{action} requires `{capability}`").into())
     }
 }
 

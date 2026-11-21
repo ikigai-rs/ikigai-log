@@ -363,9 +363,9 @@ impl Endpoint for SegmentEndpoint {
             return self.invoke(inv).await.map(Representation::into_body);
         }
         if !inv.capability.allows(CAP_READ) {
-            return Err(Error::Denied(format!(
-                "reading a log segment requires `{CAP_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("reading a log segment requires `{CAP_READ}`").into(),
+            ));
         }
         let options = window(inv)?;
         let requested_tail = tail_requested(inv)?;
@@ -436,9 +436,9 @@ impl Endpoint for SegmentEndpoint {
         // half — the capability-projected read faces are T11, and this is the
         // coarse gate they will refine.
         if !inv.capability.allows(CAP_READ) {
-            return Err(Error::Denied(format!(
-                "reading a log segment requires `{CAP_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("reading a log segment requires `{CAP_READ}`").into(),
+            ));
         }
         let tail = inv
             .bindings
@@ -647,9 +647,9 @@ impl SegmentEndpoint {
     /// rather than O(segment).
     fn exists(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_READ) {
-            return Err(Error::Denied(format!(
-                "asking after a log segment requires `{CAP_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("asking after a log segment requires `{CAP_READ}`").into(),
+            ));
         }
         let iri = inv.request.target.as_str().to_string();
         let Some(tail) = inv.bindings.get(SEGMENT_BINDING) else {
@@ -1006,9 +1006,9 @@ impl Endpoint for VerifyEndpoint {
             )));
         }
         if !inv.capability.allows(CAP_READ) {
-            return Err(Error::Denied(format!(
-                "verifying the log requires `{CAP_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("verifying the log requires `{CAP_READ}`").into(),
+            ));
         }
 
         // A piped segment is verified in ISOLATION: everything except the
@@ -1374,9 +1374,9 @@ impl Endpoint for SegmentsEndpoint {
             )));
         }
         if !inv.capability.allows(CAP_READ) {
-            return Err(Error::Denied(format!(
-                "listing log segments requires `{CAP_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("listing log segments requires `{CAP_READ}`").into(),
+            ));
         }
         let directory = crate::writer::resolve_directory(&self.handle.config())
             .ok_or_else(|| Error::Endpoint(crate::writer::WriteError::NoDirectory.to_string()))?;
