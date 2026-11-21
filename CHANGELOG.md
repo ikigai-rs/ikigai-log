@@ -5,6 +5,13 @@ with the first release that changes a public name.
 
 ## Unreleased
 
+### Changed
+
+- On ikigai-core 0.4.0 (scope opacity, structured denials; the core 0.4.0 cascade,
+  ledger #3930), with ikigai-sign 0.6.0, and in tests ikigai-sparql 0.6.0 and
+  ikigai-conformance 0.15.0. Refusals are now `Error::Denied(Denial)` carrying the
+  same messages as before. A consumer on core 0.3 cannot mix these types, hence 0.13.0.
+
 ### Fixed
 
 - A flush failure after a complete entry or seal write no longer makes the writer
