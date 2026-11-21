@@ -1423,6 +1423,214 @@ impl Endpoint for SegmentsEndpoint {
     }
 }
 
+// =====================================================================================
+// urn:log:session:{session} — one session's trail, across every segment
+// =====================================================================================
+
+#[cfg(not(target_family = "wasm"))]
+/// One session's trail: `urn:log:session:` then the session's IRI, verbatim
+/// (`urn:log:session:urn:claude:session:4f1c`). **Bound above
+/// [`SEGMENT_TEMPLATE`]**, which would otherwise read it as a segment.
+pub const SESSION_TEMPLATE: &str = "urn:log:session:{session}";
+
+#[cfg(not(target_family = "wasm"))]
+/// What `urn:log:session:` is followed by in a trail's IRI and a session
+/// capability.
+pub const SESSION_PREFIX: &str = "urn:log:session:";
+
+#[cfg(not(target_family = "wasm"))]
+/// The capability family a trail is read under: `urn:cap:log:read:session:`
+/// then the session's IRI, one scope per session. NOT implied by
+/// [`CAP_READ`], which reads every segment whole: a host can grant one
+/// session's trail to that session's owner without granting the log.
+pub const CAP_READ_SESSION_PREFIX: &str = "urn:cap:log:read:session:";
+
+#[cfg(not(target_family = "wasm"))]
+/// The binding a matched [`SESSION_TEMPLATE`] supplies.
+const SESSION_BINDING: &str = "session";
+
+#[cfg(not(target_family = "wasm"))]
+/// The scope that reads `session`'s trail.
+///
+/// ```
+/// assert_eq!(
+///     ikigai_log::session_capability("urn:claude:session:4f1c"),
+///     "urn:cap:log:read:session:urn:claude:session:4f1c",
+/// );
+/// ```
+pub fn session_capability(session: &str) -> String {
+    format!("{CAP_READ_SESSION_PREFIX}{session}")
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// One session's trail, as the PROV-aligned graph of every entry whose
+/// `session=` column names it, in every segment in the log directory.
+pub struct SessionTrailEndpoint {
+    handle: Arc<LogHandle>,
+    vocabulary: Arc<Vocabulary>,
+    clock: Arc<dyn ikigai_core::Clock>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl SessionTrailEndpoint {
+    /// A trail reader over `handle`'s directory. `clock` is what the host's
+    /// retention limit ([`LogHandle::set_session_retention_ms`]) is measured
+    /// back from.
+    pub fn new(
+        handle: Arc<LogHandle>,
+        vocabulary: Arc<Vocabulary>,
+        clock: Arc<dyn ikigai_core::Clock>,
+    ) -> SessionTrailEndpoint {
+        SessionTrailEndpoint {
+            handle,
+            vocabulary,
+            clock,
+        }
+    }
+
+    /// The trail of `session` as triples: each segment that holds one of its
+    /// entries contributes its header and those entries, and nothing else.
+    fn trail(&self, session: &str) -> Result<Vec<oxrdf::Triple>> {
+        let directory = crate::writer::resolve_directory(&self.handle.config())
+            .ok_or_else(|| Error::Endpoint(crate::writer::WriteError::NoDirectory.to_string()))?;
+        let since = self
+            .handle
+            .session_retention_ms()
+            .map(|ms| Timestamp::from_millis(self.clock.now().as_millis().saturating_sub(ms)));
+        let mut triples = Vec::new();
+        let mut read = 0usize;
+        for (name, path) in segment_files(&directory) {
+            let text = read_segment(&path)?;
+            read += text.len();
+            check_segment_size(read, MAX_VERIFY_BYTES)?;
+            let Ok((header, offset)) = Header::parse(&text) else {
+                // A damaged segment is verify's to report; a trail reads what
+                // it can rather than failing every session for one bad file.
+                continue;
+            };
+            let mut kept = text[..offset].to_string();
+            if !kept.ends_with('\n') {
+                kept.push('\n');
+            }
+            let mut any = false;
+            for raw in text[offset..].lines() {
+                // Cheap first: a session column is written bare, so a line that
+                // carries it holds the IRI verbatim. The parse below decides.
+                if !raw.contains(session) {
+                    continue;
+                }
+                let Ok(Line::Entry(entry)) = Line::parse(raw, &header.prefixes) else {
+                    continue;
+                };
+                if !entry
+                    .all(crate::vocabulary::SESSION_KEY)
+                    .any(|s| s == session)
+                {
+                    continue;
+                }
+                if since.is_some_and(|since| entry.time < since) {
+                    continue;
+                }
+                kept.push_str(raw);
+                kept.push('\n');
+                any = true;
+            }
+            if any {
+                triples.extend(
+                    crate::graph::to_triples(&kept, &self.vocabulary, &Options::all())
+                        .map_err(|e| Error::Endpoint(format!("<{}>: {e}", shown(&name))))?,
+                );
+            }
+        }
+        Ok(triples)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[async_trait]
+impl Endpoint for SessionTrailEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "a session's trail is a Source; it does not answer {:?}",
+                inv.request.verb
+            )));
+        }
+        let session = inv
+            .bindings
+            .get(SESSION_BINDING)
+            .ok_or_else(|| Error::Endpoint("no session named".to_string()))?;
+        let scope = session_capability(session);
+        if !inv.capability.allows(&scope) {
+            return Err(Error::Denied(
+                format!("reading this session's trail requires `{}`", shown(&scope)).into(),
+            ));
+        }
+        match opt(inv, "as")? {
+            None => {}
+            Some(t) if t == TURTLE_MEDIA_TYPE => {}
+            Some(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "as".to_string(),
+                    detail: format!("expected {TURTLE_MEDIA_TYPE}, got {other:?}"),
+                })
+            }
+        }
+        let triples = self.trail(session)?;
+        let turtle = crate::graph::serialize(&triples).map_err(|e| {
+            Error::Endpoint(format!("<{}>: {e}", shown(inv.request.target.as_str())))
+        })?;
+        // NOT cacheable: the trail grows with every entry the session writes,
+        // across segments, and the retention window moves with the clock.
+        Ok(turtle_repr(turtle))
+    }
+
+    fn name(&self) -> &str {
+        "log-session-trail"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("log-session-trail")
+            .title("One session's trail")
+            .summary(
+                "Every entry whose `session=` column names this session, in every segment in \
+                 this process's log directory, as text/turtle: each segment that holds one \
+                 contributes its header and those entries, under the entries' own \
+                 urn:log:{segment}:{seq} IRIs, so the trail joins to the segments it came from. \
+                 The IRI is `urn:log:session:` then the session's IRI verbatim. Read under \
+                 `urn:cap:log:read:session:` then the same IRI, one scope per session, which \
+                 `urn:cap:log:read` does not imply. A host may limit how far back it reads \
+                 (LogHandle::set_session_retention_ms); the limit removes nothing from a \
+                 segment. Seals are left out, so a trail states and does not verify: \
+                 urn:log:verify verifies. Uncacheable: it grows with the session.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("the session's trail, as a graph")
+                    .fails(ikigai_core::FailureClass::OverBudget)
+                    .fails(ikigai_core::FailureClass::Denied)
+                    .fails(ikigai_core::FailureClass::Unknown)
+                    .requires(format!("{CAP_READ_SESSION_PREFIX}*"))
+                    .input(
+                        ArgSpec::new(SESSION_BINDING)
+                            .summary("the session's IRI, as its lines' `session=` column writes it")
+                            .class(RDFS_RESOURCE)
+                            .binding(),
+                    )
+                    .input(
+                        ArgSpec::new("as")
+                            .summary("the output type")
+                            .class(XSD_STRING)
+                            .one_of([TURTLE_MEDIA_TYPE])
+                            .default_value(TURTLE_MEDIA_TYPE),
+                    )
+                    .output(TURTLE_MEDIA_TYPE),
+            )
+    }
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod budget_tests {
     use super::*;

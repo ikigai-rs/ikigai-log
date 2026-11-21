@@ -132,6 +132,17 @@
 //! header, token or body is written, and an anonymous caller is `anon` and
 //! nothing more. [`access`] has the rules.
 //!
+//! ## An agent's trail: one tool-call line
+//!
+//! [`ToolCallLog`] writes one `log:ToolCall` per tool call a host observed an
+//! agent make: the tool, the session (a `session=` column any line may carry),
+//! the outcome (`ok`, `refused`, `failed`), the duration, and the arguments'
+//! DIGEST. The argument and result text are written only when the writer opts
+//! in ([`ToolCallLog::with_text`]), so a default line holds no secret an
+//! argument carried. `urn:log:session:{session}` ([`SessionTrailEndpoint`])
+//! reads one session's trail as a graph, under its own capability,
+//! `urn:cap:log:read:session:{session}`.
+//!
 //! ## What this crate is not, yet
 //!
 //! SHACL on write and retention with `log:Tombstone` are still ahead.
@@ -160,6 +171,7 @@ pub mod load;
 #[cfg(not(target_family = "wasm"))]
 mod segment_body;
 pub mod segments;
+mod tool_call;
 pub mod tracer;
 mod vocabulary;
 mod writer;
@@ -192,9 +204,15 @@ pub use line::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use segments::{
-    SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
+    session_capability, SegmentEndpoint, SegmentsEndpoint, SessionTrailEndpoint, VerifyEndpoint,
+    CAP_READ_SESSION_PREFIX, SEGMENTS_IRI, SEGMENT_TEMPLATE, SESSION_PREFIX, SESSION_TEMPLATE,
+    VERIFY_IRI,
 };
 pub use segments::{TransreptEndpoint, TRANSREPT_IRI};
+pub use tool_call::{
+    Session, ToolCall, ToolCallError, ToolCallLog, ToolOutcome, MAX_SESSION_LEN, MAX_TOOL_TEXT,
+    TOOL_NS,
+};
 pub use tracer::{
     class_for, entry_for, entry_for_principal, principal_of, LogTracer, Principal, PrincipalError,
     ANONYMOUS_PRINCIPAL, DROP_REASONS, MAX_PRINCIPAL_LEN, NOT_RESOLVED_NOTES,
@@ -205,7 +223,8 @@ pub use vocabulary::{
     DEPTH_EXCEEDED_CLASS, DROPPED_CLASS, ENDPOINT_DENIED_CLASS, ENTRY_CLASS, ERROR_CLASS,
     FAILED_KEY, LEVEL_CHANGE_CLASS, LEVEL_CHANGE_REJECTED_CLASS, LOG_KEY_NS, LOG_NS, MESSAGE_CLASS,
     NOT_RESOLVED_CLASS, ON_BEHALF_OF_PROPERTY, PRINCIPAL_KEY, PROCESS_START_CLASS,
-    PROCESS_STOP_CLASS, PROV_NS, RESOLUTION_CLASS, ROTATION_CLASS, VOCABULARY_TTL, WARNING_CLASS,
+    PROCESS_STOP_CLASS, PROV_NS, RESOLUTION_CLASS, ROTATION_CLASS, SESSION_KEY, SESSION_PROPERTY,
+    TOOL_CALL_CLASS, VOCABULARY_TTL, WARNING_CLASS,
 };
 pub use writer::{Closed, ClosureSink, LineSink, WriteError, Writer, WriterOptions};
 #[cfg(not(target_family = "wasm"))]

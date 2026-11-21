@@ -24,6 +24,29 @@ with the first release that changes a public name.
 
 ### Added
 
+- A tool-call line and a session column (ledger #3962), additive, hence 0.14.0.
+  `ToolCallLog` writes one `log:ToolCall` per tool call: the tool as its subject
+  (`urn:tool:{name}`), `session=`, `outcome=ok|refused|failed`, `dur=`, and the
+  arguments' digest `args=sha256:…` (and `result=` when the host hands the result
+  over). Argument and result text (`args-text=`, `result-text=`) are written only
+  under the writer's opt-in, `ToolCallLog::with_text`. New public names: `Session`,
+  `ToolCall`, `ToolOutcome`, `ToolCallError`, `ToolCallLog`, `TOOL_NS`,
+  `MAX_SESSION_LEN`, `MAX_TOOL_TEXT`, `TOOL_CALL_CLASS`, `SESSION_KEY`,
+  `SESSION_PROPERTY`, and `Access::session`.
+- `urn:log:session:{session}` (`SessionTrailEndpoint`, bound by `space()` above the
+  segment template): one session's trail as Turtle across every segment, read under
+  `urn:cap:log:read:session:{session}` (`session_capability`,
+  `CAP_READ_SESSION_PREFIX`), which `urn:cap:log:read` does not imply. A host limits
+  how far back it reads with `LogHandle::set_session_retention_ms`.
+- Vocabulary: `log:Session`, `log:session`, `log:ToolCall`, `log:calledTool`,
+  `log:argumentsDigest`, `log:resultDigest`, `log:argumentsText`, `log:resultText`,
+  `log:cutColumn`. `/ns/log` is deployed by hand and needs a redeploy.
+
+### Changed in the vocabulary
+
+- `log:outcome`'s `rdfs:domain` is `log:Entry`, not `log:Access`: a tool call
+  writes the column too, and the narrower domain would type it a door request.
+
 - `Access::needs`, an optional `needs=` column on a door line naming the
   capabilities a refused request lacked, as capability IRIs, space-separated
   (ledger #3829). Written only beside `outcome=denied` (`DENIED_OUTCOME`), and

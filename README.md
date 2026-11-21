@@ -792,6 +792,54 @@ discloses nothing new.
 * `log:Access` sits at `info`: it lands at the default level and an operator
   can turn it off by setting the dial to `warn` or `error`.
 
+### One tool-call line: an agent's trail
+
+A host that observes an agent's tool calls (a Claude hook, a worker loop) writes
+one `log:ToolCall` per call through `ToolCallLog`, into the same hash-chained
+segment as everything else:
+
+```
+2026-11-21T23:04:17.512Z log:ToolCall urn:tool:Bash seq=9 session=urn:claude:session:4f1c outcome=ok dur=184 args=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+```
+
+| column | property | holds |
+|---|---|---|
+| the subject | `log:calledTool` | `urn:tool:` and the tool's name, percent-encoded |
+| `session=` | `log:session` | the session's IRI, bare; any line may carry it |
+| `outcome=` | `log:outcome` | `ok`, `refused` or `failed` |
+| `dur=` | `log:durationMs` | milliseconds |
+| `args=` | `log:argumentsDigest` | `sha256:` and the hex digest of the arguments |
+| `result=` | `log:resultDigest` | the digest of the result, when the host handed it over |
+| `args-text=` | `log:argumentsText` | the arguments' text, **only** when the writer opted in |
+| `result-text=` | `log:resultText` | the result's text, under the same opt-in |
+| `cut=` | `log:cutColumn` | which text columns were cut at `MAX_TOOL_TEXT` (4096 bytes) |
+
+```rust
+let calls = ToolCallLog::new(handle);              // digests only
+let session = Session::new("urn:claude:session:4f1c")?;
+calls.record(&ToolCall::new(started, session, "Bash", arguments_json, ToolOutcome::Ok)
+    .duration_ms(elapsed))?;
+```
+
+* **By default a line holds no argument or result text.** `ToolCallLog::new`
+  writes digests; `ToolCallLog::with_text()` is the writer's one opt-in, for every
+  call it records, and no single call can turn it on. A digest tells equal
+  arguments from different ones; it does not hide short or guessable ones
+  (`sha256` of `ls` is one guess away), so it keeps the text off the line, not
+  out of reach.
+* **`session=` is a column any line may carry.** `Access::session` puts a door
+  line into the same trail. The session IRI is a name the host minted, never a
+  token that would resume the session.
+* **One session's trail is a resource.** `urn:log:session:{session}`, with the
+  session's IRI verbatim (`urn:log:session:urn:claude:session:4f1c`), answers the
+  PROV-aligned graph of every entry carrying that `session=`, in every segment in
+  the directory, under the entries' own `urn:log:{segment}:{seq}` IRIs. It reads
+  under `urn:cap:log:read:session:{session}`, one scope per session, which
+  `urn:cap:log:read` does not imply. `LogHandle::set_session_retention_ms` limits
+  how far back it reads; the limit removes nothing from a segment. Seals are left
+  out of a trail: it states, and `urn:log:verify` verifies.
+* `log:ToolCall` sits at `info`, like `log:Access`.
+
 ## One dial, and a floor it cannot reach
 
 The verbosity level is a **vocabulary fact**: `log:rank` orders the ladder,
@@ -940,8 +988,8 @@ ending in `log:ProcessStop` and a final `#seal`) — so both cache paths are
 exercised: a live segment is served uncacheable, a finished one is cached under
 its file's golden thread, and both name `urn:file:<path>` as the thread a watcher
 must cut. `urn:log:transrept` is declared `pure` and `cacheable` (Turtle from
-bytes, no file, no clock); `urn:log:config`, `urn:log:segments` and
-`urn:log:verify` are live by design and say so in their descriptions.
+bytes, no file, no clock); `urn:log:config`, `urn:log:segments`,
+`urn:log:verify` and `urn:log:session:{session}` are live by design and say so in their descriptions.
 
 **The space has no name of its own, on purpose.** Both constructors,
 `endpoints::space(handle)` and `endpoints::space_with_vocabulary(handle,
@@ -958,8 +1006,8 @@ faces and requires every `log:` term they emit to be a subject of that file — 
 `sig:` (`https://ikigai-rs.dev/ns/sign#`), `ikigai-sign`'s, defined in that
 crate's README and held to the three terms a seal carries.
 
-No check is skipped. The six ids (`log-write`, `log-config`, `log-segments`,
-`log-verify`, `log-segment`, `log-transrept`) are kebab-case nouns, so **NAMES**
+No check is skipped. The seven ids (`log-write`, `log-config`, `log-segments`,
+`log-verify`, `log-session-trail`, `log-segment`, `log-transrept`) are kebab-case nouns, so **NAMES**
 runs like the rest; they were camelCase (`logWrite` and so on) until 0.8.0 (see
 [CHANGELOG.md](CHANGELOG.md)). What the suite cannot see is pinned by hand in the same
 file: declared outputs against served media types in both directions with `as`
@@ -996,7 +1044,8 @@ entry. `urn:log:verify` walks it, and checks brackets as well as hashes.
 * **A segment is only greppable at the granularity it is queryable.**
   Transreption is O(segment); there is no index, and `urn:log:segments` is a
   directory listing rather than a catalog.
-* No retention and no `log:Tombstone`, no central collection, no SHACL on write —
+* No retention on disk and no `log:Tombstone` (a session trail's retention limit
+  is a limit on what it reads), no central collection, no SHACL on write —
   "validate" in a rotation is the structural walk, not shapes, and this README
   will not let that word carry more than it does.
 * **A principal is recorded, never authenticated, and never correlated.** The

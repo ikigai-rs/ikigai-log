@@ -55,8 +55,9 @@ use ikigai_core::Clock;
 
 use crate::endpoints::LogHandle;
 use crate::line::{is_iri, shown, Entry, Timestamp};
+use crate::tool_call::Session;
 use crate::tracer::{bare_iri_column, ColumnRefusal, LogTracer, Principal, ANONYMOUS_PRINCIPAL};
-use crate::vocabulary::{ACCESS_CLASS, PRINCIPAL_KEY};
+use crate::vocabulary::{ACCESS_CLASS, PRINCIPAL_KEY, SESSION_KEY};
 use crate::WriteError;
 
 /// The longest a free-text column or the subject of a `log:Access` line is
@@ -298,6 +299,7 @@ pub struct Access {
     grant: Option<Grant>,
     arguments: Vec<(String, String)>,
     needs: Vec<String>,
+    session: Option<Session>,
 }
 
 impl Access {
@@ -327,6 +329,7 @@ impl Access {
             grant: None,
             arguments: Vec::new(),
             needs: Vec::new(),
+            session: None,
         }
     }
 
@@ -374,6 +377,16 @@ impl Access {
         self
     }
 
+    /// The session the request was made in, written as a bare `session=`
+    /// column so the door line reads in that session's trail
+    /// (`urn:log:session:{session}`). The session's NAME, an IRI the host
+    /// minted, and never a token or cookie that would let someone resume it.
+    #[must_use]
+    pub fn session(mut self, session: Session) -> Access {
+        self.session = Some(session);
+        self
+    }
+
     /// The [`Entry`] this request is written as.
     pub fn entry(&self) -> Result<Entry, AccessError> {
         let subject = cut(encode_iri(&self.subject));
@@ -404,6 +417,9 @@ impl Access {
             .with("credential", self.caller.credential());
         if let Some(grant) = &self.grant {
             entry = entry.with("grant", grant.as_str());
+        }
+        if let Some(session) = &self.session {
+            entry = entry.with(SESSION_KEY, session.as_str());
         }
         let served: Vec<String> = self
             .arguments
@@ -499,7 +515,7 @@ impl AccessLog {
 /// sub-delimiters and separators that read plainly in a bare column. `&`, `=`
 /// and `%` are always encoded, so `q=`'s pairs split back unambiguously. ASCII
 /// out, whatever came in.
-fn encode_text(value: &str) -> String {
+pub(crate) fn encode_text(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~:/@!$'()*+,;".contains(&byte) {
@@ -514,7 +530,7 @@ fn encode_text(value: &str) -> String {
 /// Map an IRI to the URI it stands for (RFC 3987 §3.1): every byte that is not
 /// printable ASCII, or that an IRI column cannot hold bare, is percent-encoded,
 /// and a `%` that does not start an escape becomes `%25`. ASCII out.
-fn encode_iri(iri: &str) -> String {
+pub(crate) fn encode_iri(iri: &str) -> String {
     let bytes = iri.as_bytes();
     let mut out = String::with_capacity(iri.len());
     for (i, &byte) in bytes.iter().enumerate() {
@@ -532,7 +548,7 @@ fn encode_iri(iri: &str) -> String {
 
 /// Cut an ASCII value at [`MAX_FIELD`] bytes, never inside a `%XX` escape, and
 /// end it with [`CUT_MARKER`]. Shorter values are returned as they are.
-fn cut(value: String) -> String {
+pub(crate) fn cut(value: String) -> String {
     if value.len() <= MAX_FIELD {
         return value;
     }

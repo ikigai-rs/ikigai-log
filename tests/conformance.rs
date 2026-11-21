@@ -1,4 +1,4 @@
-//! The module recipe as one test: `ikigai-conformance` walks the six endpoints
+//! The module recipe as one test: `ikigai-conformance` walks the seven endpoints
 //! [`ikigai_log::endpoints::space`] binds and reports every violation at once.
 //!
 //! ## The fixture is a log directory, and the walk WRITES to it
@@ -136,8 +136,9 @@ use ikigai_core::{
     Time, Verb,
 };
 use ikigai_log::{
-    Destination, LogConfig, LogHandle, SealPolicy, Timestamp, Vocabulary, CAP_READ, CONFIG_IRI,
-    LOG_NS, SEGMENTS_IRI, SIG_NS, TRANSREPT_IRI, VERIFY_IRI, VOCABULARY_TTL, WRITE_IRI,
+    Destination, LogConfig, LogHandle, SealPolicy, Session, Timestamp, ToolCall, ToolCallLog,
+    ToolOutcome, Vocabulary, CAP_READ, CONFIG_IRI, LOG_NS, SEGMENTS_IRI, SIG_NS, TRANSREPT_IRI,
+    VERIFY_IRI, VOCABULARY_TTL, WRITE_IRI,
 };
 
 /// The six endpoints `space()` binds, by description id — pinned against the
@@ -149,6 +150,11 @@ const CONFIG: &str = "log-config";
 const SEGMENTS: &str = "log-segments";
 const VERIFY: &str = "log-verify";
 const SEGMENT: &str = "log-segment";
+const SESSION_TRAIL: &str = "log-session-trail";
+
+/// The session the fixture's one tool-call line is written in, so the trail
+/// endpoint the walk probes has an entry to answer with.
+const SESSION: &str = "urn:conformance:session:1";
 
 /// What `SPACE-NAME` findings and the report's `space:` lines call the two
 /// constructors — the call, as the conformance README asks.
@@ -264,6 +270,19 @@ impl Log {
             .expect("the segment opens");
         assert!(opened, "destination = file opens a segment");
         let (iri, _) = handle.open_segment().expect("a segment is open");
+        ToolCallLog::new(handle.clone())
+            .record(
+                &ToolCall::new(
+                    Timestamp::from_millis(T0 + 10),
+                    Session::new(SESSION).expect("a session IRI"),
+                    "Bash",
+                    "{\"command\":\"ls\"}",
+                    ToolOutcome::Ok,
+                )
+                .duration_ms(5),
+            )
+            .expect("the tool-call line is written")
+            .expect("info admits log:ToolCall");
         if finished {
             handle
                 .close(Timestamp::from_millis(T0 + 1_000))
@@ -358,6 +377,7 @@ fn suite(log: &Log) -> Suite {
         .fixture(Fixture::new(CONFIG, Verb::Sink).arg("content", CONFIG_BODY))
         .fixture(Fixture::new(SEGMENT, Verb::Source).binding("segment", log.tail()))
         .fixture(Fixture::new(SEGMENT, Verb::Exists).binding("segment", log.tail()))
+        .fixture(Fixture::new(SESSION_TRAIL, Verb::Source).binding("session", SESSION))
         .pure(TRANSREPT)
         .cacheable(TRANSREPT)
         .host_named_space(SPACE_LABEL, log.space.clone())
@@ -365,17 +385,17 @@ fn suite(log: &Log) -> Suite {
         .body_space(log.space.clone())
 }
 
-/// The walk saw the six endpoints and their eight actions (config and the
-/// segment declare two each), and skipped nothing. A seventh
+/// The walk saw the seven endpoints and their nine actions (config and the
+/// segment declare two each), and skipped nothing. An eighth
 /// endpoint bound without a line here would be held to a weaker standard; a
 /// declared action that binds nothing is a stale list.
 fn assert_shape(report: &Report) {
     assert_eq!(
-        report.endpoints, 6,
-        "write, transrept, config, segments, verify, segment: {report}"
+        report.endpoints, 7,
+        "write, transrept, config, segments, verify, session trail, segment: {report}"
     );
     assert_eq!(
-        report.actions, 8,
+        report.actions, 9,
         "one action each, two for config (Source/Sink) and the segment (Exists/Source): {report}"
     );
     let skipped: Vec<String> = report.checks.skipped().map(|c| c.to_string()).collect();
@@ -424,7 +444,7 @@ fn conforms() {
     eprintln!("[live segment]\n{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
-    assert_unprobed(&report, &[CONFIG, SEGMENTS, VERIFY, SEGMENT]);
+    assert_unprobed(&report, &[CONFIG, SEGMENTS, VERIFY, SESSION_TRAIL, SEGMENT]);
 
     // The live tail is never served from the cache — the walk resolved it under
     // root more than once, and nothing stuck.
@@ -487,7 +507,7 @@ fn a_finished_segment_conforms_and_caches_under_its_file() {
     eprintln!("[finished segment]\n{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
-    assert_unprobed(&report, &[CONFIG, SEGMENTS, VERIFY]);
+    assert_unprobed(&report, &[CONFIG, SEGMENTS, VERIFY, SESSION_TRAIL]);
     assert_eq!(
         log.text(),
         before,

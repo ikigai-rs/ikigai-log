@@ -175,6 +175,7 @@ fn every_class_is_placeable_on_the_dial() {
         log("Destination"),
         log("Cadence"),
         log("CredentialKind"),
+        log("Session"),
     ];
     for class in vocab.classes() {
         if structural.contains(&class.iri) {
@@ -6298,6 +6299,49 @@ fn no_column_the_writer_or_the_config_door_writes_types_an_entry_into_a_family_i
             .iter()
             .any(|t| t.predicate.as_str() == log("configuredInstance")),
         "the fixture writes configured="
+    );
+    let traps = family_traps(&triples);
+    assert!(traps.is_empty(), "{traps:#?}");
+}
+
+#[test]
+fn a_tool_call_and_a_door_line_in_a_session_type_nothing_falsely() {
+    // Ledger #3962: `outcome=` is written by log:ToolCall and log:Access alike,
+    // and `session=` by any line. A domain narrower than log:Entry on either
+    // would make a reasoner call a tool call a door request, or the reverse.
+    let session = crate::Session::new("urn:claude:session:4f1c").expect("a session");
+    let (_segment, text) = written_segment("info", |writer| {
+        let call = crate::ToolCall::new(
+            at(1_700_000_001_000),
+            session.clone(),
+            "Bash",
+            "{}",
+            crate::ToolOutcome::Refused,
+        )
+        .duration_ms(3)
+        .result("no");
+        writer
+            .write(call.entry_with(true).expect("an entry"))
+            .expect("a tool call at info");
+        let door = crate::Access::new(
+            at(1_700_000_002_000),
+            "urn:cms:page:home",
+            "web",
+            "GET",
+            "ok",
+            crate::Caller::Anonymous,
+        )
+        .session(session.clone());
+        writer
+            .write(door.entry().expect("an entry"))
+            .expect("a door line at info");
+    });
+    let triples = to_triples(&text, Vocabulary::builtin(), &Options::all()).expect("transrepts");
+    assert!(
+        triples
+            .iter()
+            .any(|t| t.predicate.as_str() == log("argumentsText")),
+        "the fixture writes the opt-in columns too"
     );
     let traps = family_traps(&triples);
     assert!(traps.is_empty(), "{traps:#?}");
