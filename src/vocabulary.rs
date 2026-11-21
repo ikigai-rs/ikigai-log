@@ -155,7 +155,7 @@ pub const TOOL_CALL_CLASS: &str = "https://ikigai-rs.dev/ns/log#ToolCall";
 pub const SESSION_PROPERTY: &str = "https://ikigai-rs.dev/ns/log#session";
 /// The `key=` column [`SESSION_PROPERTY`] is bound to in the built-in
 /// vocabulary: what `grep 'session=…'` looks for, and what
-/// `urn:log:session:{session}` selects a trail by.
+/// `urn:log:trail:session:{session}` selects a trail by.
 pub const SESSION_KEY: &str = "session";
 /// `log:Dropped` — always-land. What an observer that cannot fail upward leaves
 /// behind when it loses something.

@@ -442,7 +442,7 @@ log:neededCapability a rdf:Property ;
 # Written by ikigai_log::ToolCallLog (ledger #3962), for a host that observes an
 # agent's tool calls. By default a line states the arguments' DIGEST and never
 # their text; the text columns are the writer's opt-in. One session's trail is
-# read at urn:log:session:{session}, under urn:cap:log:read:session:{session}.
+# read at urn:log:trail:session:{session}, under urn:cap:log:read:session:{session}.
 
 log:Session a rdfs:Class ;
     rdfs:subClassOf prov:Activity ;
@@ -461,13 +461,13 @@ log:ToolCall a rdfs:Class ;
     log:minLevel log:info ;
     log:subjectPredicate log:calledTool ;
     rdfs:label "ToolCall" ;
-    rdfs:comment "One tool call an agent made: which tool (the subject column, urn:tool:{name}, as log:calledTool), in which session (log:session), how it went (log:outcome: `ok`, `refused` or `failed`; log:durationMs), and with what arguments, as their digest (log:argumentsDigest) and, only where the writer opted in, their text (log:argumentsText). The default line holds no argument or result text, so a segment can be shipped without shipping a secret an argument carried. At log:info, the day-to-day default." .
+    rdfs:comment "One tool call an agent made: which tool (the subject column, urn:log:tool:name:{name}, as log:calledTool), in which session (log:session), how it went (log:outcome: `ok`, `refused` or `failed`; log:durationMs), and with what arguments, as their digest (log:argumentsDigest) and, only where the writer opted in, their text (log:argumentsText). The default line holds no argument or result text, so a segment can be shipped without shipping a secret an argument carried. At log:info, the day-to-day default." .
 
 log:calledTool a rdf:Property ;
     rdfs:domain log:Entry ;
     rdfs:range rdfs:Resource ;
     rdfs:label "calledTool" ;
-    rdfs:comment "The tool a log:ToolCall called: the subject column, urn:tool:{name}, the tool's name percent-encoded to ASCII. NOT a sub-property of prov:used: a refused call used nothing, and log:outcome says which it was." .
+    rdfs:comment "The tool a log:ToolCall called: the subject column, urn:log:tool:name:{name}, the tool's name percent-encoded to ASCII. NOT a sub-property of prov:used: a refused call used nothing, and log:outcome says which it was." .
 
 log:argumentsDigest a rdf:Property ;
     log:keyName "args" ;

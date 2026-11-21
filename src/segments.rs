@@ -1424,19 +1424,19 @@ impl Endpoint for SegmentsEndpoint {
 }
 
 // =====================================================================================
-// urn:log:session:{session} — one session's trail, across every segment
+// urn:log:trail:session:{session} — one session's trail, across every segment
 // =====================================================================================
 
 #[cfg(not(target_family = "wasm"))]
-/// One session's trail: `urn:log:session:` then the session's IRI, verbatim
-/// (`urn:log:session:urn:claude:session:4f1c`). **Bound above
+/// One session's trail: `urn:log:trail:session:` then the session's IRI, verbatim
+/// (`urn:log:trail:session:urn:claude:session:4f1c`). **Bound above
 /// [`SEGMENT_TEMPLATE`]**, which would otherwise read it as a segment.
-pub const SESSION_TEMPLATE: &str = "urn:log:session:{session}";
+pub const SESSION_TEMPLATE: &str = "urn:log:trail:session:{session}";
 
 #[cfg(not(target_family = "wasm"))]
-/// What `urn:log:session:` is followed by in a trail's IRI and a session
+/// What `urn:log:trail:session:` is followed by in a trail's IRI and a session
 /// capability.
-pub const SESSION_PREFIX: &str = "urn:log:session:";
+pub const SESSION_PREFIX: &str = "urn:log:trail:session:";
 
 #[cfg(not(target_family = "wasm"))]
 /// The capability family a trail is read under: `urn:cap:log:read:session:`
@@ -1586,18 +1586,18 @@ impl Endpoint for SessionTrailEndpoint {
     }
 
     fn name(&self) -> &str {
-        "log-session-trail"
+        "log-trail"
     }
 
     fn describe(&self) -> Description {
-        Description::new("log-session-trail")
+        Description::new("log-trail")
             .title("One session's trail")
             .summary(
                 "Every entry whose `session=` column names this session, in every segment in \
                  this process's log directory, as text/turtle: each segment that holds one \
                  contributes its header and those entries, under the entries' own \
                  urn:log:{segment}:{seq} IRIs, so the trail joins to the segments it came from. \
-                 The IRI is `urn:log:session:` then the session's IRI verbatim. Read under \
+                 The IRI is `urn:log:trail:session:` then the session's IRI verbatim. Read under \
                  `urn:cap:log:read:session:` then the same IRI, one scope per session, which \
                  `urn:cap:log:read` does not imply. A host may limit how far back it reads \
                  (LogHandle::set_session_retention_ms); the limit removes nothing from a \

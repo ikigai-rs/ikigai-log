@@ -26,7 +26,7 @@ This is a library a host uses to write and read its log. People read its files w
   Its subject and free-text columns are percent-encoded to ASCII, so they hold no control or
   bidirectional formatting character at all, and a column cut at `MAX_FIELD` ends with `…`.
 - **Tool-call lines** (`src/tool_call.rs`): one `log:ToolCall` entry per tool call,
-  `… log:ToolCall urn:tool:<name> session=… outcome=ok|refused|failed dur=… args=sha256:…`.
+  `… log:ToolCall urn:log:tool:name:<name> session=… outcome=ok|refused|failed dur=… args=sha256:…`.
   The tool's name is percent-encoded to ASCII; the outcome is a word. The digests are
   long opaque strings (see Known limitations). Opted-in `args-text=` and `result-text=`
   are quoted and escaped like every free-text value, and a cut is named in words in a

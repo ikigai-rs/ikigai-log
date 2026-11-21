@@ -379,7 +379,7 @@ impl Access {
 
     /// The session the request was made in, written as a bare `session=`
     /// column so the door line reads in that session's trail
-    /// (`urn:log:session:{session}`). The session's NAME, an IRI the host
+    /// (`urn:log:trail:session:{session}`). The session's NAME, an IRI the host
     /// minted, and never a token or cookie that would let someone resume it.
     #[must_use]
     pub fn session(mut self, session: Session) -> Access {

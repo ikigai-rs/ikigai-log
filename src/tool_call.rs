@@ -2,14 +2,14 @@
 //! and the `session=` column that groups a trail.
 //!
 //! ```text
-//! 2026-11-21T23:04:17.512Z log:ToolCall urn:tool:Bash session=urn:claude:session:4f1c outcome=ok dur=184 args=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+//! 2026-11-21T23:04:17.512Z log:ToolCall urn:log:tool:name:Bash session=urn:claude:session:4f1c outcome=ok dur=184 args=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 //! ```
 //!
 //! The ikigai-log half of the workspace design's tool-call trail (ledger
 //! #3962): a host that observes an agent's tool calls (a Claude hook, a worker
 //! loop) writes them here, into the same hash-chained segment as everything
 //! else the process logs, and a reader asks for one session's trail at
-//! `urn:log:session:{session}` ([`SessionTrailEndpoint`](crate::SessionTrailEndpoint)).
+//! `urn:log:trail:session:{session}` ([`SessionTrailEndpoint`](crate::SessionTrailEndpoint)).
 //!
 //! ## By default the line holds no argument text
 //!
@@ -53,12 +53,12 @@ use crate::vocabulary::{SESSION_KEY, TOOL_CALL_CLASS};
 use crate::WriteError;
 
 /// The namespace a tool's name is written under as the subject of a
-/// `log:ToolCall` line: `urn:tool:Bash`, `urn:tool:mcp__github__create_issue`.
+/// `log:ToolCall` line: `urn:log:tool:name:Bash`, `urn:log:tool:name:mcp__github__create_issue`.
 ///
 /// ```
-/// assert_eq!(ikigai_log::TOOL_NS, "urn:tool:");
+/// assert_eq!(ikigai_log::TOOL_NS, "urn:log:tool:name:");
 /// ```
-pub const TOOL_NS: &str = "urn:tool:";
+pub const TOOL_NS: &str = "urn:log:tool:name:";
 
 /// The longest a session IRI may be, in bytes: core's principal bound, for the
 /// same reason it bounds a principal. A session is refused rather than cut.

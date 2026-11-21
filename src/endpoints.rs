@@ -167,7 +167,7 @@ pub struct LogHandle {
     append_cutter: Mutex<Option<append::AppendState>>,
     #[cfg(not(target_family = "wasm"))]
     append_cuts_enabled: std::sync::atomic::AtomicBool,
-    /// How far back `urn:log:session:{session}` reads, in milliseconds; `None`
+    /// How far back `urn:log:trail:session:{session}` reads, in milliseconds; `None`
     /// reads every entry still on disk. See [`LogHandle::set_session_retention_ms`].
     session_retention_ms: Mutex<Option<u64>>,
 }
@@ -231,7 +231,7 @@ impl LogHandle {
     }
 
     /// Set how far back a session's trail is served, in milliseconds before
-    /// the reader's clock: `urn:log:session:{session}` leaves out every entry
+    /// the reader's clock: `urn:log:trail:session:{session}` leaves out every entry
     /// older than that. `None`, the default, serves every entry still on disk.
     ///
     /// A limit on what the trail READS, which is the host's to set: it removes

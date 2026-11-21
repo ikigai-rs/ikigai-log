@@ -139,7 +139,7 @@
 //! the outcome (`ok`, `refused`, `failed`), the duration, and the arguments'
 //! DIGEST. The argument and result text are written only when the writer opts
 //! in ([`ToolCallLog::with_text`]), so a default line holds no secret an
-//! argument carried. `urn:log:session:{session}` ([`SessionTrailEndpoint`])
+//! argument carried. `urn:log:trail:session:{session}` ([`SessionTrailEndpoint`])
 //! reads one session's trail as a graph, under its own capability,
 //! `urn:cap:log:read:session:{session}`.
 //!

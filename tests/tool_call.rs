@@ -1,6 +1,6 @@
 //! The tool-call line and the session trail (ledger #3962): one `log:ToolCall`
 //! per tool call, a `session=` column any line may carry, and
-//! `urn:log:session:{session}` reading one session's trail under its own
+//! `urn:log:trail:session:{session}` reading one session's trail under its own
 //! capability, within a retention limit the host sets.
 //!
 //! Each test parses or transrepts what was written rather than matching
@@ -133,7 +133,7 @@ fn a_default_line_carries_no_argument_or_result_text() {
     let args = format!(r#"{{"command":"echo {SECRET}"}}"#);
     assert_eq!(
         entries[0],
-        Entry::new(at(T0 + 5), TOOL_CALL_CLASS, "urn:tool:Bash")
+        Entry::new(at(T0 + 5), TOOL_CALL_CLASS, "urn:log:tool:name:Bash")
             .with(SESSION_KEY, SESSION_A)
             .with("outcome", "ok")
             .with("dur", "184")
@@ -158,7 +158,7 @@ fn the_line_is_one_greppable_line_with_a_bare_session_column() {
         .expect("a tool-call line");
     assert!(!line.contains('\n'));
     assert!(
-        line.starts_with("2023-11-14T22:13:20.005Z log:ToolCall urn:tool:Bash "),
+        line.starts_with("2023-11-14T22:13:20.005Z log:ToolCall urn:log:tool:name:Bash "),
         "time, class, subject: {line}"
     );
     assert!(line.contains(&format!(" session={SESSION_A} ")), "{line}");
@@ -234,7 +234,10 @@ fn a_tool_name_is_percent_encoded_into_its_subject() {
         "{}",
         ToolOutcome::Refused,
     );
-    assert_eq!(call.tool_iri().unwrap(), "urn:tool:mcp__git%20hub__issue");
+    assert_eq!(
+        call.tool_iri().unwrap(),
+        "urn:log:tool:name:mcp__git%20hub__issue"
+    );
     let empty = ToolCall::new(at(T0), session(SESSION_A), "", "{}", ToolOutcome::Ok);
     assert!(matches!(empty.entry(), Err(ToolCallError::Tool { .. })));
 }
@@ -273,7 +276,10 @@ fn the_graph_states_the_call_in_declared_terms() {
             .collect()
     };
     let named = |iri: &str| Term::NamedNode(oxrdf::NamedNode::new(iri).unwrap());
-    assert_eq!(object(&log("calledTool")), [&named("urn:tool:Bash")]);
+    assert_eq!(
+        object(&log("calledTool")),
+        [&named("urn:log:tool:name:Bash")]
+    );
     assert_eq!(object(&log("session")), [&named(SESSION_A)]);
     assert_eq!(
         object(&log("outcome")),
@@ -342,7 +348,7 @@ fn node_of(triples: &[Triple], class: &str) -> String {
 }
 
 // =====================================================================================
-// urn:log:session:{session}
+// urn:log:trail:session:{session}
 // =====================================================================================
 
 /// A scratch directory that removes itself.
@@ -439,7 +445,7 @@ fn read_trail(
 ) -> ikigai_core::Result<Vec<Triple>> {
     let request = Request::new(
         Verb::Source,
-        Iri::parse(format!("urn:log:session:{of}")).expect("an IRI"),
+        Iri::parse(format!("urn:log:trail:session:{of}")).expect("an IRI"),
     );
     let repr = futures::executor::block_on(kernel.issue(request, capability))?;
     let turtle = String::from_utf8(repr.bytes.to_vec()).expect("utf-8");
@@ -470,7 +476,11 @@ fn a_trail_is_one_sessions_entries_under_its_own_capability() {
     let triples = read_trail(&kernel, SESSION_A, &own).expect("the session's own scope reads it");
     assert_eq!(
         steps(&triples),
-        ["<urn:cms:page:home>", "<urn:tool:Edit>", "<urn:tool:Read>"],
+        [
+            "<urn:cms:page:home>",
+            "<urn:log:tool:name:Edit>",
+            "<urn:log:tool:name:Read>"
+        ],
         "A's two calls and its door line, and none of B's"
     );
     let sessions: Vec<String> = triples
@@ -494,7 +504,7 @@ fn a_trail_is_one_sessions_entries_under_its_own_capability() {
         &Capability::scoped([session_capability(SESSION_B)]),
     )
     .expect("B reads B");
-    assert_eq!(steps(&b), ["<urn:tool:Bash>"]);
+    assert_eq!(steps(&b), ["<urn:log:tool:name:Bash>"]);
 }
 
 #[test]
@@ -528,7 +538,7 @@ fn the_host_sets_how_far_back_a_trail_reads() {
     handle.set_session_retention_ms(Some(60_000));
     assert_eq!(
         steps(&read_trail(&kernel, SESSION_A, &own).unwrap()),
-        ["<urn:cms:page:home>", "<urn:tool:Edit>"]
+        ["<urn:cms:page:home>", "<urn:log:tool:name:Edit>"]
     );
     // And the segment itself is untouched.
     let segment = futures::executor::block_on(
@@ -580,6 +590,6 @@ fn the_space_binds_the_trail_above_the_segment_template() {
         SESSION_A,
         &Capability::scoped([session_capability(SESSION_A)]),
     )
-    .expect("resolved as a trail, not as a segment named `session:…`");
-    assert_eq!(steps(&triples), ["<urn:tool:Read>"]);
+    .expect("resolved as a trail, not as a segment named `trail:session:…`");
+    assert_eq!(steps(&triples), ["<urn:log:tool:name:Read>"]);
 }

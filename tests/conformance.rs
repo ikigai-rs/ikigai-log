@@ -150,7 +150,7 @@ const CONFIG: &str = "log-config";
 const SEGMENTS: &str = "log-segments";
 const VERIFY: &str = "log-verify";
 const SEGMENT: &str = "log-segment";
-const SESSION_TRAIL: &str = "log-session-trail";
+const SESSION_TRAIL: &str = "log-trail";
 
 /// The session the fixture's one tool-call line is written in, so the trail
 /// endpoint the walk probes has an entry to answer with.

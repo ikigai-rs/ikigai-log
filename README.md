@@ -799,12 +799,12 @@ one `log:ToolCall` per call through `ToolCallLog`, into the same hash-chained
 segment as everything else:
 
 ```
-2026-11-21T23:04:17.512Z log:ToolCall urn:tool:Bash seq=9 session=urn:claude:session:4f1c outcome=ok dur=184 args=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+2026-11-21T23:04:17.512Z log:ToolCall urn:log:tool:name:Bash seq=9 session=urn:claude:session:4f1c outcome=ok dur=184 args=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 ```
 
 | column | property | holds |
 |---|---|---|
-| the subject | `log:calledTool` | `urn:tool:` and the tool's name, percent-encoded |
+| the subject | `log:calledTool` | `urn:log:tool:name:` and the tool's name, percent-encoded |
 | `session=` | `log:session` | the session's IRI, bare; any line may carry it |
 | `outcome=` | `log:outcome` | `ok`, `refused` or `failed` |
 | `dur=` | `log:durationMs` | milliseconds |
@@ -830,8 +830,8 @@ calls.record(&ToolCall::new(started, session, "Bash", arguments_json, ToolOutcom
 * **`session=` is a column any line may carry.** `Access::session` puts a door
   line into the same trail. The session IRI is a name the host minted, never a
   token that would resume the session.
-* **One session's trail is a resource.** `urn:log:session:{session}`, with the
-  session's IRI verbatim (`urn:log:session:urn:claude:session:4f1c`), answers the
+* **One session's trail is a resource.** `urn:log:trail:session:{session}`, with the
+  session's IRI verbatim (`urn:log:trail:session:urn:claude:session:4f1c`), answers the
   PROV-aligned graph of every entry carrying that `session=`, in every segment in
   the directory, under the entries' own `urn:log:{segment}:{seq}` IRIs. It reads
   under `urn:cap:log:read:session:{session}`, one scope per session, which
@@ -989,7 +989,7 @@ exercised: a live segment is served uncacheable, a finished one is cached under
 its file's golden thread, and both name `urn:file:<path>` as the thread a watcher
 must cut. `urn:log:transrept` is declared `pure` and `cacheable` (Turtle from
 bytes, no file, no clock); `urn:log:config`, `urn:log:segments`,
-`urn:log:verify` and `urn:log:session:{session}` are live by design and say so in their descriptions.
+`urn:log:verify` and `urn:log:trail:session:{session}` are live by design and say so in their descriptions.
 
 **The space has no name of its own, on purpose.** Both constructors,
 `endpoints::space(handle)` and `endpoints::space_with_vocabulary(handle,
@@ -1007,7 +1007,7 @@ faces and requires every `log:` term they emit to be a subject of that file — 
 crate's README and held to the three terms a seal carries.
 
 No check is skipped. The seven ids (`log-write`, `log-config`, `log-segments`,
-`log-verify`, `log-session-trail`, `log-segment`, `log-transrept`) are kebab-case nouns, so **NAMES**
+`log-verify`, `log-trail`, `log-segment`, `log-transrept`) are kebab-case nouns, so **NAMES**
 runs like the rest; they were camelCase (`logWrite` and so on) until 0.8.0 (see
 [CHANGELOG.md](CHANGELOG.md)). What the suite cannot see is pinned by hand in the same
 file: declared outputs against served media types in both directions with `as`
