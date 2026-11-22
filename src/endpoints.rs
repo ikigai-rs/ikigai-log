@@ -73,7 +73,8 @@ use crate::config::{level_iri, ConfigError, Destination, Patch};
 use crate::line::{parse_fields, shown, Entry, Timestamp};
 #[cfg(not(target_family = "wasm"))]
 use crate::segments::{
-    SegmentEndpoint, SegmentsEndpoint, VerifyEndpoint, SEGMENTS_IRI, SEGMENT_TEMPLATE, VERIFY_IRI,
+    SegmentEndpoint, SegmentsEndpoint, SessionTrailEndpoint, VerifyEndpoint, SEGMENTS_IRI,
+    SEGMENT_TEMPLATE, SESSION_TEMPLATE, VERIFY_IRI,
 };
 use crate::segments::{TransreptEndpoint, TRANSREPT_IRI};
 #[cfg(not(target_family = "wasm"))]
@@ -166,6 +167,9 @@ pub struct LogHandle {
     append_cutter: Mutex<Option<append::AppendState>>,
     #[cfg(not(target_family = "wasm"))]
     append_cuts_enabled: std::sync::atomic::AtomicBool,
+    /// How far back `urn:log:trail:session:{session}` reads, in milliseconds; `None`
+    /// reads every entry still on disk. See [`LogHandle::set_session_retention_ms`].
+    session_retention_ms: Mutex<Option<u64>>,
 }
 
 struct State {
@@ -211,6 +215,7 @@ impl LogHandle {
             append_cutter: append::empty(),
             #[cfg(not(target_family = "wasm"))]
             append_cuts_enabled: std::sync::atomic::AtomicBool::new(false),
+            session_retention_ms: Mutex::new(None),
             home,
             app,
             state: Mutex::new(State {
@@ -223,6 +228,30 @@ impl LogHandle {
                 rotation_error: None,
             }),
         }
+    }
+
+    /// Set how far back a session's trail is served, in milliseconds before
+    /// the reader's clock: `urn:log:trail:session:{session}` leaves out every entry
+    /// older than that. `None`, the default, serves every entry still on disk.
+    ///
+    /// A limit on what the trail READS, which is the host's to set: it removes
+    /// nothing from a segment, so the chain and `urn:log:verify` are untouched,
+    /// and an older entry stays readable to whoever holds `urn:cap:log:read`
+    /// at the segment's own IRI.
+    pub fn set_session_retention_ms(&self, retention_ms: Option<u64>) {
+        *self
+            .session_retention_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retention_ms;
+    }
+
+    /// How far back a session's trail is served, as
+    /// [`set_session_retention_ms`](Self::set_session_retention_ms) set it.
+    pub fn session_retention_ms(&self) -> Option<u64> {
+        *self
+            .session_retention_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A closed handle over the machine's own config home, with `base` as the
@@ -1767,6 +1796,16 @@ pub fn space_with_vocabulary(handle: Arc<LogHandle>, vocabulary: Arc<Vocabulary>
         .bind(
             Exact::new(VERIFY_IRI),
             VerifyEndpoint::new(handle.clone(), vocabulary.clone()),
+        )
+        // ABOVE the segment template too, which would read a trail's IRI as a
+        // segment named `session:…`.
+        .bind(
+            UriTemplate::parse(SESSION_TEMPLATE).expect("SESSION_TEMPLATE is a valid template"),
+            SessionTrailEndpoint::new(
+                handle.clone(),
+                vocabulary.clone(),
+                Arc::new(ikigai_core::SystemClock),
+            ),
         )
         // LAST. See the note above: this template matches every IRI in the space.
         .bind(

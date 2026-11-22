@@ -146,6 +146,17 @@ pub const CACHE_HIT_CLASS: &str = "https://ikigai-rs.dev/ns/log#CacheHit";
 /// `log:Access` — one request a host's door served, written by
 /// [`crate::AccessLog`]. At `info`.
 pub const ACCESS_CLASS: &str = "https://ikigai-rs.dev/ns/log#Access";
+/// `log:ToolCall` — one tool call an agent made, written by
+/// [`crate::ToolCallLog`]: the tool as its subject, and the session, the
+/// outcome, the duration and the arguments' digest as columns. At `info`.
+pub const TOOL_CALL_CLASS: &str = "https://ikigai-rs.dev/ns/log#ToolCall";
+/// `log:session` — the session a line belongs to, as the session's IRI.
+/// Declared on `log:Entry`, so any line may carry it.
+pub const SESSION_PROPERTY: &str = "https://ikigai-rs.dev/ns/log#session";
+/// The `key=` column [`SESSION_PROPERTY`] is bound to in the built-in
+/// vocabulary: what `grep 'session=…'` looks for, and what
+/// `urn:log:trail:session:{session}` selects a trail by.
+pub const SESSION_KEY: &str = "session";
 /// `log:Dropped` — always-land. What an observer that cannot fail upward leaves
 /// behind when it loses something.
 pub const DROPPED_CLASS: &str = "https://ikigai-rs.dev/ns/log#Dropped";

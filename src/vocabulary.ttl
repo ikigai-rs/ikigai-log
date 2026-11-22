@@ -45,7 +45,7 @@
 <https://ikigai-rs.dev/ns/log> a owl:Ontology ;
     rdfs:label "ikigai-log vocabulary" ;
     rdfs:comment "The log's own terms: entry classes under log:Entry (a prov:Activity), the level ladder, and the key bindings that make the line format's key= columns into RDF. Also the transreptor's term table and the level dial's threshold table, embedded in the ikigai-log crate." ;
-    owl:versionInfo "0.13.0" .
+    owl:versionInfo "0.14.0" .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The spine
@@ -375,10 +375,10 @@ log:verb a rdf:Property ;
 
 log:outcome a rdf:Property ;
     log:keyName "outcome" ;
-    rdfs:domain log:Access ;
+    rdfs:domain log:Entry ;
     rdfs:range xsd:string ;
     rdfs:label "outcome" ;
-    rdfs:comment "How the request ended, as one token: `ok`, or the kind of error the door answered with (`denied`, `not-found`, …). Never the error's message, which may carry a path or a host." .
+    rdfs:comment "How the request or call ended, as one token: on a log:Access `ok`, or the kind of error the door answered with (`denied`, `not-found`, …); on a log:ToolCall `ok`, `refused` or `failed`. Never the error's message, which may carry a path or a host. Domain log:Entry, not log:Access, since 0.14: both classes write the column, and a narrower domain would type every tool call a door request." .
 
 log:byteCount a rdf:Property ;
     log:keyName "bytes" ;
@@ -434,6 +434,75 @@ log:neededCapability a rdf:Property ;
     rdfs:range xsd:string ;
     rdfs:label "neededCapability" ;
     rdfs:comment "The capabilities a refused request lacked, as the door knew them: capability IRIs separated by single spaces, each percent-encoded to ASCII as the subject is, so none holds a space. Written only beside `outcome=denied`, and only when the door knows which scope was missing; a request that was served lacked nothing. It tells a request that used an old spelling of a scope from any other refusal. Capability IRIs are already public, in every endpoint's description and the catalog, so it discloses nothing new. A plain literal, as log:servedQuery is, because it is cut at ikigai_log::MAX_FIELD bytes and ended with `…` when it is cut, and a cut IRI is not an IRI. NOT log:deniedScope: that is the kernel's own `denied=` column on a log:CapabilityDenied, and this is what a host's door said on its own line." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sessions and tool calls — an agent's trail, one line per tool call
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Written by ikigai_log::ToolCallLog (ledger #3962), for a host that observes an
+# agent's tool calls. By default a line states the arguments' DIGEST and never
+# their text; the text columns are the writer's opt-in. One session's trail is
+# read at urn:log:trail:session:{session}, under urn:cap:log:read:session:{session}.
+
+log:Session a rdfs:Class ;
+    rdfs:subClassOf prov:Activity ;
+    rdfs:label "Session" ;
+    rdfs:comment "One working session of an agent: what the host that ran it names with one IRI, so the lines written during it can be read as one trail. A prov:Activity, because a session is something that happened over a time; the entries that carry log:session are the steps it is made of. The log does not mint session IRIs: the host does, and the log writes down what it was told." .
+
+log:session a rdf:Property ;
+    log:keyName "session" ;
+    rdfs:domain log:Entry ;
+    rdfs:range log:Session ;
+    rdfs:label "session" ;
+    rdfs:comment "The session this entry belongs to, as the session's IRI, written bare so `grep 'session=urn:…'` finds a trail. Declared on log:Entry, so any line may carry it; every log:ToolCall does. NOT a sub-property of a PROV term: PROV has no part-of between activities, and prov:wasInformedBy would claim the session generated something the entry used." .
+
+log:ToolCall a rdfs:Class ;
+    rdfs:subClassOf log:Entry ;
+    log:minLevel log:info ;
+    log:subjectPredicate log:calledTool ;
+    rdfs:label "ToolCall" ;
+    rdfs:comment "One tool call an agent made: which tool (the subject column, urn:log:tool:name:{name}, as log:calledTool), in which session (log:session), how it went (log:outcome: `ok`, `refused` or `failed`; log:durationMs), and with what arguments, as their digest (log:argumentsDigest) and, only where the writer opted in, their text (log:argumentsText). The default line holds no argument or result text, so a segment can be shipped without shipping a secret an argument carried. At log:info, the day-to-day default." .
+
+log:calledTool a rdf:Property ;
+    rdfs:domain log:Entry ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "calledTool" ;
+    rdfs:comment "The tool a log:ToolCall called: the subject column, urn:log:tool:name:{name}, the tool's name percent-encoded to ASCII. NOT a sub-property of prov:used: a refused call used nothing, and log:outcome says which it was." .
+
+log:argumentsDigest a rdf:Property ;
+    log:keyName "args" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "argumentsDigest" ;
+    rdfs:comment "The digest of the tool call's arguments as the tool received them: `sha256:` then 64 lowercase hex digits, the same tagged form a seal uses. Written on every log:ToolCall instead of the text. It tells equal arguments from different ones and lets a reader who holds the arguments check them; it does not keep short or guessable arguments secret, since a digest of `ls` is one guess away." .
+
+log:resultDigest a rdf:Property ;
+    log:keyName "result" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "resultDigest" ;
+    rdfs:comment "The digest of what the tool answered, in the form of log:argumentsDigest. Written when the host handed the result over." .
+
+log:argumentsText a rdf:Property ;
+    log:keyName "args-text" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "argumentsText" ;
+    rdfs:comment "The tool call's arguments as text. Written ONLY when the writer opted in for the whole log (ikigai_log::ToolCallLog::with_text), never by default. Quoted and escaped like every free-text column, and cut at ikigai_log::MAX_TOOL_TEXT bytes with a `…`; a cut is named in log:cutColumn, because the text may hold a `…` of its own." .
+
+log:resultText a rdf:Property ;
+    log:keyName "result-text" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "resultText" ;
+    rdfs:comment "What the tool answered, as text. Written only under the same opt-in as log:argumentsText, and cut the same way." .
+
+log:cutColumn a rdf:Property ;
+    log:keyName "cut" ;
+    rdfs:domain log:Entry ;
+    rdfs:range xsd:string ;
+    rdfs:label "cutColumn" ;
+    rdfs:comment "Which of this line's text columns were cut, by key, comma-separated (`args-text`, `result-text`). Absent when nothing was cut. The digest columns always cover the whole text." .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The unstructured escape hatch — permitted, honest, and MEASURABLE

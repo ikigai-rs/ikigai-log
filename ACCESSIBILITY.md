@@ -25,6 +25,12 @@ This is a library a host uses to write and read its log. People read its files w
   `… log:Access <subject> door=… verb=… outcome=… bytes=… dur=… principal=… credential=… grant=… q=… needs=…`.
   Its subject and free-text columns are percent-encoded to ASCII, so they hold no control or
   bidirectional formatting character at all, and a column cut at `MAX_FIELD` ends with `…`.
+- **Tool-call lines** (`src/tool_call.rs`): one `log:ToolCall` entry per tool call,
+  `… log:ToolCall urn:log:tool:name:<name> session=… outcome=ok|refused|failed dur=… args=sha256:…`.
+  The tool's name is percent-encoded to ASCII; the outcome is a word. The digests are
+  long opaque strings (see Known limitations). Opted-in `args-text=` and `result-text=`
+  are quoted and escaped like every free-text value, and a cut is named in words in a
+  `cut=` column as well as ended with `…`.
 - **The verify report** from `urn:log:verify` (`ChainReport::render` in `src/chain.rs`,
   `text/plain`): one `segment <iri> OK|BROKEN entries=… seals=… level=… prev=… signed=… head=…`
   line per segment, each finding indented under it and prefixed `BROKEN` or `noted`, and a last
@@ -36,8 +42,8 @@ This is a library a host uses to write and read its log. People read its files w
   segment IRIs, one per line; `urn:log:config` answers the effective configuration as TOML; a
   segment or the transreptor answers Turtle.
 - **Errors**: the `Display` of `ParseError` (`bad timestamp: …`, `unbound prefix in CURIE: …`),
-  `RenderError`, `WriteError`, `ConfigError`, `VocabError` and `AccessError`, and the endpoints'
-  refusals.
+  `RenderError`, `WriteError`, `ConfigError`, `VocabError`, `AccessError` and
+  `ToolCallError`, and the endpoints' refusals.
 
 Not this repository's: how a host or a terminal shows any of this, and the display of core's
 error kinds.
@@ -52,7 +58,7 @@ Verified by reading the source:
   formatting characters (U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F, U+061C) as
   `\u{hex}`, so a reader or a screen reader moving line by line meets whole entries, no value
   reaches the screen as a control sequence, and no value reorders the rest of its line. A
-  subject, class or principal holding one is refused rather than written.
+  subject, class, principal or session holding one is refused rather than written.
 - **An error is one printable line.** An error or report line that repeats its input (`ParseError`,
   `RenderError`, `GraphError`, `PrincipalError`, `AccessError`, `WriteError`, `ConfigError`,
   `VocabError`, every verify finding and the verify report's segment line, and an endpoint's text
@@ -86,6 +92,7 @@ They do not establish usability, pronunciation, reading order in a host, or WCAG
 | Fixed-width UTC timestamps | Pass | `src/tests.rs`: `timestamps_are_fixed_width_utc_and_round_trip`, run by `cargo test` with the tools and date above. Checks timestamp text and round trips, not local-time comprehension. |
 | Verify outcomes expressed in words | Pass | `src/tests.rs`: `verify_binds_above_the_template_and_reports_through_the_kernel` checks `OK`, `BROKEN` and `verified 1 segment(s), 0 broken`; `a_crashed_tail_is_noted_and_not_called_broken` checks nonbreaking crash findings. Run by `cargo test` with the tools and date above; no screen reader announcement check. |
 | Control and bidirectional formatting characters in log output | Pass | `tests/control_characters.rs`, run by `cargo test` with the tools and date above. Checks escaping, rejection in IRI columns and principals, parser/verifier/transreptor round trips and older-segment compatibility; no terminal or assistive technology session. |
+| Tool-call line: no argument text by default, one line, escaped session errors | Pass | `tests/tool_call.rs`, run by `cargo test` on 2026-11-21 with Cargo 1.99.0 and rustc 1.99.0 on Linux, against the branch that added it (ledger #3962); CI repeats it. Checks bytes, columns, round trips and escaped `ToolCallError` text, not whether people understand the columns. |
 | Door-line encoding, columns and truncation marker | Pass | `tests/access.rs`, run by `cargo test` with the tools and date above. Checks Turtle round trips, anonymous caller fields, the `…` cut marker and escaped `AccessError` text; does not test whether people understand the columns. |
 | Quoted input in errors, findings and endpoint answers | Pass | `tests/error_text.rs`, run by `cargo test` with the tools and date above. Checks control/bidirectional character escaping and unchanged printable text, including streaming errors and report segment names; does not evaluate error comprehension. |
 | Timestamp bounds and payload round trips | Pass | `tests/audit_3436.rs`: `out_of_format_timestamps_are_refused_before_writing` and `timestamp_endpoints_and_payloads_survive_lines_and_turtle`, run by `cargo test` with the tools and date above. Checks printable rejection beyond year 9999 and supported timestamp/payload round trips; no assistive technology check. |
@@ -104,7 +111,7 @@ They do not establish usability, pronunciation, reading order in a host, or WCAG
 Recorded from source review on 2026-10-31 and 2026-11-02, not assistive technology
 testing. The user impacts below remain unevaluated:
 
-- **Long opaque strings.** `#seal` lines, `@prev`, and the report's `prev=` and `head=` carry
+- **Long opaque strings.** `#seal` lines, `@prev`, a tool-call line's `args=` and `result=`, and the report's `prev=` and `head=` carry
   full SHA-256 digests, and a seal mismatch finding states two; a screen reader may read them
   as a long sequence of characters, depending on its settings.
 - **Findings are grouped by indentation.** A finding belongs to the segment line above it only
@@ -146,3 +153,4 @@ goes through [private vulnerability reporting](https://github.com/ikigai-rs/ikig
 | 2026-11-02 | The verify report, every finding and every error show the names they repeat escaped. |
 | 2026-11-02 | Log lines escape bidirectional formatting characters; the limitation row is removed. |
 | 2026-11-12 | Record current format-test results and blocked accessibility checks with evidence and scope. |
+| 2026-11-21 | The tool-call line, its error text and its test row are listed. |
