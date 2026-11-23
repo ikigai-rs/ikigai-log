@@ -14,6 +14,16 @@ with the first release that changes a public name.
 
 ### Fixed
 
+- `urn:log:verify` streams the directory instead of reading it all under a 64 MiB
+  total budget (ledger #4099), hence 0.14.1. A host that never prunes had a log over
+  64 MiB answer `over budget` to every verify, `segment=` included, for good. Each
+  segment is now read under its own 16 MiB bound, verified alone and dropped; the
+  links across rotations are checked from the previous segment's report. Memory is
+  one segment plus the report, and the directory's total has no bound (no time
+  budget either). `segment=` now reads the segment it names and its predecessor,
+  plus every other segment's header and last seal, and reports that one segment
+  with its link checked, where it used to report the whole chain it belonged to.
+  Report wording is unchanged. `MAX_VERIFY_BYTES` now bounds only the session trail.
 - A flush failure after a complete entry or seal write no longer makes the writer
   reuse its sequence number or repeat the seal. A later explicit seal retries an
   outstanding flush without appending another checkpoint (ledger #3436). I/O

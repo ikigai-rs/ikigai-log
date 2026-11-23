@@ -3493,6 +3493,73 @@ fn verify_binds_above_the_template_and_reports_through_the_kernel() {
 }
 
 #[test]
+fn verify_streams_a_directory_larger_than_the_old_total_budget() {
+    // ★ The claim of ledger #4099, reproduced: verification read the whole
+    // directory under one 64 MiB budget, so a host that never prunes answered
+    // `over budget` to `urn:log:verify` — and to `segment=`, which read every
+    // file before filtering — for good. Generated, never committed: a chain of
+    // seven segments of ~10 MiB each, about 70 MiB in all.
+    let dir = Scratch::new("verify-streams");
+    let handle = chained_handle(dir.path(), "bug:big", "info", 1_700_000_000_000);
+    let chunk = "x".repeat(256 * 1024);
+    let mut now = 1_700_000_001_000;
+    let mut names = Vec::new();
+    for _ in 0..7 {
+        names.push(handle.open_segment().expect("open").0);
+        for _ in 0..40 {
+            handle.write(message(now, &chunk)).expect("writes");
+            now += 1;
+        }
+        handle.rotate(at(now)).expect("rotates");
+        now += 1;
+    }
+    handle.close(at(now)).expect("closes");
+    let total: u64 = std::fs::read_dir(dir.path())
+        .expect("the scratch dir")
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    assert!(
+        total > 64 * 1024 * 1024,
+        "the fixture exceeds 64 MiB: {total}"
+    );
+
+    let kernel = kernel(handle);
+    let body = text_of(&source(&kernel, VERIFY_IRI, &[]));
+    assert!(
+        body.contains("verified 8 segment(s), 0 broken"),
+        "every segment, one at a time, with its link checked: {body}"
+    );
+    for name in &names {
+        assert!(body.contains(&format!("segment {name} OK")), "{body}");
+    }
+
+    // `segment=` names one segment and reads it and its predecessor, never the
+    // directory — and still checks the link across the rotation.
+    let middle = &names[3];
+    let body = text_of(&source(&kernel, VERIFY_IRI, &[("segment", middle)]));
+    assert!(body.contains(&format!("segment {middle} OK")), "{body}");
+    assert!(body.contains("verified 1 segment(s), 0 broken"), "{body}");
+
+    // Tampering past the old budget is still found, and localized.
+    let path = path_of(dir.path(), &names[5]);
+    let honest = std::fs::read_to_string(&path).expect("readable");
+    std::fs::write(&path, honest.replacen("msg=xxxx", "msg=yxxx", 1)).expect("tampers");
+    let body = text_of(&source(&kernel, VERIFY_IRI, &[]));
+    assert!(
+        body.contains(&format!("segment {} BROKEN", names[5])),
+        "{body}"
+    );
+    assert!(body.contains("verified 8 segment(s), 1 broken"), "{body}");
+    let body = text_of(&source(&kernel, VERIFY_IRI, &[("segment", &names[6])]));
+    assert!(
+        body.contains(&format!("segment {} OK", names[6])),
+        "a successor's own chain and link still hold; the damage is its predecessor's: {body}"
+    );
+}
+
+#[test]
 fn verifying_without_the_capability_is_refused() {
     let dir = Scratch::new("verify-cap");
     let handle = chained_handle(dir.path(), "bug:cap", "info", 1_700_000_000_000);

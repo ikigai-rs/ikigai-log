@@ -967,21 +967,7 @@ pub fn verify_segment(
         }
     }
 
-    if let Some((predecessor, expected)) = predecessor {
-        match &header.prev {
-            Prev::Genesis => findings.push(Finding::UnexpectedGenesis {
-                predecessor: predecessor.to_string(),
-            }),
-            Prev::Seal(stated) if stated != expected => findings.push(Finding::PrevMismatch {
-                predecessor: predecessor.to_string(),
-                stated: stated.clone(),
-                expected: expected.to_string(),
-            }),
-            Prev::Seal(_) => {}
-        }
-    }
-
-    SegmentReport {
+    let mut report = SegmentReport {
         name: header.name,
         instance: header.instance,
         level: header.level,
@@ -997,6 +983,35 @@ pub fn verify_segment(
             .map(|(_, from, to)| (from, to))
             .collect(),
         findings,
+    };
+    if let Some(predecessor) = predecessor {
+        check_link(&mut report, predecessor);
+    }
+    report
+}
+
+/// Layer 3 for a segment already verified in isolation: its `@prev` against
+/// `predecessor`, `(its IRI, its chain head)`. Appends exactly what
+/// [`verify_segment`] would have appended had it been given the predecessor,
+/// so a walk can verify each segment alone, drop its bytes, and link it later.
+/// Bytes with no readable header have no `@prev` to check, and are left alone.
+pub(crate) fn check_link(report: &mut SegmentReport, (predecessor, expected): (&str, &str)) {
+    if report.is_unreadable() {
+        return;
+    }
+    match &report.prev {
+        Prev::Genesis => report.findings.push(Finding::UnexpectedGenesis {
+            predecessor: predecessor.to_string(),
+        }),
+        Prev::Seal(stated) if stated != expected => {
+            let stated = stated.clone();
+            report.findings.push(Finding::PrevMismatch {
+                predecessor: predecessor.to_string(),
+                stated,
+                expected: expected.to_string(),
+            })
+        }
+        Prev::Seal(_) => {}
     }
 }
 
@@ -1119,64 +1134,84 @@ pub(crate) fn verify_chain_walk(
     vocab: &Vocabulary,
     extent: WalkExtent,
 ) -> ChainReport {
-    let mut reports: Vec<SegmentReport> = Vec::with_capacity(segments.len());
+    let mut walk = ChainWalk::default();
     for (_, text) in segments {
-        let predecessor = reports
-            .last()
-            .map(|previous| (previous.name.clone(), previous.head.clone()));
-        let mut report = verify_segment(
-            text,
-            vocab,
-            predecessor
-                .as_ref()
-                .map(|(name, head)| (name.as_str(), head.as_str())),
-        );
-        // The bracket for a level change may be recorded in EITHER segment: the
-        // config write lands its entry in whatever segment was open at the time,
-        // and the change takes effect at the next one. It must name THIS change.
-        if let Some(previous) = reports.last() {
-            let changes: Vec<&(String, String)> = previous
-                .level_changes
-                .iter()
-                .chain(report.level_changes.iter())
-                .collect();
-            if previous.level != report.level
-                && !bracketed(&previous.level, &report.level, &changes)
-            {
-                report.findings.push(Finding::UnbracketedLevelChange {
-                    from_segment: previous.name.clone(),
-                    from: previous.level.clone(),
-                    to_segment: report.name.clone(),
-                    to: report.level.clone(),
-                });
-            }
-        }
-        // A rotation named where it went. If the successor is not the segment
-        // that follows, the chain was cut — and this is the only check that can
-        // see a chain truncated at its HEAD, since nothing else points forward.
-        if let Some(previous) = reports.last_mut() {
-            if let Some(named) = previous.successor.clone() {
-                if named != report.name {
-                    previous.findings.push(Finding::MissingSuccessor {
-                        after: previous.name.clone(),
-                        successor: named,
-                    });
-                }
-            }
-        }
-        reports.push(report);
+        walk.push(verify_segment(text, vocab, None));
     }
-    if extent == WalkExtent::WholeChain {
-        if let Some(last) = reports.last_mut() {
-            if let Some(named) = last.successor.clone() {
-                last.findings.push(Finding::MissingSuccessor {
-                    after: last.name.clone(),
-                    successor: named,
-                });
+    walk.finish(extent)
+}
+
+/// A chain walked one segment at a time: each segment is verified ALONE, its
+/// bytes dropped, and its report linked here to the report before it. What
+/// crosses a rotation is only what the previous REPORT carries (its name,
+/// head, level, recorded level changes and named successor), so a walk over
+/// any number of segments holds one segment's bytes at once.
+#[derive(Default)]
+pub(crate) struct ChainWalk {
+    reports: Vec<SegmentReport>,
+}
+
+impl ChainWalk {
+    /// Link `report`, verified in isolation, to the segment walked before it.
+    pub(crate) fn push(&mut self, mut report: SegmentReport) {
+        if let Some(previous) = self.reports.last() {
+            check_link(&mut report, (&previous.name, &previous.head));
+        }
+        if let Some(previous) = self.reports.last_mut() {
+            link_adjacent(previous, &mut report);
+        }
+        self.reports.push(report);
+    }
+
+    /// The report, with a final segment that names an absent successor
+    /// reported as a truncated chain when the walk reached the head.
+    pub(crate) fn finish(mut self, extent: WalkExtent) -> ChainReport {
+        if extent == WalkExtent::WholeChain {
+            if let Some(last) = self.reports.last_mut() {
+                missing_successor(last, None);
             }
+        }
+        ChainReport {
+            segments: self.reports,
         }
     }
-    ChainReport { segments: reports }
+}
+
+/// The checks between two adjacent segments beyond `@prev`: the level bracket
+/// (on `report`) and the rotation's named successor (on `previous`).
+pub(crate) fn link_adjacent(previous: &mut SegmentReport, report: &mut SegmentReport) {
+    // The bracket for a level change may be recorded in EITHER segment: the
+    // config write lands its entry in whatever segment was open at the time,
+    // and the change takes effect at the next one. It must name THIS change.
+    let changes: Vec<&(String, String)> = previous
+        .level_changes
+        .iter()
+        .chain(report.level_changes.iter())
+        .collect();
+    if previous.level != report.level && !bracketed(&previous.level, &report.level, &changes) {
+        report.findings.push(Finding::UnbracketedLevelChange {
+            from_segment: previous.name.clone(),
+            from: previous.level.clone(),
+            to_segment: report.name.clone(),
+            to: report.level.clone(),
+        });
+    }
+    // A rotation named where it went. If the successor is not the segment
+    // that follows, the chain was cut — and this is the only check that can
+    // see a chain truncated at its HEAD, since nothing else points forward.
+    missing_successor(previous, Some(&report.name));
+}
+
+/// Report `report`'s named successor as missing unless it is `next`.
+pub(crate) fn missing_successor(report: &mut SegmentReport, next: Option<&str>) {
+    if let Some(named) = report.successor.clone() {
+        if Some(named.as_str()) != next {
+            report.findings.push(Finding::MissingSuccessor {
+                after: report.name.clone(),
+                successor: named,
+            });
+        }
+    }
 }
 
 /// Whether a writer holding these counters owes a seal.
