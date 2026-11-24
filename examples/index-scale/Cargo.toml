@@ -1,0 +1,10 @@
+[package]
+name = "log-index-scale"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ikigai-log = { path = "../.." }
+ikigai-store = "=0.6.0"
+oxigraph = { version = "0.5.8", default-features = false }
