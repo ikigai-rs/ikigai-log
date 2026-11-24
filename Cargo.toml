@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-log"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The line grammar and RDF vocabulary of the ikigai log: greppable one-line entries (`<ISO-8601 Z> <class CURIE> <subject IRI> key=value…`) that transrept mechanically into PROV-O-aligned Turtle. The key→property→range mapping and the per-class verbosity threshold are declared in the vocabulary graph, not in code, so a module extends both with `rdfs:subClassOf` and needs no change here."
@@ -66,6 +66,9 @@ sha2 = "0.10"
 # crates still carry). Unused at runtime: nothing here generates randomness.
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+same-file = "1" # file identity across appends, including on Windows
 
 [dev-dependencies]
 futures = "0.3" # block_on, for the endpoint tests

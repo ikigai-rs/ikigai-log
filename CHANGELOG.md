@@ -14,6 +14,11 @@ with the first release that changes a public name.
 
 ### Fixed
 
+- Live segment replays pin file identity and the byte length observed when
+  preparing the body (ledger #4141), hence 0.14.2. A host can use the streaming
+  body API for its open segment even when it writes an access line before
+  streaming the response.
+
 - `urn:log:verify` streams the directory instead of reading it all under a 64 MiB
   total budget (ledger #4099), hence 0.14.1. A host that never prunes had a log over
   64 MiB answer `over budget` to every verify, `segment=` included, for good. Each

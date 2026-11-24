@@ -394,12 +394,12 @@ impl Endpoint for SegmentEndpoint {
             &path,
             &self.vocabulary,
             usize::try_from(memory).unwrap_or(usize::MAX),
+            || {
+                self.handle
+                    .open_segment()
+                    .is_some_and(|(open, _)| open == iri)
+            },
         )?;
-        let finished = finished
-            && self
-                .handle
-                .open_segment()
-                .is_none_or(|(open, _)| open != iri);
         let cacheable = self.tail_cacheable(iri, face, finished, requested_tail)?;
         let body = if face == TURTLE_MEDIA_TYPE {
             crate::graph_stream::measured(
