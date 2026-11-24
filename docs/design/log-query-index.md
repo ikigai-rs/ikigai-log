@@ -210,9 +210,15 @@ segment's transaction appear whole; the store grew to 480,804,355 bytes of files
 At 100x on the store (first run after open, then 100 warm runs, milliseconds): selective, 100
 rows, 0.61 first, p50 / p95 / p99 0.148 / 0.154 / 0.172; broad-wide, 35,000 rows, 103 first,
 81.6 / 88.3 / 90.4; broad-join, 3,500 rows, 126 first, 122.9 / 123.5 / 124.2. Idle runs in the
-concurrency process agreed (selective p99 0.59 ms). **The 100x during-ingest runs and the 100x
-`graph=` comparison did not finish within this measurement session** and remain unmeasured, as
-do cold-disk reads with the page cache dropped, a compacted size, crash recovery and graph-scoped
+concurrency process agreed (selective p99 0.59 ms). While 10 more segments (350,979 quads) were
+ingested in 1.83 s, 8 runs of each query gave p50 / p95 selective 0.277 / 0.315, broad-wide
+102 / 110, broad-join 158 / 166 ms (too few runs for a p99); readers saw 100 to 109 needles.
+
+**Today's `graph=` path refused all three queries at 100x** under the default run byte budget
+(`385009 byte(s) left, at least 1551719 needed`, after about 2.5 s resolving segments), naming the
+`urn:cap:stream:memory:<bytes>` grant that would raise it. Its warm latency at 100x is therefore
+unmeasured under default settings; measuring it with a raised grant is the next step, as are
+cold-disk reads with the page cache dropped, a compacted size, crash recovery and graph-scoped
 endpoint authorization overhead.
 
 Reproduce from the repository root (each line is one process):
