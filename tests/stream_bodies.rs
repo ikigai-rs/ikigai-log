@@ -89,6 +89,35 @@ fn raw_segment_body_is_seekable_with_exact_length_and_validator() {
 }
 
 #[test]
+fn live_segment_body_replays_the_prefix_prepared_before_an_append() {
+    use std::io::Write;
+    let log = Log::new(false);
+    let expected = std::fs::read(&log.path).unwrap();
+    let answer = block_on(log.kernel.issue_body(log.request(), &Capability::root())).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log.path)
+        .unwrap()
+        .write_all(b"# appended after prepare\n")
+        .unwrap();
+    let Body::Replay(replay) = answer.bytes else {
+        panic!("expected a file-backed replay");
+    };
+    assert_eq!(replay.len_hint(), Some(expected.len() as u64));
+    assert_eq!(replay.validator(), Some(ContentId::of(&expected)));
+    assert_eq!(
+        block_on(Body::Replay(replay.clone()).collect(usize::MAX)).unwrap(),
+        expected
+    );
+    let offset = expected.len() / 2;
+    let suffix = Body::Once(replay.open_at(offset as u64).unwrap());
+    assert_eq!(
+        block_on(suffix.collect(usize::MAX)).unwrap(),
+        expected[offset..]
+    );
+}
+
+#[test]
 fn log_transreption_declares_incremental_input() {
     use ikigai_core::Endpoint;
     let endpoint = ikigai_log::segments::TransreptEndpoint::new(Vocabulary::shared_builtin());
@@ -98,6 +127,7 @@ fn log_transreption_declares_incremental_input() {
 #[test]
 fn both_faces_and_windows_equal_the_bytes_path_and_keep_cache_policy() {
     use ikigai_core::{Bindings, Endpoint, Expiry, Invocation};
+    use std::io::Write;
     for finished in [false, true] {
         let log = Log::new(finished);
         let endpoint = ikigai_log::segments::SegmentEndpoint::new(
@@ -135,6 +165,14 @@ fn both_faces_and_windows_equal_the_bytes_path_and_keep_cache_policy() {
                     Expiry::Always
                 }
             );
+            if !finished {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log.path)
+                    .unwrap()
+                    .write_all(b"# appended before replay\n")
+                    .unwrap();
+            }
             let actual = block_on(answer.collect(usize::MAX)).unwrap();
             assert_eq!(actual.bytes, expected.bytes);
             assert_eq!(actual.repr_type, expected.repr_type);
@@ -168,11 +206,11 @@ fn a_cached_file_body_refuses_a_changed_or_removed_file() {
 }
 
 #[test]
-fn a_file_changed_after_a_data_chunk_ends_with_error_then_eof() {
+fn a_sealed_file_changed_after_a_data_chunk_ends_with_error_then_eof() {
     use futures::StreamExt;
     use ikigai_core::Error;
     use std::io::Write;
-    let log = Log::new(false);
+    let log = Log::new(true);
     let answer = block_on(log.kernel.issue_body(log.request(), &Capability::root())).unwrap();
     let mut stream = answer.bytes.into_stream();
     assert!(!block_on(stream.next()).unwrap().unwrap().is_empty());
@@ -187,6 +225,60 @@ fn a_file_changed_after_a_data_chunk_ends_with_error_then_eof() {
         Some(Err(Error::Conflict(_)))
     ));
     assert!(block_on(stream.next()).is_none());
+}
+
+#[test]
+fn live_segment_body_stops_at_its_pinned_length_after_a_midstream_append() {
+    use futures::StreamExt;
+    use std::io::Write;
+    let log = Log::new(false);
+    let expected = std::fs::read(&log.path).unwrap();
+    let answer = block_on(log.kernel.issue_body(log.request(), &Capability::root())).unwrap();
+    let mut stream = answer.bytes.into_stream();
+    assert_eq!(block_on(stream.next()).unwrap().unwrap(), expected);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log.path)
+        .unwrap()
+        .write_all(b"# appended during replay\n")
+        .unwrap();
+    assert!(block_on(stream.next()).is_none());
+}
+
+#[test]
+fn live_segment_body_refuses_truncation_and_replacement() {
+    use futures::StreamExt;
+    use ikigai_core::Error;
+    for replace in [false, true] {
+        let log = Log::new(false);
+        let answer = block_on(log.kernel.issue_body(log.request(), &Capability::root())).unwrap();
+        let Body::Replay(replay) = answer.bytes else {
+            panic!("expected a file-backed replay");
+        };
+        let mut stream = replay.open();
+        assert!(!block_on(stream.next()).unwrap().unwrap().is_empty());
+        if replace {
+            let original = log.path.with_extension("original");
+            std::fs::rename(&log.path, &original).unwrap();
+            std::fs::copy(original, &log.path).unwrap();
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log.path)
+                .unwrap()
+                .set_len(replay.len_hint().unwrap() - 1)
+                .unwrap();
+        }
+        assert!(matches!(
+            block_on(stream.next()),
+            Some(Err(Error::Conflict(_)))
+        ));
+        assert!(block_on(stream.next()).is_none());
+        assert!(matches!(
+            block_on(Body::Replay(replay).collect(usize::MAX)),
+            Err(Error::Conflict(_))
+        ));
+    }
 }
 
 #[test]
@@ -335,16 +427,16 @@ fn append_cut_wakes_a_scoped_listener_and_a_new_range_resumes_at_last_offset() {
         batch.events[0].invalidated.as_slice(),
         std::slice::from_ref(&log.iri)
     );
-    assert!(matches!(
-        block_on(old.collect(usize::MAX)),
-        Err(Error::Conflict(_))
-    ));
+    let bytes = std::fs::read(&log.path).unwrap();
+    assert_eq!(
+        block_on(old.collect(usize::MAX)).unwrap(),
+        bytes[..offset as usize]
+    );
     let fresh = block_on(log.kernel.issue_body(request.clone(), &cap)).unwrap();
     let Body::Replay(replay) = fresh.bytes else {
         panic!("a file replay")
     };
     let suffix = block_on(Body::Once(replay.open_at(offset).unwrap()).collect(usize::MAX)).unwrap();
-    let bytes = std::fs::read(&log.path).unwrap();
     assert_eq!(suffix, bytes[offset as usize..]);
     assert!(std::str::from_utf8(&suffix)
         .unwrap()

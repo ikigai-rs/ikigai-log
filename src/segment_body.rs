@@ -1,8 +1,9 @@
-//! File-backed raw segment bodies. Readers pin a file version, not its text.
+//! File-backed raw segment bodies with live prefix and sealed version pins.
 
 use std::fs::{File, Metadata};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures_util::stream;
 use ikigai_core::{Body, ByteStream, ContentHasher, ContentId, Error, Replay, Result};
@@ -15,9 +16,38 @@ const CHUNK_BYTES: usize = 64 * 1024;
 
 pub(crate) struct SegmentBody {
     path: PathBuf,
-    version: Metadata,
+    pin: Pin,
+    length: u64,
     validator: ContentId,
     chunk_bytes: usize,
+}
+
+#[derive(Clone)]
+enum Pin {
+    // Keep the original handle alive so the file ID cannot be reused.
+    Live(Arc<same_file::Handle>),
+    Sealed(Metadata),
+}
+
+impl Pin {
+    fn check(&self, file: &File, path: &Path, length: u64) -> Result<()> {
+        let metadata = file.metadata().map_err(io)?;
+        let matches = match self {
+            Self::Live(identity) => {
+                // Check the path as well as the open file so a replacement during
+                // a read is refused even while the old descriptor remains valid.
+                // ambient: fs: checks the identity of the log's own segment path
+                metadata.len() >= length
+                    && same_file::Handle::from_path(path).is_ok_and(|named| named == **identity)
+            }
+            Self::Sealed(version) => same_version(version, &metadata),
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(changed())
+        }
+    }
 }
 
 fn io(error: std::io::Error) -> Error {
@@ -58,19 +88,21 @@ impl SegmentBody {
         path: &Path,
         vocabulary: &Vocabulary,
         memory_bytes: usize,
+        is_open: impl FnOnce() -> bool,
     ) -> Result<(Self, bool)> {
-        // ambient: fs: opens one of the log's own segment files to pin its version for a streamed body
+        // ambient: fs: opens one of the log's own segment files for a streamed body
         #[allow(clippy::disallowed_methods)]
         let file = File::open(path).map_err(io)?;
         let version = file.metadata().map_err(io)?;
-        if version.len() > MAX_SEGMENT_BYTES as u64 {
+        let length = version.len();
+        if length > MAX_SEGMENT_BYTES as u64 {
             return Err(over());
         }
         if memory_bytes == 0 {
             return Err(over());
         }
         let chunk_bytes = CHUNK_BYTES.min((memory_bytes / 4).max(1));
-        let mut reader = BufReader::with_capacity(chunk_bytes, file);
+        let mut reader = BufReader::with_capacity(chunk_bytes, file.take(length));
         let mut hasher = ContentHasher::new();
         let mut seen = 0;
         let mut header_text = String::new();
@@ -95,8 +127,6 @@ impl SegmentBody {
                 return Err(over());
             }
             seen += n;
-            // Check the byte bound before decoding, including a malformed
-            // sentinel byte appended while this scan was in flight.
             hasher.update(&line);
             let line = String::from_utf8(line).map_err(|e| Error::Endpoint(e.to_string()))?;
             let raw = line.trim_end_matches(['\n', '\r']);
@@ -119,19 +149,28 @@ impl SegmentBody {
                 }
             }
         }
-        if seen as u64 != version.len()
-            || !same_version(&version, &reader.get_ref().metadata().map_err(io)?)
-        {
+        if seen as u64 != length {
             return Err(changed());
         }
+        let finished = ended && sealed_after && !after_end && !is_open();
+        let file = reader.into_inner().into_inner();
+        let pin = if finished {
+            Pin::Sealed(version)
+        } else {
+            Pin::Live(Arc::new(
+                same_file::Handle::from_file(file.try_clone().map_err(io)?).map_err(io)?,
+            ))
+        };
+        pin.check(&file, path, length)?;
         Ok((
             Self {
                 path: path.into(),
-                version,
+                pin,
+                length,
                 validator: hasher.finish(),
                 chunk_bytes,
             },
-            ended && sealed_after && !after_end,
+            finished,
         ))
     }
 
@@ -140,44 +179,45 @@ impl SegmentBody {
             // ambient: fs: reopens the pinned segment file, refused below if it changed
             #[allow(clippy::disallowed_methods)]
             let mut file = File::open(&self.path).map_err(|_| changed())?;
-            if !same_version(&self.version, &file.metadata().map_err(io)?) {
-                return Err(changed());
+            if let Pin::Live(identity) = &self.pin {
+                let opened =
+                    same_file::Handle::from_file(file.try_clone().map_err(io)?).map_err(io)?;
+                if opened != **identity {
+                    return Err(changed());
+                }
             }
+            self.pin.check(&file, &self.path, self.length)?;
             file.seek(SeekFrom::Start(offset)).map_err(io)?;
             Ok(file)
         })();
-        let version = self.version.clone();
+        let pin = self.pin.clone();
+        let path = Arc::new(self.path.clone());
+        let length = self.length;
+        let sentinel = usize::from(matches!(pin, Pin::Sealed(_)));
         let chunk_bytes = self.chunk_bytes;
-        let remaining = version.len().saturating_sub(offset);
+        let remaining = length.saturating_sub(offset);
         Box::pin(stream::unfold(Some((opened, remaining)), move |state| {
-            let version = version.clone();
+            let pin = pin.clone();
+            let path = path.clone();
             async move {
                 let (file, mut remaining) = state?;
                 let result = (|| {
                     let mut file = file?;
-                    // The extra byte detects append, including after the last
-                    // data chunk. Every failure terminates with an error item.
-                    let mut bytes = vec![0; chunk_bytes.min(remaining as usize + 1)];
+                    // Only sealed readers probe beyond the pinned length.
+                    let mut bytes = vec![0; chunk_bytes.min(remaining as usize + sentinel)];
                     let n = loop {
                         match file.read(&mut bytes) {
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             other => break other.map_err(io)?,
                         }
                     };
-                    if n as u64 > remaining {
+                    if n as u64 > remaining || (n == 0 && remaining != 0) {
                         return Err(changed());
                     }
+                    // A range consumer may stop before EOF, so check every chunk.
+                    pin.check(&file, &path, length)?;
                     if n == 0 {
-                        if remaining != 0 || !same_version(&version, &file.metadata().map_err(io)?)
-                        {
-                            return Err(changed());
-                        }
                         return Ok(None);
-                    }
-                    // A range consumer may stop before EOF. Check every chunk
-                    // so it cannot silently join versions in a partial read.
-                    if !same_version(&version, &file.metadata().map_err(io)?) {
-                        return Err(changed());
                     }
                     remaining -= n as u64;
                     bytes.truncate(n);
@@ -203,7 +243,7 @@ impl Replay for SegmentBody {
     }
 
     fn len_hint(&self) -> Option<u64> {
-        Some(self.version.len())
+        Some(self.length)
     }
 
     fn validator(&self) -> Option<ContentId> {

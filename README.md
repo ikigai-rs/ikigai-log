@@ -406,12 +406,17 @@ already held by their caller.
 ### File-backed bodies and a live tail
 
 `Kernel::issue_body` reads a raw segment (`as=text/x-ikigai-log`) as a seekable
-`Body::Replay`, with its exact byte length and a core `ContentId` validator. It
-holds a file version, not the text. Each reader checks that version on open,
-after each chunk and at EOF; a changed or removed file fails with `Conflict`.
-Obtain a fresh replay after a change. Raw reads still validate UTF-8 and hash the
-file once before returning, so seeking avoids transferring the prefix but does
-not eliminate that initial scan.
+`Body::Replay`, with its exact byte length and a core `ContentId` validator.
+A live replay holds the file identity and streams only the prefix whose length
+was observed at preparation. Appends made before or during streaming belong to
+the next snapshot. Replacement, removal, or truncation below the pinned length
+fails with `Conflict`. A finished segment pins the full file version and also
+fails on append. Raw reads validate UTF-8 and hash the pinned bytes before
+returning, so a ranged read transfers only its requested suffix after that scan.
+
+Hosts that buffer their open segment to avoid a conflict after writing an
+access line can use `issue_body` for that segment and stream the returned replay
+after logging access.
 
 The default Turtle face also replays from the file, using the same triple emitter
 and Oxigraph serializer as the bytes API. Its length and validator are measured
