@@ -128,8 +128,9 @@ const HEADER_PROBE_BYTES: usize = 8 * 1024;
 /// Oversized segments are refused with `Error::OverBudget`, never truncated.
 pub const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum total segment input retained by a directory verification (64 MiB).
-/// This bounds the whole-file verifier until a streaming implementation replaces it.
+/// Maximum total segment input a session trail reads across the directory
+/// (64 MiB). `urn:log:verify` no longer uses it: it streams one segment at a
+/// time, each under [`MAX_SEGMENT_BYTES`], and has no total bound.
 #[cfg(not(target_family = "wasm"))]
 pub const MAX_VERIFY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1037,22 +1038,18 @@ impl Endpoint for VerifyEndpoint {
 
         let mut body = String::new();
         let mut chains = 0usize;
-        let (walks, damaged) = chains_in(&directory)?;
-        for (instance, chain) in walks {
-            if wanted_instance
-                .as_ref()
-                .is_some_and(|want| want != &instance)
-            {
-                continue;
-            }
-            if wanted_segment
-                .as_ref()
-                .is_some_and(|want| !chain.iter().any(|(name, _)| name == want))
-            {
-                continue;
-            }
+        let (walks, damaged) = match &wanted_segment {
+            Some(want) => one_segment_in(
+                &directory,
+                want,
+                wanted_instance.as_deref(),
+                &self.vocabulary,
+            )?,
+            None => chains_in(&directory, wanted_instance.as_deref(), &self.vocabulary)?,
+        };
+        for walk in walks {
             chains += 1;
-            body.push_str(&crate::chain::verify_chain(&chain, &self.vocabulary).render());
+            body.push_str(&walk.render());
         }
         // Every walk, whatever it was filtered to: a file with no readable
         // header belongs to no chain anyone can name, so no filter can say it
@@ -1094,8 +1091,9 @@ impl Endpoint for VerifyEndpoint {
         Description::new("log-verify")
             .title("Verify the log")
             .summary(
-                "Walk the hash chain (16 MiB per segment, 64 MiB total directory input; \
-                 OverBudget refuses the whole request, never a partial verdict) and report \
+                "Walk the hash chain (16 MiB per segment, one segment held at a time, so no \
+                 bound on the directory's total; a segment over its bound is OverBudget for \
+                 the whole request, never a partial verdict) and report \
                  what it finds, one `segment <iri> OK|BROKEN` \
                  line per segment with its findings indented beneath — greppable like \
                  everything else here. Checks FOUR things, not one: that each entry hashes \
@@ -1128,8 +1126,8 @@ impl Endpoint for VerifyEndpoint {
                     .input(
                         ArgSpec::new("segment")
                             .summary(
-                                "verify the chain this segment belongs to; omit for every chain \
-                                 in the directory",
+                                "verify this one segment, with its link to its predecessor in \
+                                 its chain; omit for every chain in the directory",
                             )
                             .class(RDFS_RESOURCE)
                             .optional(),
@@ -1155,74 +1153,212 @@ impl Endpoint for VerifyEndpoint {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// One instance's chain: its IRI, and its segments as `(segment IRI, bytes)`.
-type InstanceChain = (String, Vec<(String, String)>);
-
-#[cfg(not(target_family = "wasm"))]
-/// Every chain in `directory`, as `(instance IRI, [(segment IRI, bytes)])`,
-/// each chain oldest-first — and every segment file that could not be read as
-/// one, as `(path, why)`.
-///
-/// **One chain per INSTANCE**, because the instance is the attribution key: a
-/// machine's log directory holds as many chains as it has instances, and a
-/// disambiguated name is a chain of its own — which is right, since it is a
-/// different process that never claimed to continue anyone.
+/// Every walk a verification produced — and every segment file that could not
+/// be read as one, as `(path, why)`.
 ///
 /// ★ **A file that cannot be read is RETURNED, not skipped.** Its header names
 /// the instance, so a damaged header leaves it in no chain — and a walk that
 /// dropped it would report "0 broken" over a directory holding a damaged
 /// segment, which is the verifier vouching for exactly what it could not check.
-type DirectoryChains = (Vec<InstanceChain>, Vec<(PathBuf, String)>);
+type DirectoryWalks = (Vec<crate::chain::ChainReport>, Vec<(PathBuf, String)>);
 
 #[cfg(not(target_family = "wasm"))]
-fn chains_in(directory: &Path) -> Result<DirectoryChains> {
-    chains_in_with_budget(directory, MAX_VERIFY_BYTES)
+/// One segment file, read and verified ALONE: what ordering and linking need,
+/// and its report. Never its bytes.
+struct Walked {
+    prev: Prev,
+    /// The head its last `#seal` line states, used only to put it in order.
+    stated_head: Option<String>,
+    report: crate::chain::SegmentReport,
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn chains_in_with_budget(directory: &Path, budget: usize) -> Result<DirectoryChains> {
-    let mut remaining = budget;
+/// Every segment file in `directory` with a `.log` suffix, in path order.
+fn segment_paths(directory: &Path) -> Vec<PathBuf> {
     // ambient: fs: lists the log's own segment directory for verify
     #[allow(clippy::disallowed_methods)]
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Vec::new();
     };
-    let mut by_instance: std::collections::BTreeMap<String, Vec<(String, String)>> =
-        std::collections::BTreeMap::new();
-    let mut damaged = Vec::new();
     let mut found: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == SEGMENT_EXTENSION))
         .collect();
     found.sort();
-    for path in found {
-        let text = match read_segment_with_budget(&path, MAX_SEGMENT_BYTES.min(remaining)) {
-            Ok(text) => text,
-            Err(e @ Error::OverBudget { .. }) => return Err(e),
-            Err(e) => {
-                damaged.push((path, e.to_string()));
-                continue;
-            }
-        };
-        remaining -= text.len();
-        let header = match Header::parse(&text) {
-            Ok((header, _)) => header,
-            Err(e) => {
-                damaged.push((path, e.to_string()));
-                continue;
-            }
-        };
-        by_instance
-            .entry(header.instance)
-            .or_default()
-            .push((header.name, text));
+    found
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Read one segment file under its own 16 MiB bound and verify it in isolation.
+///
+/// `Ok(Err(why))` is a file that is not a readable segment — it goes on the
+/// damaged list. An oversized file refuses the whole request, as it always has:
+/// no partial verdict.
+fn walk_file(
+    path: &Path,
+    wanted_instance: Option<&str>,
+    vocab: &Vocabulary,
+) -> Result<std::result::Result<Option<Walked>, String>> {
+    let text = match read_segment_with_budget(path, MAX_SEGMENT_BYTES) {
+        Ok(text) => text,
+        Err(e @ Error::OverBudget { .. }) => return Err(e),
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    let header = match Header::parse(&text) {
+        Ok((header, _)) => header,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    if wanted_instance.is_some_and(|want| want != header.instance) {
+        return Ok(Ok(None));
     }
-    for chain in by_instance.values_mut() {
-        let ordered = std::mem::take(chain);
-        *chain = in_chain_order(ordered);
+    Ok(Ok(Some(Walked {
+        stated_head: stated_head_in(&text, &header),
+        prev: header.prev,
+        report: crate::chain::verify_segment(&text, vocab, None),
+    })))
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Every chain in `directory` (or only `wanted_instance`'s), verified.
+///
+/// **One chain per INSTANCE**, because the instance is the attribution key: a
+/// machine's log directory holds as many chains as it has instances, and a
+/// disambiguated name is a chain of its own — which is right, since it is a
+/// different process that never claimed to continue anyone.
+///
+/// ★ **It STREAMS.** Each file is read under its own 16 MiB bound, verified in
+/// isolation and its bytes dropped before the next is read; what crosses a
+/// rotation is the previous segment's REPORT — its name, head, level, recorded
+/// level changes and named successor — so the links are checked after the
+/// fact, in chain order, exactly as a walk over the bytes would check them.
+/// Memory is one segment plus the report being built, and the directory's
+/// total size does not matter: a host that never prunes can still verify.
+fn chains_in(
+    directory: &Path,
+    wanted_instance: Option<&str>,
+    vocab: &Vocabulary,
+) -> Result<DirectoryWalks> {
+    let mut by_instance: std::collections::BTreeMap<String, Vec<Walked>> =
+        std::collections::BTreeMap::new();
+    let mut damaged = Vec::new();
+    for path in segment_paths(directory) {
+        match walk_file(&path, wanted_instance, vocab)? {
+            Ok(Some(walked)) => by_instance
+                .entry(walked.report.instance.clone())
+                .or_default()
+                .push(walked),
+            Ok(None) => {}
+            Err(why) => damaged.push((path, why)),
+        }
     }
-    Ok((by_instance.into_iter().collect(), damaged))
+    let walks = by_instance
+        .into_values()
+        .map(|chain| {
+            let mut walk = crate::chain::ChainWalk::default();
+            for walked in in_chain_order(chain) {
+                walk.push(walked.report);
+            }
+            walk.finish(crate::chain::WalkExtent::WholeChain)
+        })
+        .collect();
+    Ok((walks, damaged))
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// The one segment `want` names, verified with its link — reading THAT segment,
+/// its predecessor in the chain, and only the header and last seal of the rest.
+///
+/// The predecessor is read in full because the link check needs more than its
+/// head: a level change between the two is bracketed by a sealed
+/// `log:LevelChange` in EITHER segment. Whatever follows is known by name, which
+/// is all the rotation's `next=` is checked against.
+fn one_segment_in(
+    directory: &Path,
+    want: &str,
+    wanted_instance: Option<&str>,
+    vocab: &Vocabulary,
+) -> Result<DirectoryWalks> {
+    let mut damaged = Vec::new();
+    let mut headers: Vec<(Header, PathBuf)> = Vec::new();
+    for path in segment_paths(directory) {
+        match read_header(&path) {
+            Ok(header) => headers.push((header, path)),
+            // A header past the probe, or none at all: read it in full, as a
+            // walk would, so a damaged file is reported in the same words.
+            Err(_) => match read_segment_with_budget(&path, MAX_SEGMENT_BYTES) {
+                Ok(text) => match Header::parse(&text) {
+                    Ok((header, _)) => headers.push((header, path)),
+                    Err(e) => damaged.push((path, e.to_string())),
+                },
+                Err(e @ Error::OverBudget { .. }) => return Err(e),
+                Err(e) => damaged.push((path, e.to_string())),
+            },
+        }
+    }
+    let Some(instance) = headers
+        .iter()
+        .find(|(header, _)| {
+            header.name == want && wanted_instance.is_none_or(|i| i == header.instance)
+        })
+        .map(|(header, _)| header.instance.clone())
+    else {
+        return Ok((Vec::new(), damaged));
+    };
+    let mut chain: Vec<(Header, PathBuf)> = headers
+        .into_iter()
+        .filter(|(header, _)| header.instance == instance)
+        .collect();
+    chain.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+    let links: Option<Vec<(Prev, String)>> = chain
+        .iter()
+        .map(|(header, path)| Some((header.prev.clone(), stated_head_of_file(path, header)?)))
+        .collect();
+    let order: Vec<usize> = links
+        .as_deref()
+        .and_then(link_order)
+        .unwrap_or_else(|| (0..chain.len()).collect());
+    let at = order
+        .iter()
+        .position(|&index| chain[index].0.name == want)
+        .expect("the wanted segment is in its own instance's chain");
+
+    let previous = match at.checked_sub(1) {
+        Some(before) => {
+            let path = &chain[order[before]].1;
+            match walk_file(path, None, vocab)? {
+                Ok(walked) => walked,
+                Err(why) => {
+                    // Unreadable: in no chain, as a walk would have it — so the
+                    // wanted segment has no predecessor to be linked to here.
+                    damaged.push((path.clone(), why));
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let path = &chain[order[at]].1;
+    let mut report = match walk_file(path, None, vocab)? {
+        Ok(Some(walked)) => walked.report,
+        Ok(None) => return Ok((Vec::new(), damaged)),
+        Err(why) => {
+            damaged.push((path.clone(), why));
+            return Ok((Vec::new(), damaged));
+        }
+    };
+    if let Some(mut previous) = previous.map(|walked| walked.report) {
+        crate::chain::check_link(&mut report, (&previous.name, &previous.head));
+        crate::chain::link_adjacent(&mut previous, &mut report);
+    }
+    let next = order.get(at + 1).map(|&index| chain[index].0.name.as_str());
+    crate::chain::missing_successor(&mut report, next);
+    Ok((
+        vec![crate::chain::ChainReport {
+            segments: vec![report],
+        }],
+        damaged,
+    ))
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1243,36 +1379,27 @@ fn chains_in_with_budget(directory: &Path, budget: usize) -> Result<DirectoryCha
 /// So the order comes from the thing that is actually authoritative: `@prev`
 /// names the predecessor's final seal, and a segment's final seal is stated in
 /// its last `#seal` line. Nothing here VERIFIES those hashes — recomputing is
-/// [`verify_segment`]'s job and happens next — so a tamperer gains nothing: a
-/// link they break stops forming a chain, the fallback to IRI order applies, and
-/// the mismatch is reported exactly as before.
-fn in_chain_order(mut chain: Vec<(String, String)>) -> Vec<(String, String)> {
+/// [`crate::chain::verify_segment`]'s job — so a tamperer gains nothing: a link
+/// they break stops forming a chain, the fallback to IRI order applies, and the
+/// mismatch is reported exactly as before.
+fn in_chain_order(mut chain: Vec<Walked>) -> Vec<Walked> {
     // The segment IRI ends in a fixed-width UTC stamp, so IRI order is
     // chronological within an instance — the same property that makes
     // `grep '^2026-08-23T09:'` a query. It is the fallback, and the order the
     // links are resolved against.
-    chain.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let Some(order) = chain_order(&chain) else {
+    chain.sort_by(|a, b| a.report.name.cmp(&b.report.name));
+    let links: Option<Vec<(Prev, String)>> = chain
+        .iter()
+        .map(|walked| Some((walked.prev.clone(), walked.stated_head.clone()?)))
+        .collect();
+    let Some(order) = links.as_deref().and_then(link_order) else {
         return chain;
     };
-    let mut slots: Vec<Option<(String, String)>> = chain.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<Walked>> = chain.into_iter().map(Some).collect();
     order
         .into_iter()
         .map(|index| slots[index].take().expect("each index exactly once"))
         .collect()
-}
-
-#[cfg(not(target_family = "wasm"))]
-/// The indices of `chain` in link order, or `None` when the links do not form a
-/// single chain over exactly this set — see [`link_order`].
-fn chain_order(chain: &[(String, String)]) -> Option<Vec<usize>> {
-    let mut links = Vec::with_capacity(chain.len());
-    for (_, text) in chain {
-        let (header, _) = Header::parse(text).ok()?;
-        let head = stated_head_in(text, &header)?;
-        links.push((header.prev, head));
-    }
-    link_order(&links)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1673,32 +1800,49 @@ mod budget_tests {
         assert_eq!(read_segment_with_budget(&path, 0).unwrap(), "");
     }
 
-    #[test]
-    fn directory_budget_is_shared_across_segments_and_instances() {
-        let dir = Scratch::new();
-        let mut total = 0;
-        for i in 0..2 {
-            let text = Header {
-                version: 1,
-                prefixes: Default::default(),
-                name: format!("urn:log:test:{i}"),
-                instance: format!("urn:instance:{i}"),
-                level: "https://ikigai-rs.dev/ns/log#info".into(),
-                started: Timestamp::from_millis(0),
-                prev: Prev::Genesis,
-            }
-            .render()
-            .unwrap();
-            total += text.len();
-            std::fs::write(dir.0.join(format!("{i}.log")), text).unwrap();
+    fn segment(dir: &Path, i: usize) -> usize {
+        let text = Header {
+            version: 1,
+            prefixes: Default::default(),
+            name: format!("urn:log:test:{i}"),
+            instance: format!("urn:instance:{i}"),
+            level: "https://ikigai-rs.dev/ns/log#info".into(),
+            started: Timestamp::from_millis(0),
+            prev: Prev::Genesis,
         }
-        let (chains, damaged) = chains_in_with_budget(&dir.0, total).unwrap();
-        assert_eq!(chains.len(), 2);
+        .render()
+        .unwrap();
+        std::fs::write(dir.join(format!("{i}.log")), &text).unwrap();
+        text.len()
+    }
+
+    #[test]
+    fn the_directory_walk_has_no_total_budget_but_each_segment_keeps_its_own() {
+        // ★ Ledger #4099: the walk streams, so the directory's total is not a
+        // bound — but every file is still read under MAX_SEGMENT_BYTES, and one
+        // file over it refuses the whole request rather than give a partial
+        // verdict.
+        let dir = Scratch::new();
+        let vocab = Vocabulary::builtin();
+        segment(&dir.0, 0);
+        segment(&dir.0, 1);
+        let (walks, damaged) = chains_in(&dir.0, None, vocab).unwrap();
+        assert_eq!(walks.len(), 2);
         assert!(damaged.is_empty());
-        // Individually within budget, together exactly one byte above it.
-        assert!(matches!(
-            chains_in_with_budget(&dir.0, total - 1),
-            Err(Error::OverBudget { .. })
-        ));
+        let (walks, _) = chains_in(&dir.0, Some("urn:instance:1"), vocab).unwrap();
+        assert_eq!(walks.len(), 1);
+
+        let big = vec![b'x'; MAX_SEGMENT_BYTES + 1];
+        std::fs::write(dir.0.join("2.log"), big).unwrap();
+        let refused = chains_in(&dir.0, None, vocab).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "over budget: log input exceeds its 16777216-byte read budget"
+        );
+        // `segment=` reads only headers of the rest, so an oversized OTHER file
+        // with a readable header is not read in full; a headerless one is, and
+        // refuses in the same words.
+        let refused = one_segment_in(&dir.0, "urn:log:test:0", None, vocab).unwrap_err();
+        assert!(matches!(refused, Error::OverBudget { .. }), "{refused}");
     }
 }

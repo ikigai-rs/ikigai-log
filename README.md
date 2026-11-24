@@ -383,13 +383,18 @@ gap is bracketed by an always-land marker**:
 
 Segment Source reads (both raw log and Turtle), piped transreption, and piped
 verification accept at most **16 MiB (16,777,216 bytes)** of segment input.
-`urn:log:verify` over a directory also caps the combined segment input at
-**64 MiB (67,108,864 bytes)**, across all instances, before applying instance or
-segment filters. These limits apply before parsing and window filtering. Exceeding
-a limit returns `OverBudget`; no truncated segment or partial verification verdict
-is returned. Exactly the limit is accepted. The directory verifier still holds
-whole segments, with its retained input bounded by the total budget; this is not
-a streaming verifier or a cap on parsed output size.
+`urn:log:verify` over a directory **streams**: it reads one segment at a time, each
+under that 16 MiB bound, verifies it, and drops its bytes before reading the next.
+What crosses a rotation is the previous segment's report (name, head, level,
+recorded level changes, named successor), so memory is one segment plus the report
+being built, and the directory's total size is not bounded: a host that never
+prunes can always verify. There is no time budget on the walk either; it is linear
+in the bytes the host itself wrote. `segment=` reads the segment it names and its
+predecessor in full, and only the header and last seal of every other segment, and
+reports that one segment. These limits apply before parsing and window filtering.
+Exceeding a limit returns `OverBudget`; no truncated segment or partial
+verification verdict is returned. Exactly the limit is accepted. This is not a cap
+on parsed output size.
 
 Rotation's best-effort verification uses the same per-segment bound for each of
 its two inputs. An unreadable or over-budget input is recorded as `log:ChainBroken`
@@ -526,6 +531,9 @@ A segment file whose header will not parse is reported as
 `segment <path> BROKEN unreadable` in every walk. It belongs to no chain anyone
 can name, and leaving it out would be the verifier vouching for what it could not
 read.
+`segment=` reads every other file's header only, so it reports a file with no
+readable header but not one whose damage starts after its header; a walk over the
+whole directory reports both.
 
 ## Files are the owner's
 
