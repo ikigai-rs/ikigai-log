@@ -6,5 +6,21 @@ publish = false
 
 [dependencies]
 ikigai-log = { path = "../.." }
-ikigai-store = "=0.6.0"
+# `persistent` is RocksDB, for `log-index-persistent`; the in-memory spike ignores it.
+ikigai-store = { version = "=0.6.0", features = ["persistent"] }
 oxigraph = { version = "0.5.8", default-features = false }
+# Today's `graph=` path, through a real kernel, for the comparison.
+ikigai-core = "0.4.0"
+ikigai-sparql = "=0.6.0"
+futures = "0.3"
+# Real Ed25519 seal signatures, checked again before ingest.
+ed25519-dalek = "2.1"
+base64 = "0.22"
+
+[[bin]]
+name = "log-index-scale"
+path = "src/main.rs"
+
+[[bin]]
+name = "log-index-persistent"
+path = "src/persistent.rs"
