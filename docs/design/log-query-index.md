@@ -130,3 +130,99 @@ boundary, source identity, freshness and retention choices. The following are pr
   subset, graph-scoped grants and resource budgets with no network or write authority.
 - **Design cited query answers** — Specify and test entry/segment citation validation, aggregates,
   incomplete coverage, accessible presentation and prompt-injection resistance.
+
+## Persistent measurement (ledger #4218)
+
+Measurement only; nothing below changes `ikigai-log` behavior, and none of it is a service-level
+objective. The [persistent example](../../examples/index-scale/src/persistent.rs) runs each phase
+as its own process:
+
+- **Segments** are written by the real writer (`LogHandle`, file destination), sealed every 500
+  entries, each seal signed with a real Ed25519 key (a fixed fixture seed), chained by rotation:
+  5,000 entries plus a rotation marker per segment, mixed `log:Message`, `log:Warning` (1%) and
+  `log:Error` (0.1%) entries, 50 subjects, one `needle` per segment. `verify_chain` must pass and
+  every seal signature must check before anything is measured.
+- **Ingest** opens `DurableStore::open_shared` (RocksDB, `persistent`), and for each segment
+  re-verifies it against its predecessor and its signatures, transrepts it with `to_triples`, and
+  writes its quads under the segment IRI in one `Store::extend` call, then flushes.
+- **Query** is a fresh process: the open time is the restart cost; the first run of each query
+  is the first read after open (the OS page cache was not dropped, so it is not a cold-disk read);
+  then 100 repeated runs give p50/p95/p99 (nearest rank). Queries run on the shared Oxigraph
+  handle, bypassing endpoint authorization, budgets and serialization, as in the spike.
+- **Today's path** is `urn:sparql:select graph=<every segment IRI>` through a `Kernel` over the
+  log space and `ikigai_sparql::space()`, default cache. The first run resolves and transrepts
+  every segment; an identical repeat is a result-cache hit; the warm runs add a distinct SPARQL
+  comment so the result cache misses while segment representations may still be cached.
+- **Concurrency** reopens the 10x or 100x store, measures each query 50 times idle, then ingests 10
+  more verified segments (another instance) on one thread while a second thread runs the three
+  queries in a loop.
+
+The same three query texts run on both paths (`log:` and `prov:` prefixes):
+**selective** `GRAPH ?g { ?e log:text "needle" }` (one row per segment); **broad-wide**
+`GRAPH ?g { ?e a log:Warning ; ?p ?o }` (every triple of every warning); **broad-join** errors
+and warnings sharing a `log:subject` within a segment.
+
+Machine: Apple M5 Pro, 18 cores, 64 GiB, macOS (Darwin 27.2.0, arm64), internal SSD; rustc and
+cargo 1.99.1, release build; ikigai-store 0.6.0, ikigai-sparql 0.6.0, ikigai-core 0.4.2,
+Oxigraph 0.5.13 with oxrocksdb-sys 0.5.13. One run per size on a machine doing other work.
+
+| | 10x | 100x |
+|---|---:|---:|
+| Segments, entries, input bytes | 10, 50,010, 4,048,685 | 100, 500,100, 40,487,852 |
+| Seals (all signed and checked) | 110 | 1,100 |
+| Quads | 350,979 | 3,509,799 |
+| Ingest wall time (verify, transrept inside it) | 2.05 s (0.06, 0.10) | 20.7 s (0.61, 0.98) |
+| Ingest throughput | 24,300 entries/s | 24,100 entries/s |
+| Peak RSS during ingest | 427 MiB | 2,390 MiB |
+| Disk, sum of file lengths / allocated (`du`) | 337 MB / 435 MiB | 3,325 MB / 1.1 GiB |
+| Restart (open an existing store) | 7.5 ms | 30.3 ms |
+
+The sum of file lengths exceeds the allocated size because RocksDB preallocates its log files;
+both are reported because neither alone is the dataset's footprint. Compaction state was not
+controlled and the size was not measured after a compaction.
+
+Reads at 10x (milliseconds; first = first run after open, then 100 warm runs; today's path has
+20 warm runs):
+
+| Query | Rows | Store first | Store p50 / p95 / p99 | `graph=` first | `graph=` identical repeat | `graph=` p50 / p95 / p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| selective | 10 | 0.58 | 0.024 / 0.029 / 0.037 | 1,221 | 0.014 | 876 / 891 / 900 |
+| broad-wide | 3,500 | 9.9 | 7.7 / 8.0 / 8.1 | 882 | 0.26 | 881 / 888 / 898 |
+| broad-join | 350 | 10.9 | 6.8 / 6.9 / 7.0 | 884 | 0.035 | 885 / 894 / 900 |
+
+At 10x, every `graph=` query that misses the result cache costs about 0.9 s whatever its shape,
+because the sources are reloaded into a fresh in-memory store per query; the persistent index
+answers the same text in microseconds to milliseconds. An identical repeat on today's path is a
+result-cache hit and is the fastest of all, and is the honest case for dashboards that ask the
+same question of finished segments.
+
+Concurrent ingest at 10x (10 more segments, 350,979 quads, ingested in 1.82 s while reading):
+
+| Query | Idle p50 / p95 / p99 | During ingest p50 / p95 / p99 (n=70) |
+|---|---:|---:|
+| selective | 0.023 / 0.030 / 0.180 | 0.051 / 0.070 / 0.077 |
+| broad-wide | 7.8 / 8.0 / 8.9 | 12.1 / 18.2 / 19.1 |
+| broad-join | 6.8 / 7.0 / 8.1 | 13.3 / 19.4 / 20.6 |
+
+The selective query saw between 10 and 19 needles during the run, so readers observed each
+segment's transaction appear whole; the store grew to 480,804,355 bytes of files.
+
+At 100x on the store (first run after open, then 100 warm runs, milliseconds): selective, 100
+rows, 0.61 first, p50 / p95 / p99 0.148 / 0.154 / 0.172; broad-wide, 35,000 rows, 103 first,
+81.6 / 88.3 / 90.4; broad-join, 3,500 rows, 126 first, 122.9 / 123.5 / 124.2. Idle runs in the
+concurrency process agreed (selective p99 0.59 ms). **The 100x during-ingest runs and the 100x
+`graph=` comparison did not finish within this measurement session** and remain unmeasured, as
+do cold-disk reads with the page cache dropped, a compacted size, crash recovery and graph-scoped
+endpoint authorization overhead.
+
+Reproduce from the repository root (each line is one process):
+
+```sh
+CARGO_TARGET_DIR=target cargo build --release --locked --manifest-path examples/index-scale/Cargo.toml
+B=target/release/log-index-persistent W=$(mktemp -d)
+$B generate 10 $W/seg && $B generate 10 $W/extra scale-extra
+$B ingest $W/seg $W/store
+$B query $W/seg $W/store 100
+$B graph $W/seg 20
+$B concurrent $W/extra $W/store 50
+```
