@@ -14,6 +14,13 @@ with the first release that changes a public name.
 
 ### Fixed
 
+- `verify` hashes an entry line exactly as it appears once its line ending (`\n` or
+  `\r\n`) is taken off (ledger #4359), hence 0.14.3. It used to trim every trailing
+  carriage return before hashing, so a sealed line with `\r\r` added to its end was
+  reported intact. The writer never writes a raw `\r`, so such a line was edited
+  after the seal and is now reported as a seal mismatch. CRLF line endings still
+  verify.
+
 - Live segment replays pin file identity and the byte length observed when
   preparing the body (ledger #4141), hence 0.14.2. A host can use the streaming
   body API for its open segment even when it writes an access line before
