@@ -864,8 +864,12 @@ pub fn verify_segment(
                 entries += 1;
                 // The chain folds in the line EXACTLY as written — not a
                 // re-render of the parsed entry — so whitespace and quoting
-                // tampering is caught along with everything else.
-                chain.advance(raw.trim_end_matches(['\n', '\r']));
+                // tampering is caught along with everything else. `lines()` has
+                // already taken off the line ending (`\n` or `\r\n`); nothing
+                // more is trimmed, because the writer never puts a raw `\r` on
+                // a line, so one left at the end is a byte added after the fact
+                // and must change the hash (ledger #4359).
+                chain.advance(raw);
                 check_sequence(&entry, &mut last_seq, &mut findings);
                 position = stated_seq(&entry).unwrap_or(entries);
                 if let Some((from, to)) = level_bracket(&entry, vocab) {
