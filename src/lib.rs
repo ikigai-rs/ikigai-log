@@ -185,8 +185,9 @@ pub use access::{
     PASSKEY_CREDENTIAL, SOCKET_OWNER_CREDENTIAL, WITHHELD_ARGUMENTS,
 };
 pub use chain::{
-    head_of, split_signature, tagged, verify_chain, verify_segment, Chain, ChainReport, Finding,
-    RotationPolicy, SealPolicy, SealSigner, SegmentReport, HASH_ALGORITHM,
+    head_of, split_signature, tagged, verify_chain, verify_chain_to, verify_segment, Chain,
+    ChainReport, ExpectedHead, Finding, RotationPolicy, SealPolicy, SealSigner, SegmentReport,
+    HASH_ALGORITHM,
 };
 pub use config::{
     instance_iri, level_iri, Bound, ConfigError, Destination, LogConfig, Patch, RotationPatch,

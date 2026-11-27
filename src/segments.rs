@@ -1026,6 +1026,7 @@ impl Endpoint for VerifyEndpoint {
             return Ok(plain(
                 crate::chain::ChainReport {
                     segments: vec![report],
+                    ..crate::chain::ChainReport::default()
                 }
                 .render(),
             ));
@@ -1035,6 +1036,23 @@ impl Endpoint for VerifyEndpoint {
             .ok_or_else(|| Error::Endpoint(crate::writer::WriteError::NoDirectory.to_string()))?;
         let wanted_segment = opt(inv, "segment")?.map(str::to_string);
         let wanted_instance = opt(inv, "instance")?.map(str::to_string);
+        let expected = expected_head(inv)?;
+        if !expected.is_empty() && (wanted_segment.is_some() || wanted_instance.is_none()) {
+            // A head belongs to ONE chain, walked whole. Checked against a
+            // lone segment, or against whichever chain happened to hold it,
+            // a missing head would say nothing about the chain it came from.
+            return Err(Error::InvalidArgument {
+                name: if wanted_segment.is_some() {
+                    "segment"
+                } else {
+                    "instance"
+                }
+                .to_string(),
+                detail: "an expected head is one chain's: name that chain's `instance`, and \
+                         no `segment`, so the whole chain is walked to it"
+                    .to_string(),
+            });
+        }
 
         let mut body = String::new();
         let mut chains = 0usize;
@@ -1047,8 +1065,20 @@ impl Endpoint for VerifyEndpoint {
             )?,
             None => chains_in(&directory, wanted_instance.as_deref(), &self.vocabulary)?,
         };
-        for walk in walks {
+        if !expected.is_empty() && walks.is_empty() {
+            // No segment of this instance at all is the furthest a chain can
+            // fall short of its head, and it is reported as that, not as
+            // "no segments to verify".
+            let mut walk = crate::chain::ChainReport::default();
+            walk.check_expected(&expected);
             chains += 1;
+            body.push_str(&walk.render());
+        }
+        for mut walk in walks {
+            chains += 1;
+            if !expected.is_empty() {
+                walk.check_expected(&expected);
+            }
             body.push_str(&walk.render());
         }
         // Every walk, whatever it was filtered to: a file with no readable
@@ -1064,6 +1094,7 @@ impl Endpoint for VerifyEndpoint {
                             crate::chain::unreadable(path.display().to_string(), why)
                         })
                         .collect(),
+                    ..crate::chain::ChainReport::default()
                 }
                 .render(),
             );
@@ -1139,6 +1170,25 @@ impl Endpoint for VerifyEndpoint {
                             .optional(),
                     )
                     .input(
+                        ArgSpec::new("head")
+                            .summary(
+                                "the seal hash (sha256:…) this instance's chain must reach, \
+                                 from a checkpoint published elsewhere; a chain that ends \
+                                 before it is BROKEN. Needs `instance`",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("entries")
+                            .summary(
+                                "the fewest entries this instance's chain must hold; one that \
+                                 holds fewer is BROKEN. Needs `instance`",
+                            )
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
                         ArgSpec::new("content")
                             .summary(
                                 "a segment's bytes, verified in ISOLATION: everything except \
@@ -1150,6 +1200,25 @@ impl Endpoint for VerifyEndpoint {
                     .output(TEXT_PLAIN),
             )
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// The `head` and `entries` a verify request states the chain must reach.
+fn expected_head(inv: &Invocation<'_>) -> Result<crate::chain::ExpectedHead> {
+    let mut expected = crate::chain::ExpectedHead::default();
+    if let Some(head) = opt(inv, "head")? {
+        expected.head = Some(head.to_string());
+    }
+    if let Some(entries) = opt(inv, "entries")? {
+        expected.entries = Some(entries.parse::<u64>().map_err(|_| Error::InvalidArgument {
+            name: "entries".to_string(),
+            detail: format!(
+                "a count of entries is a whole number, not {}",
+                shown(entries)
+            ),
+        })?);
+    }
+    Ok(expected)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1356,6 +1425,7 @@ fn one_segment_in(
     Ok((
         vec![crate::chain::ChainReport {
             segments: vec![report],
+            ..crate::chain::ChainReport::default()
         }],
         damaged,
     ))

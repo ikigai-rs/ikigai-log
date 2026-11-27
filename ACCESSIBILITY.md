@@ -34,7 +34,10 @@ This is a library a host uses to write and read its log. People read its files w
 - **The verify report** from `urn:log:verify` (`ChainReport::render` in `src/chain.rs`,
   `text/plain`): one `segment <iri> OK|BROKEN entries=… seals=… level=… prev=… signed=… head=…`
   line per segment, each finding indented under it and prefixed `BROKEN` or `noted`, and a last
-  line `verified N segment(s), M broken`. Each finding is a sentence (`Finding`'s `Display`):
+  line `verified N segment(s), M broken`. Asked to check an expected head (`head=` or
+  `entries=`), it adds one `expected OK|BROKEN head=… entries=…` line before the total with
+  its findings indented under it, and the total gains `, expected head not reached` when it
+  was not. Each finding is a sentence (`Finding`'s `Display`):
   `sequence jumps from 4 to 7: entries were removed (filtering consumes no sequence number)`.
 - **Other text answers**: `urn:log:write` answers the new entry's IRI, or says in words why
   nothing was written (`closed: no segment is open, …`, `filtered: … is below this segment's

@@ -530,6 +530,25 @@ pub enum Finding {
         /// Last uncommitted sequence.
         to: u64,
     },
+    /// The verifier was told the chain's head (a seal hash published somewhere
+    /// the operator does not solely control) and no seal in the chain states
+    /// it. **Breaking**: every link may hold and the chain still be a PREFIX of
+    /// the one that was published, cut back to before its head (ledger #4510).
+    /// A hash chain cannot tell a cut apart from a rewrite before the head, so
+    /// the finding names both.
+    ExpectedHeadMissing {
+        /// The head the verifier expected to reach.
+        head: String,
+    },
+    /// The verifier was told how many entries the chain holds and it holds
+    /// fewer. **Breaking**, for the same reason as
+    /// [`Finding::ExpectedHeadMissing`]: a valid prefix passes every link.
+    ShortOfExpectedLength {
+        /// The entries the verifier was told the chain holds.
+        expected: u64,
+        /// The entries the walk found.
+        found: u64,
+    },
 }
 
 impl Finding {
@@ -637,6 +656,19 @@ impl fmt::Display for Finding {
                 f,
                 "sequences {from}-{to} are past the final seal and committed to no checkpoint"
             ),
+            Finding::ExpectedHeadMissing { head } => write!(
+                f,
+                "no seal in this chain states its expected head {}: the chain ends before \
+                 it, or was rewritten before it",
+                shown(head)
+            ),
+            Finding::ShortOfExpectedLength { expected, found } => write!(
+                f,
+                "the chain holds {found} {} but {expected} {} expected: it ends before its \
+                 expected head, so entries were removed from its end",
+                if *found == 1 { "entry" } else { "entries" },
+                if *expected == 1 { "was" } else { "were" },
+            ),
         }
     }
 }
@@ -663,6 +695,10 @@ pub struct SegmentReport {
     pub entries: u64,
     /// How many seals it holds.
     pub seals: usize,
+    /// The hash every seal states, in the order written, so a head published
+    /// elsewhere can be looked for anywhere in the chain, not only at its end
+    /// (a chain that grew past a published head still reaches it).
+    pub seal_hashes: Vec<String>,
     /// The algorithms its seals were signed with, in order of first appearance.
     pub signed_with: Vec<String>,
     /// The successor its rotation marker named, when it ended in one. The only
@@ -727,12 +763,93 @@ impl SegmentReport {
 pub struct ChainReport {
     /// One report per segment, in chain order.
     pub segments: Vec<SegmentReport>,
+    /// The head this chain was checked against, when the verifier was given
+    /// one. `None` is link verification alone, which passes any valid prefix.
+    pub expected: Option<ExpectedHead>,
+    /// What checking the chain against [`ChainReport::expected`] found. Every
+    /// finding here is about the chain as a whole, so it sits under no segment.
+    pub findings: Vec<Finding>,
+}
+
+/// The head a chain must reach, learned from somewhere other than the chain:
+/// a signed checkpoint published where the operator does not solely control
+/// it, or a length someone stated. Link verification alone passes any valid
+/// PREFIX of a chain (ledger #4510); checking against this is what refuses one.
+///
+/// Either part may be given, or both. A chain that grew past the head still
+/// reaches it: the head is looked for in every seal, and the length is a floor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExpectedHead {
+    /// A seal hash (`sha256:…`) some seal in the chain must state.
+    pub head: Option<String>,
+    /// The fewest entries the chain's segments must hold between them.
+    ///
+    /// Counted over the segments walked, so after retention drops old segments
+    /// a stated length no longer fits; state the head instead.
+    pub entries: Option<u64>,
+}
+
+impl ExpectedHead {
+    /// Expect a seal stating `head`.
+    pub fn seal(head: impl Into<String>) -> ExpectedHead {
+        ExpectedHead {
+            head: Some(head.into()),
+            entries: None,
+        }
+    }
+
+    /// Expect at least `entries` entries.
+    pub fn entries(entries: u64) -> ExpectedHead {
+        ExpectedHead {
+            head: None,
+            entries: Some(entries),
+        }
+    }
+
+    /// Also expect at least `entries` entries.
+    pub fn with_entries(mut self, entries: u64) -> ExpectedHead {
+        self.entries = Some(entries);
+        self
+    }
+
+    /// Whether this expects nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none() && self.entries.is_none()
+    }
 }
 
 impl ChainReport {
-    /// Whether every segment verified.
+    /// Whether every segment verified, and the chain reached its expected head.
     pub fn ok(&self) -> bool {
         self.segments.iter().all(SegmentReport::ok)
+            && !self.findings.iter().any(Finding::is_breaking)
+    }
+
+    /// Check this walked chain against `expected`, recording what it finds in
+    /// [`ChainReport::findings`]. The walk must be one whole chain, oldest
+    /// first: a head is looked for in every seal of every segment.
+    pub fn check_expected(&mut self, expected: &ExpectedHead) {
+        if let Some(head) = &expected.head {
+            let reached = self
+                .segments
+                .iter()
+                .any(|s| s.seal_hashes.iter().any(|h| h == head));
+            if !reached {
+                self.findings
+                    .push(Finding::ExpectedHeadMissing { head: head.clone() });
+            }
+        }
+        if let Some(wanted) = expected.entries {
+            let found: u64 = self.segments.iter().map(|s| s.entries).sum();
+            if found < wanted {
+                self.findings.push(Finding::ShortOfExpectedLength {
+                    expected: wanted,
+                    found,
+                });
+            }
+        }
+        self.expected = Some(expected.clone());
     }
 
     /// How many segments carry a breaking finding.
@@ -784,10 +901,42 @@ impl ChainReport {
                 out.push_str(&format!("  {line}\n"));
             }
         }
+        if let Some(expected) = &self.expected {
+            out.push_str(&format!(
+                "expected {}",
+                if self.findings.iter().any(Finding::is_breaking) {
+                    "BROKEN"
+                } else {
+                    "OK"
+                }
+            ));
+            if let Some(head) = &expected.head {
+                out.push_str(&format!(" head={}", shown(head)));
+            }
+            if let Some(entries) = expected.entries {
+                out.push_str(&format!(" entries={entries}"));
+            }
+            out.push('\n');
+            for finding in &self.findings {
+                out.push_str(&format!(
+                    "  {} {finding}\n",
+                    if finding.is_breaking() {
+                        "BROKEN"
+                    } else {
+                        "noted"
+                    }
+                ));
+            }
+        }
         out.push_str(&format!(
-            "verified {} segment(s), {} broken\n",
+            "verified {} segment(s), {} broken{}\n",
             self.segments.len(),
-            self.broken()
+            self.broken(),
+            if self.findings.iter().any(Finding::is_breaking) {
+                ", expected head not reached"
+            } else {
+                ""
+            }
         ));
         out
     }
@@ -833,6 +982,7 @@ pub fn verify_segment(
     let mut chain = Chain::open(&header);
     let mut entries = 0u64;
     let mut seals = 0usize;
+    let mut seal_hashes: Vec<String> = Vec::new();
     let mut signed_with: Vec<String> = Vec::new();
     let mut last_seq: Option<u64> = None;
     // The POSITION of the last entry read: its own `seq=`, or its ordinal in a
@@ -927,6 +1077,7 @@ pub fn verify_segment(
                 // computed from here on (the unsealed tail, which brackets are
                 // trusted) rests on the entries, never on an editable number.
                 sealed_through = position;
+                seal_hashes.push(seal.hash.clone());
                 head = seal.hash;
             }
             Ok(Line::Blank) | Ok(Line::Comment(_)) => {}
@@ -979,6 +1130,7 @@ pub fn verify_segment(
         head,
         entries,
         seals,
+        seal_hashes,
         signed_with,
         successor,
         level_changes: brackets
@@ -1031,6 +1183,7 @@ pub(crate) fn unreadable(name: String, detail: String) -> SegmentReport {
         head: String::new(),
         entries: 0,
         seals: 0,
+        seal_hashes: Vec::new(),
         signed_with: Vec::new(),
         successor: None,
         level_changes: Vec::new(),
@@ -1124,6 +1277,24 @@ pub fn verify_chain(segments: &[(String, String)], vocab: &Vocabulary) -> ChainR
     verify_chain_walk(segments, vocab, WalkExtent::WholeChain)
 }
 
+/// [`verify_chain`], then check that the chain reaches `expected`.
+///
+/// ★ **Link verification alone passes any valid prefix** (ledger #4510). A
+/// chain cut back to an earlier seal has every link intact, and its missing
+/// tail reads as a crash, which is `noted`. Only a head held outside the chain,
+/// a signed checkpoint published elsewhere or a stated length, can say it
+/// ends too soon; this refuses it, as [`Finding::ExpectedHeadMissing`] or
+/// [`Finding::ShortOfExpectedLength`].
+pub fn verify_chain_to(
+    segments: &[(String, String)],
+    vocab: &Vocabulary,
+    expected: &ExpectedHead,
+) -> ChainReport {
+    let mut report = verify_chain(segments, vocab);
+    report.check_expected(expected);
+    report
+}
+
 /// Whether the walk reaches the chain's head or ends at a rotation boundary.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkExtent {
@@ -1177,6 +1348,7 @@ impl ChainWalk {
         }
         ChainReport {
             segments: self.reports,
+            ..ChainReport::default()
         }
     }
 }

@@ -485,7 +485,14 @@ none. Against an **unkeyed** reader of the files, an `OK` means:
 * nothing follows an orderly end, and every change of level between adjacent
   segments is recorded by a sealed bracket naming that change;
 * every segment file in the directory was read — one it could not read is
-  reported, not skipped.
+  reported, not skipped;
+* when the request names an `instance` and an expected head (`head=`, a seal hash
+  published somewhere the operator does not solely control, or `entries=`, a
+  stated length), the chain reaches it: some seal states that hash, and the
+  segments hold at least that many entries. Without one, **link verification
+  alone passes any valid prefix** of the chain, because a tail cut back to a seal
+  reads as a crash (ledger #4510). The report then ends with an `expected OK|BROKEN`
+  line and, when the head was not reached, `…, expected head not reached`.
 
 What it does **not** establish:
 
@@ -495,8 +502,9 @@ What it does **not** establish:
   writer comes only from **signatures**, and seal signatures are **stated, not
   checked** here: `signed=` lists the algorithms the seals name, and checking one
   is `urn:sign:verify` with the public key, which this crate never resolves. An
-  external anchor of the head (a signed or published seal) is the other answer,
-  and nothing here makes one.
+  external anchor of the head (a signed or published seal) is the other answer:
+  verify checks a chain against one it is given (`head=`), and nothing here
+  makes or publishes one yet. See `docs/design/chain-head-anchoring.md`.
 * **The level is verified as *recorded*, not as *authentic*.** A `log:LevelChange`
   brackets the gap and the chain proves that entry was not altered afterwards,
   but nothing stops whoever holds the writer from lowering the level and honestly
@@ -506,7 +514,8 @@ What it does **not** establish:
   seal of a segment that never ended are `noted`, because that is what a crash
   leaves — so the newest segment, or any segment whose process died, can be
   extended, or rewritten back to its last seal, without a `BROKEN`. The seal
-  cadence (1,000 entries or 60 s by default) bounds how much.
+  cadence (1,000 entries or 60 s by default) bounds how much. A cut back past a
+  head published elsewhere is `BROKEN` when verify is given that head.
 * **Deleting the oldest segments looks like retention.** The first segment
   listed is not checked against a predecessor that is not there, so removing
   history from the old end is invisible to the walk. (There is no retention or
