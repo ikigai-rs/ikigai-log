@@ -5,7 +5,24 @@ with the first release that changes a public name.
 
 ## Unreleased
 
+### Added
+
+- `urn:log:verify` checks an instance's chain against an expected head (ledger #4510), hence
+  0.15.0. Link verification alone passes any valid prefix: a chain cut back to an earlier
+  seal has every link intact, and its missing tail reads as a crash. With `instance=` and
+  `head=` (a seal hash published elsewhere) or `entries=` (a stated length), a chain that
+  ends before it is `BROKEN`, said in a sentence:
+  `no seal in this chain states its expected head sha256:…: the chain ends before it, or was
+  rewritten before it`. In the library, `verify_chain_to`, `ExpectedHead` and
+  `ChainReport::check_expected`, with two new findings, `Finding::ExpectedHeadMissing` and
+  `Finding::ShortOfExpectedLength`.
+
 ### Changed
+
+- `ChainReport` gains `expected` and `findings`, and `SegmentReport` gains `seal_hashes` (every
+  seal's hash, so a published head is found anywhere in a chain that grew past it). Code that
+  builds either with a struct literal adds the fields, or `..ChainReport::default()`; hence
+  0.15.0. A report without an expected head renders exactly as before.
 
 - On ikigai-core 0.4.0 (scope opacity, structured denials; the core 0.4.0 cascade,
   ledger #3930), with ikigai-sign 0.6.0, and in tests ikigai-sparql 0.6.0 and

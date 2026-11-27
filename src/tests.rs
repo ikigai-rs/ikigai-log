@@ -3493,6 +3493,105 @@ fn verify_binds_above_the_template_and_reports_through_the_kernel() {
 }
 
 #[test]
+fn verify_checks_an_instance_chain_against_an_expected_head() {
+    // Ledger #4510: link verification alone passes any valid prefix, so the
+    // verifier takes a head held elsewhere (`head=`, a seal hash) or a stated
+    // length (`entries=`) and says BROKEN when the chain ends before it.
+    let dir = Scratch::new("verify-expected");
+    let handle = chained_handle(dir.path(), "bug:xpct", "info", 1_700_000_000_000);
+    let (segment, _) = handle.open_segment().expect("open");
+    handle.write(message(1_700_000_001_000, "one")).ok();
+    handle.close(at(1_700_000_002_000)).expect("closes");
+    let text = std::fs::read_to_string(path_of(dir.path(), &segment)).expect("readable");
+    let head = crate::chain::head_of(&text).expect("a head");
+    let entries = crate::chain::verify_segment(&text, Vocabulary::builtin(), None).entries;
+    let instance = "urn:ikigai:instance:bug:xpct";
+
+    let kernel = kernel(handle);
+    let body = text_of(&source(
+        &kernel,
+        VERIFY_IRI,
+        &[("instance", instance), ("head", &head)],
+    ));
+    assert!(
+        body.contains(&format!("expected OK head={head}\n")),
+        "{body}"
+    );
+    assert!(
+        body.ends_with("verified 1 segment(s), 0 broken\n"),
+        "{body}"
+    );
+
+    // A head this chain never reached: what a chain cut short looks like.
+    let ahead = format!("sha256:{}", "0".repeat(64));
+    let body = text_of(&source(
+        &kernel,
+        VERIFY_IRI,
+        &[("instance", instance), ("head", &ahead)],
+    ));
+    assert!(
+        body.contains(&format!(
+            "  BROKEN no seal in this chain states its expected head {ahead}: the chain \
+             ends before it, or was rewritten before it\n"
+        )),
+        "{body}"
+    );
+    assert!(
+        body.ends_with("verified 1 segment(s), 0 broken, expected head not reached\n"),
+        "{body}"
+    );
+
+    let more = (entries + 1).to_string();
+    let body = text_of(&source(
+        &kernel,
+        VERIFY_IRI,
+        &[("instance", instance), ("entries", &more)],
+    ));
+    assert!(
+        body.contains(&format!("expected BROKEN entries={more}\n")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "the chain holds {entries} entries but {more} were expected"
+        )),
+        "{body}"
+    );
+
+    // A head is one chain's, so it needs `instance` and refuses `segment`.
+    for args in [
+        vec![("head", head.as_str())],
+        vec![
+            ("instance", instance),
+            ("segment", segment.as_str()),
+            ("head", head.as_str()),
+        ],
+    ] {
+        let refused = futures::executor::block_on(
+            kernel.issue(source_request(VERIFY_IRI, &args), &Capability::root()),
+        )
+        .expect_err("refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("an expected head is one chain's"),
+            "{refused}"
+        );
+    }
+    let refused = futures::executor::block_on(kernel.issue(
+        source_request(VERIFY_IRI, &[("instance", instance), ("entries", "many")]),
+        &Capability::root(),
+    ))
+    .expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("a count of entries is a whole number, not many"),
+        "{refused}"
+    );
+}
+
+#[test]
 fn verify_streams_a_directory_larger_than_the_old_total_budget() {
     // ★ The claim of ledger #4099, reproduced: verification read the whole
     // directory under one 64 MiB budget, so a host that never prunes answered

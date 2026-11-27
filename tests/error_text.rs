@@ -209,6 +209,7 @@ fn findings_naming(text: &str) -> Vec<Finding> {
         Finding::UnmarkedEnd {
             last_class: Some(t()),
         },
+        Finding::ExpectedHeadMissing { head: t() },
     ]
 }
 
@@ -242,6 +243,7 @@ fn a_verify_report_shows_every_name_it_read_escaped() {
             head: text.clone(),
             entries: 1,
             seals: 1,
+            seal_hashes: vec![text.clone()],
             signed_with: vec![text.clone()],
             successor: None,
             level_changes: Vec::new(),
@@ -256,15 +258,24 @@ fn a_verify_report_shows_every_name_it_read_escaped() {
             head: String::new(),
             entries: 0,
             seals: 0,
+            seal_hashes: Vec::new(),
             signed_with: Vec::new(),
             successor: None,
             level_changes: Vec::new(),
             findings: Vec::new(),
         };
-        let rendered = ikigai_log::ChainReport {
+        let mut report = ikigai_log::ChainReport {
             segments: vec![read, unreadable],
-        }
-        .render();
+            ..ikigai_log::ChainReport::default()
+        };
+        // A head the chain never reaches, named in the line and the finding.
+        report.check_expected(&ikigai_log::ExpectedHead::seal(format!("{text}z")));
+        let rendered = report.render();
+        assert!(
+            rendered.contains(&format!("expected BROKEN head={want}z\n")),
+            "U+{:04X}: {rendered:?}",
+            c as u32
+        );
         for line in rendered.lines() {
             assert_one_printable_line(line);
         }
